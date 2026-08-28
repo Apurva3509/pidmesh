@@ -1,0 +1,52 @@
+name: Bug report
+description: Report incorrect behavior or a reliability problem
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping make concurrent agent coordination more reliable.
+  - type: input
+    id: version
+    attributes:
+      label: PidMesh version
+      placeholder: v0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      options:
+        - CLI
+        - MCP
+        - Python API
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the command or tool call, expected result, and actual result.
+    validations:
+      required: true
+  - type: textarea
+    id: concurrency
+    attributes:
+      label: Process context
+      description: List the operating system, Python version, agent count, and relevant PIDs.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized output
+      description: Remove session content, secrets, and private filesystem paths.
+      render: text
