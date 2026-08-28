@@ -37,3 +37,5 @@ owner can renew a lease. Another agent receives the existing owner instead of a 
 
 Every coordination mutation appends an event with a monotonically increasing sequence. Consumers can
 checkpoint a sequence and request only later events, which makes polling deterministic and cheap.
+The bounded wait operation long-polls this sequence for up to 60 seconds, allowing an agent to sleep
+until another session creates a memory, message, claim, handoff, or lifecycle event.

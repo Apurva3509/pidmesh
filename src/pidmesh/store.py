@@ -642,6 +642,29 @@ class MeshStore:
 
         return self._read(operation)
 
+    def wait_for_events(
+        self,
+        agent_id: str,
+        *,
+        after: int = 0,
+        timeout_seconds: float = 30,
+        poll_interval: float = 0.1,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not 0 <= timeout_seconds <= 60:
+            raise ValueError("timeout_seconds must be between 0 and 60")
+        if not 0.01 <= poll_interval <= 5:
+            raise ValueError("poll_interval must be between 0.01 and 5")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            events = self.events(agent_id, after, limit)
+            if events:
+                return events
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return []
+            time.sleep(min(poll_interval, remaining))
+
     def collect_stale(self, stale_seconds: int = 30) -> dict[str, int]:
         cutoff = self._now() - stale_seconds * 1000
 

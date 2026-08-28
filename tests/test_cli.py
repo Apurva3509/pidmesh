@@ -118,6 +118,14 @@ def test_cli_coordination_commands(tmp_path: Path, capsys, monkeypatch) -> None:
     assert status["claims"][0]["task_key"] == "parser"
     _, events = invoke("events", "--after", "0", "--limit", "20")
     assert any(event["event_type"] == "task.claimed" for event in events)
+    _, waited = invoke(
+        "wait",
+        "--after",
+        str(events[-1]["sequence"]),
+        "--timeout-seconds",
+        "0",
+    )
+    assert waited == []
     _, released = invoke("release", "parser")
     assert released["released"]
     _, stopped = invoke("leave")
