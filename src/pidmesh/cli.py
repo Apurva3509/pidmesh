@@ -90,6 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--after", type=int, default=0)
     events.add_argument("--limit", type=int, default=100)
 
+    wait = subparsers.add_parser("wait", help="wait until a coordination event arrives")
+    wait.add_argument("--agent")
+    wait.add_argument("--after", type=int, default=0)
+    wait.add_argument("--timeout-seconds", type=float, default=30)
+    wait.add_argument("--limit", type=int, default=100)
+
     collect = subparsers.add_parser("gc", help="collect dead agents and expired leases")
     collect.add_argument("--stale-seconds", type=int, default=30)
 
@@ -217,6 +223,15 @@ def dispatch(args: argparse.Namespace) -> int:
         _emit(store.status(args.agent, args.workspace))
     elif args.command == "events":
         _emit(store.events(_agent_id(args), args.after, args.limit))
+    elif args.command == "wait":
+        _emit(
+            store.wait_for_events(
+                _agent_id(args),
+                after=args.after,
+                timeout_seconds=args.timeout_seconds,
+                limit=args.limit,
+            )
+        )
     elif args.command == "gc":
         _emit(store.collect_stale(args.stale_seconds))
     elif args.command == "run":

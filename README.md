@@ -62,6 +62,7 @@ Inspect the mesh from another terminal:
 ```bash
 pidmesh status
 pidmesh events --agent "$PIDMESH_AGENT_ID"
+pidmesh wait --agent "$PIDMESH_AGENT_ID" --after 42 --timeout-seconds 30
 pidmesh gc
 ```
 
@@ -69,8 +70,10 @@ Every command emits JSON so both humans and agents can consume it reliably.
 
 ## MCP setup
 
-PidMesh exposes eight tools: status, remember, recall, send, inbox, claim, release, and event stream.
-Each MCP server process registers its real PID and refreshes its heartbeat on tool calls.
+PidMesh exposes nine tools: status, remember, recall, send, inbox, claim, release, event stream, and
+bounded event waiting.
+Each MCP server process registers its real PID, pulses its heartbeat every five seconds, and marks
+itself stopped during a clean shutdown.
 
 Claude Code:
 
@@ -98,6 +101,7 @@ Set `PIDMESH_WORKSPACE` when the host does not launch the server from the projec
 - Stopped or dead sessions release their claims.
 - Broadcast acknowledgements are tracked independently for every agent.
 - Workspaces are isolated even though all projects can share one database.
+- Long polling wakes an agent on the next event without a tight database polling loop.
 
 The test suite launches eight simultaneous processes to verify write integrity and prove that an
 atomic claim has one winner.

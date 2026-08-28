@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -25,15 +27,33 @@ def build_server(
         os.getpid(),
         root=workspace,
         provider=provider or os.environ.get("PIDMESH_PROVIDER", "mcp"),
-        capabilities=["memory", "messaging", "claims", "events"],
+        capabilities=["memory", "messaging", "claims", "events", "wait"],
     )
     agent_id = registration["agent_id"]
+
+    @asynccontextmanager
+    async def lifespan(_: Any):
+        async def heartbeat_loop() -> None:
+            while True:
+                await asyncio.sleep(5)
+                await asyncio.to_thread(store.heartbeat, agent_id)
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        try:
+            yield {}
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+            await asyncio.to_thread(store.stop_agent, agent_id)
+
     server = MCPServer(
         "PidMesh",
         instructions=(
             "Use PidMesh to coordinate with other local agent processes. Check status and inbox "
             "before starting work, claim a task before editing, and record decisions as memories."
         ),
+        lifespan=lifespan,
     )
 
     @server.tool()
@@ -96,6 +116,19 @@ def build_server(
         """Read ordered coordination events after a sequence number."""
         store.heartbeat(agent_id)
         return store.events(agent_id, after_sequence, limit)
+
+    @server.tool()
+    def wait_for_events(
+        after_sequence: int = 0, timeout_seconds: float = 30, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Wait up to 60 seconds for the next coordination event."""
+        store.heartbeat(agent_id)
+        return store.wait_for_events(
+            agent_id,
+            after=after_sequence,
+            timeout_seconds=timeout_seconds,
+            limit=limit,
+        )
 
     return server
 

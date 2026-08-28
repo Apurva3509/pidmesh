@@ -4,6 +4,7 @@ import multiprocessing
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -209,6 +210,37 @@ def test_release_and_acknowledge_noops(store: MeshStore, tmp_path: Path) -> None
     agent = store.register_agent("worker", os.getpid(), root=tmp_path)
     assert not store.release(agent["agent_id"], "missing")
     assert store.acknowledge(agent["agent_id"], []) == 0
+
+
+def test_wait_for_events_wakes_on_message(store: MeshStore, tmp_path: Path) -> None:
+    receiver = store.register_agent("receiver", os.getpid(), root=tmp_path)
+    sender = store.register_agent("sender", os.getpid(), root=tmp_path)
+    after = store.events(receiver["agent_id"])[-1]["sequence"]
+
+    def send_later() -> None:
+        time.sleep(0.05)
+        store.send(sender["agent_id"], "wake up", recipient="receiver")
+
+    thread = threading.Thread(target=send_later)
+    thread.start()
+    events = store.wait_for_events(
+        receiver["agent_id"], after=after, timeout_seconds=1, poll_interval=0.01
+    )
+    thread.join()
+
+    assert events[0]["event_type"] == "message.sent"
+
+
+@pytest.mark.parametrize(
+    ("timeout", "interval", "message"),
+    [(-1, 0.1, "timeout_seconds"), (61, 0.1, "timeout_seconds"), (1, 0, "poll_interval")],
+)
+def test_wait_for_events_validates_bounds(
+    store: MeshStore, tmp_path: Path, timeout: float, interval: float, message: str
+) -> None:
+    agent = store.register_agent("worker", os.getpid(), root=tmp_path)
+    with pytest.raises(ValueError, match=message):
+        store.wait_for_events(agent["agent_id"], timeout_seconds=timeout, poll_interval=interval)
 
 
 def test_temporary_database_can_be_reopened() -> None:
