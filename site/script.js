@@ -26,6 +26,18 @@
     });
   });
 
+  const alignHashTarget = () => {
+    const id = decodeURIComponent(window.location.hash.slice(1));
+    if (!id) return;
+    window.requestAnimationFrame(() =>
+      document
+        .getElementById(id)
+        ?.scrollIntoView({ block: "start", behavior: "instant" }),
+    );
+  };
+  if (document.readyState === "complete") alignHashTarget();
+  else window.addEventListener("load", alignHashTarget, { once: true });
+
   const clock = document.querySelector("[data-clock]");
   const updateClock = () => {
     if (clock) {
