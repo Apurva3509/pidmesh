@@ -1,13 +1,16 @@
 use std::ffi::OsString;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use pidmesh::store::{MeshStore, default_database_path, workspace_root};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -135,6 +138,24 @@ enum Commands {
         workspace: Option<PathBuf>,
         #[arg(long, default_value_t = 5.0)]
         heartbeat_seconds: f64,
+        #[arg(last = true, required = true)]
+        child_command: Vec<OsString>,
+    },
+    Swarm {
+        #[arg(long, default_value = "worker")]
+        name_prefix: String,
+        #[arg(long, default_value = "unknown")]
+        provider: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, default_value_t = 5)]
+        workers: u16,
+        #[arg(long, default_value_t = 5.0)]
+        heartbeat_seconds: f64,
+        #[arg(long, default_value_t = 2.0)]
+        shutdown_grace_seconds: f64,
+        #[arg(long)]
+        fail_fast: bool,
         #[arg(last = true, required = true)]
         child_command: Vec<OsString>,
     },
@@ -286,8 +307,242 @@ fn run() -> Result<u8> {
                 &child_command,
             );
         }
+        Commands::Swarm {
+            name_prefix,
+            provider,
+            workspace,
+            workers,
+            heartbeat_seconds,
+            shutdown_grace_seconds,
+            fail_fast,
+            child_command,
+        } => {
+            return run_swarm(
+                &store,
+                &name_prefix,
+                &provider,
+                workspace.as_deref(),
+                workers,
+                duration_from_seconds(heartbeat_seconds)?,
+                duration_from_seconds(shutdown_grace_seconds)?,
+                fail_fast,
+                &child_command,
+            );
+        }
     }
     Ok(0)
+}
+
+struct SwarmWorker {
+    agent_id: String,
+    name: String,
+    child: Child,
+    exit_code: Option<i32>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_swarm(
+    store: &MeshStore,
+    name_prefix: &str,
+    provider: &str,
+    workspace: Option<&std::path::Path>,
+    worker_count: u16,
+    heartbeat_interval: Duration,
+    shutdown_grace: Duration,
+    fail_fast: bool,
+    child_command: &[OsString],
+) -> Result<u8> {
+    if !(1..=64).contains(&worker_count) {
+        return Err(anyhow!("workers must be between 1 and 64"));
+    }
+    if heartbeat_interval < Duration::from_millis(10) {
+        return Err(anyhow!(
+            "heartbeat interval must be at least 10 milliseconds"
+        ));
+    }
+    if shutdown_grace > Duration::from_secs(60) {
+        return Err(anyhow!("shutdown grace must be at most 60 seconds"));
+    }
+
+    let root = workspace_root(workspace)?;
+    let swarm_id = format!("swarm-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let signal_stopping = Arc::clone(&stopping);
+    let signal_interrupted = Arc::clone(&interrupted);
+    ctrlc::set_handler(move || {
+        signal_interrupted.store(true, Ordering::Relaxed);
+        signal_stopping.store(true, Ordering::Relaxed);
+    })
+    .context("failed to install swarm shutdown handler")?;
+
+    let mut workers = Vec::with_capacity(usize::from(worker_count));
+    for index in 0..worker_count {
+        let name = format!("{name_prefix}-{index}");
+        let agent_id = format!(
+            "{name}-{swarm_id}-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
+        let registration = store.register_agent(
+            &name,
+            std::process::id(),
+            Some(std::path::Path::new(&root)),
+            provider,
+            &["swarm-worker".to_owned()],
+            Some(&agent_id),
+        )?;
+        let environment = json!({
+            "PIDMESH_AGENT_ID": agent_id,
+            "PIDMESH_AGENT_INDEX": index,
+            "PIDMESH_AGENT_NAME": name,
+            "PIDMESH_DB": store.path(),
+            "PIDMESH_PROVIDER": provider,
+            "PIDMESH_SWARM_ID": swarm_id,
+            "PIDMESH_SWARM_SIZE": worker_count,
+            "PIDMESH_WORKSPACE": root
+        });
+        let mut command = Command::new(&child_command[0]);
+        command.args(&child_command[1..]);
+        command.process_group(0);
+        for (key, value) in environment.as_object().into_iter().flatten() {
+            command.env(key, environment_value(value)?);
+        }
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                store.stop_agent(&agent_id)?;
+                force_stop_workers(store, &mut workers);
+                return Err(error).context("failed to start swarm worker");
+            }
+        };
+        let child_pid = child.id();
+        workers.push(SwarmWorker {
+            agent_id: agent_id.clone(),
+            name,
+            child,
+            exit_code: None,
+        });
+        let registered = store.update_agent_pid(&agent_id, child_pid).and_then(|_| {
+            store.remember(
+                &agent_id,
+                &json!({
+                    "command": child_command,
+                    "environment": environment,
+                    "registration": registration,
+                    "swarm_id": swarm_id
+                })
+                .to_string(),
+                "session",
+                Some("process.start"),
+                0.2,
+            )
+        });
+        if let Err(error) = registered {
+            force_stop_workers(store, &mut workers);
+            return Err(error).context("failed to register spawned swarm worker");
+        }
+    }
+
+    let mut remaining = workers.len();
+    let mut next_heartbeat = Instant::now() + heartbeat_interval;
+    let mut shutdown_deadline = None;
+    let mut first_failure = None;
+    while remaining > 0 {
+        if stopping.load(Ordering::Relaxed) && shutdown_deadline.is_none() {
+            request_worker_shutdown(&mut workers);
+            shutdown_deadline = Some(Instant::now() + shutdown_grace);
+        }
+        if shutdown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            force_kill_running(&mut workers);
+        }
+        for worker in &mut workers {
+            if worker.exit_code.is_some() {
+                continue;
+            }
+            if let Some(status) = worker
+                .child
+                .try_wait()
+                .context("failed to poll swarm worker")?
+            {
+                let code = status.code().unwrap_or(1);
+                worker.exit_code = Some(code);
+                remaining -= 1;
+                store.stop_agent(&worker.agent_id)?;
+                if code != 0 && first_failure.is_none() {
+                    first_failure = Some(code);
+                    if fail_fast {
+                        stopping.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        if Instant::now() >= next_heartbeat {
+            for worker in workers.iter().filter(|worker| worker.exit_code.is_none()) {
+                store.heartbeat(&worker.agent_id)?;
+            }
+            next_heartbeat = Instant::now() + heartbeat_interval;
+        }
+        if remaining > 0 {
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    emit(&json!({
+        "event": "swarm.stopped",
+        "interrupted": interrupted.load(Ordering::Relaxed),
+        "swarm_id": swarm_id,
+        "workers": workers.iter().map(|worker| json!({
+            "agent_id": worker.agent_id,
+            "exit_code": worker.exit_code,
+            "name": worker.name,
+            "pid": worker.child.id()
+        })).collect::<Vec<_>>()
+    }))?;
+    if interrupted.load(Ordering::Relaxed) {
+        Ok(130)
+    } else {
+        Ok(first_failure
+            .and_then(|code| code.try_into().ok())
+            .unwrap_or(0))
+    }
+}
+
+fn environment_value(value: &Value) -> Result<String> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        _ => Err(anyhow!("unsupported child environment value")),
+    }
+}
+
+fn request_worker_shutdown(workers: &mut [SwarmWorker]) {
+    for worker in workers
+        .iter_mut()
+        .filter(|worker| worker.exit_code.is_none())
+    {
+        if let Ok(pid) = i32::try_from(worker.child.id()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGTERM);
+        }
+    }
+}
+
+fn force_kill_running(workers: &mut [SwarmWorker]) {
+    for worker in workers
+        .iter_mut()
+        .filter(|worker| worker.exit_code.is_none())
+    {
+        if let Ok(pid) = i32::try_from(worker.child.id()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+}
+
+fn force_stop_workers(store: &MeshStore, workers: &mut [SwarmWorker]) {
+    force_kill_running(workers);
+    for worker in workers {
+        let _ = worker.child.wait();
+        let _ = store.stop_agent(&worker.agent_id);
+    }
 }
 
 fn run_supervised(

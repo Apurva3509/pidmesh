@@ -85,6 +85,22 @@ pidmesh gc
 
 Every command emits JSON for reliable agent consumption.
 
+## Run a native agent swarm
+
+Launch five independently addressable agent processes with one supervisor:
+
+```bash
+pidmesh swarm --workers 5 --name-prefix researcher --provider codex -- \
+  codex exec "Claim one open task, complete it, and send a handoff"
+```
+
+Each child receives `PIDMESH_AGENT_ID`, `PIDMESH_AGENT_INDEX`, `PIDMESH_AGENT_NAME`,
+`PIDMESH_SWARM_ID`, `PIDMESH_SWARM_SIZE`, `PIDMESH_DB`, and `PIDMESH_WORKSPACE`. Workers can use
+the CLI or MCP server against the same mesh while remaining separate operating-system processes.
+The supervisor heartbeats every live worker, observes exits independently, and marks sessions stopped
+when they finish. `--fail-fast` terminates the remaining workers after the first failure. Ctrl-C,
+SIGTERM, and SIGHUP request a graceful shutdown before forcing stragglers to exit.
+
 ## MCP setup
 
 The native MCP server uses the official Rust SDK and exposes nine tools: status, remember, recall,
@@ -129,6 +145,10 @@ Codex PID 4101 ─┐             one connection / process
 Claude PID 4102 ├── CLI/MCP ───────────┐
 Worker PID 4103 ┘                      ├── SQLite WAL
                                       └── memory + inbox + claims + events
+
+pidmesh swarm ──┬── Worker PID 5101
+                ├── Worker PID 5102
+                └── Worker PID 5103
 ```
 
 The Rust runtime reads databases created by the earlier Python releases without a migration. See

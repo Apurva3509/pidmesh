@@ -16,6 +16,11 @@ write transactions. The schema remains compatible with databases created by Pyth
 4. Garbage collection marks a stale session dead only when its heartbeat is old and its PID no
    longer exists.
 
+The native swarm supervisor registers every child as a separate session, updates its registration
+with the real child PID, and heartbeats only workers that have not exited. A supervisor interruption
+sends a termination request to every live child, waits for the configured grace period, then forces
+remaining processes to exit and releases their claims.
+
 The PID check avoids declaring a quiet but live local process dead. Leases still expire independently,
 so abandoned work can be recovered even before garbage collection runs.
 

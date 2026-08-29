@@ -1,8 +1,10 @@
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use pidmesh::store::MeshStore;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -317,5 +319,180 @@ fn supervised_command_receives_identity_and_stops_cleanly() -> Result<()> {
     let store = MeshStore::new(database)?;
     let status = store.status(None, Some(directory.path()))?;
     assert_eq!(status["agents"][0]["status"], "stopped");
+    Ok(())
+}
+
+#[test]
+fn swarm_launches_six_distinct_processes_and_stops_them_cleanly() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("swarm.db");
+    let marker = directory.path().join("workers.txt");
+    let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "swarm",
+            "--workers",
+            "6",
+            "--name-prefix",
+            "researcher",
+            "--provider",
+            "test",
+            "--workspace",
+            directory.path().to_str().context("workspace path")?,
+            "--heartbeat-seconds",
+            "0.01",
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!(
+                "printf '%s,%s,%s,%s\\n' \"$PIDMESH_AGENT_ID\" \"$PIDMESH_AGENT_INDEX\" \"$PIDMESH_SWARM_SIZE\" \"$$\" >> {}",
+                marker.display()
+            ),
+        ])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(summary["event"], "swarm.stopped");
+    assert_eq!(summary["workers"].as_array().context("workers")?.len(), 6);
+
+    let records = std::fs::read_to_string(marker)?;
+    let mut identities = records
+        .lines()
+        .map(|line| line.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    identities.sort_by_key(|record| record[1].parse::<usize>().unwrap_or_default());
+    assert_eq!(identities.len(), 6);
+    for (index, record) in identities.iter().enumerate() {
+        assert_eq!(record.len(), 4);
+        assert_eq!(record[1], index.to_string());
+        assert_eq!(record[2], "6");
+        assert_ne!(record[3], std::process::id().to_string());
+    }
+    let unique_ids = identities
+        .iter()
+        .map(|record| &record[0])
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique_ids.len(), 6);
+
+    let store = MeshStore::new(database)?;
+    let status = store.status(None, Some(directory.path()))?;
+    assert_eq!(status["agents"].as_array().context("agents")?.len(), 6);
+    assert!(
+        status["agents"]
+            .as_array()
+            .context("agents")?
+            .iter()
+            .all(|agent| agent["status"] == "stopped")
+    );
+    Ok(())
+}
+
+#[test]
+fn swarm_fail_fast_propagates_failure_and_stops_other_workers() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("fail-fast.db");
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "swarm",
+            "--workers",
+            "4",
+            "--fail-fast",
+            "--shutdown-grace-seconds",
+            "0.05",
+            "--workspace",
+            directory.path().to_str().context("workspace path")?,
+            "--",
+            "/bin/sh",
+            "-c",
+            "if [ \"$PIDMESH_AGENT_INDEX\" = 2 ]; then exit 7; fi; sleep 10",
+        ])
+        .output()?;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(output.status.code(), Some(7));
+    let summary: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(summary["interrupted"], false);
+    assert_eq!(
+        summary["workers"]
+            .as_array()
+            .context("workers")?
+            .iter()
+            .filter(|worker| worker["exit_code"] == 7)
+            .count(),
+        1
+    );
+    let store = MeshStore::new(database)?;
+    let status = store.status(None, Some(directory.path()))?;
+    assert!(
+        status["agents"]
+            .as_array()
+            .context("agents")?
+            .iter()
+            .all(|agent| agent["status"] == "stopped")
+    );
+    Ok(())
+}
+
+#[test]
+fn swarm_interrupt_terminates_every_worker_and_releases_sessions() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("interrupt.db");
+    let child = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "swarm",
+            "--workers",
+            "3",
+            "--shutdown-grace-seconds",
+            "0.1",
+            "--workspace",
+            directory.path().to_str().context("workspace path")?,
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; while :; do sleep 10; done",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let store = MeshStore::new(&database)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = store.status(None, Some(directory.path()))?;
+        if status["agents"]
+            .as_array()
+            .is_some_and(|agents| agents.len() == 3)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "swarm workers did not register");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    kill(Pid::from_raw(i32::try_from(child.id())?), Signal::SIGINT)?;
+    let interrupted_at = Instant::now();
+    let output = child.wait_with_output()?;
+    assert!(interrupted_at.elapsed() < Duration::from_secs(2));
+    assert_eq!(output.status.code(), Some(130));
+    let summary: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(summary["interrupted"], true);
+
+    let status = store.status(None, Some(directory.path()))?;
+    assert!(
+        status["agents"]
+            .as_array()
+            .context("agents")?
+            .iter()
+            .all(|agent| agent["status"] == "stopped")
+    );
     Ok(())
 }
