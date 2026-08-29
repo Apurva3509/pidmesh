@@ -2052,92 +2052,86 @@ h2 em {
     gap: 10px;
     font-size: 11px;
   }
+  .site-nav > a:nth-child(-n + 3) {
+    display: none;
+  }
   .nav-cta {
     padding: 12px;
   }
   .hero {
-    min-height: 790px;
-    grid-template-columns: minmax(250px, 0.82fr) minmax(350px, 1.18fr);
-    gap: 24px;
+    min-height: auto;
+    grid-template-columns: 1fr;
+    gap: 30px;
     padding-top: 118px;
+    padding-bottom: 64px;
   }
   .hero-copy {
-    display: block;
+    display: grid;
+    grid-template-columns: minmax(0, 1.06fr) minmax(0, 0.94fr);
+    align-items: start;
+    column-gap: 38px;
+  }
+  .hero-copy .eyebrow,
+  .hero-facts {
+    grid-column: 1 / -1;
   }
   .hero-copy h1 {
-    margin-bottom: 24px;
-    font-size: clamp(52px, 7.5vw, 61px);
+    grid-row: 2 / span 3;
+    margin-bottom: 0;
+    font-size: clamp(54px, 8vw, 62px);
+    line-height: 0.92;
   }
   .hero-lede {
+    grid-column: 2;
     margin-bottom: 20px;
-    font-size: 14px;
+    font-size: 15px;
   }
   .hero-actions {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 14px;
+    grid-column: 2;
+    flex-wrap: wrap;
+    gap: 15px;
+  }
+  .hero-actions .button {
+    min-height: 48px;
+    padding: 0 17px;
+  }
+  .hero-actions .text-link {
+    font-size: 13px;
   }
   .hero-facts {
-    margin-top: 32px;
-  }
-  .hero-facts li {
-    padding-left: 10px;
-  }
-  .hero-facts strong {
-    font-size: 21px;
-  }
-  .hero-facts span {
-    font-size: 7px;
+    max-width: none;
+    margin-top: 30px;
   }
   .hero-stage {
-    height: 500px;
+    height: 410px;
+    border-radius: 22px;
   }
   .mesh-core {
-    width: 104px;
-    height: 104px;
-  }
-  .mesh-core b {
-    font-size: 16px;
-  }
-  .mesh-core small {
-    bottom: 17px;
-    font-size: 7px;
+    width: 112px;
+    height: 112px;
   }
   .orbit-one {
-    width: 270px;
-    height: 270px;
+    width: 250px;
+    height: 250px;
   }
   .orbit-two {
-    width: 390px;
-    height: 390px;
+    width: 370px;
+    height: 370px;
   }
   .agent-node {
-    min-width: 132px;
-    gap: 7px;
-    padding: 8px;
-  }
-  .agent-avatar {
-    width: 29px;
-    height: 29px;
-    font-size: 8px;
-  }
-  .agent-node b {
-    font-size: 9px;
-  }
-  .agent-node small {
-    font-size: 7px;
+    min-width: 150px;
   }
   .node-one {
-    top: 10%;
-    left: 2%;
+    top: 7%;
+    left: 7%;
   }
   .node-two {
-    top: 25%;
-    right: 1%;
+    top: 18%;
+    right: 6%;
   }
   .node-three {
-    bottom: 8%;
-    left: 10%;
+    bottom: 7%;
+    left: 16%;
   }
 }
 
