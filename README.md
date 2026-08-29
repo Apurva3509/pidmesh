@@ -2,6 +2,8 @@
 
 Fast, local process-aware memory and coordination for concurrent AI agents—implemented in Rust.
 
+[Website](https://apurva3509.github.io/pidmesh/) · [Protocol](docs/protocol.md) · [Releases](https://github.com/Apurva3509/pidmesh/releases)
+
 Run Codex, Claude Code, Cursor, local models, and custom workers in separate terminals without
 making them work blind. Every process gets a workspace-scoped identity, shared durable memory, an
 inbox, a wakeable event stream, and atomic task leases through one private SQLite database.
@@ -51,6 +53,20 @@ Release archives contain both `pidmesh` and `pidmesh-mcp`:
 ```bash
 gh release download --repo Apurva3509/pidmesh --pattern 'pidmesh-*'
 ```
+
+## Open the local control room
+
+Launch a private browser dashboard for the current workspace:
+
+```bash
+pidmesh dashboard
+```
+
+PidMesh prints a one-time local URL containing the session token. The dashboard binds only to
+`127.0.0.1` and shows live agent PIDs, task claims, messages, memory, and the event timeline. You can
+also create memories, send handoffs, claim tasks, and release dashboard-owned claims without leaving
+the page. Use `pidmesh dashboard --port 0` to select an available port automatically; `pidmesh ui` is
+an alias.
 
 ## Five-minute demo
 
@@ -144,6 +160,7 @@ claim has exactly one winner. It also performs a full MCP stdio handshake and na
 Codex PID 4101 ─┐             one connection / process
 Claude PID 4102 ├── CLI/MCP ───────────┐
 Worker PID 4103 ┘                      ├── SQLite WAL
+Browser UI ─── localhost/token ────────┘
                                       └── memory + inbox + claims + events
 
 pidmesh swarm ──┬── Worker PID 5101

@@ -126,6 +126,13 @@ struct AgentRow {
     started_at: i64,
 }
 
+struct DashboardActivity {
+    events: Vec<Value>,
+    memories: Vec<Value>,
+    messages: Vec<Value>,
+    totals: (i64, i64, i64),
+}
+
 impl MeshStore {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
@@ -665,6 +672,58 @@ impl MeshStore {
         })
     }
 
+    pub fn dashboard_snapshot(&self, root: &Path, limit: u32) -> Result<Value> {
+        if !(1..=500).contains(&limit) {
+            bail!("dashboard limit must be between 1 and 500");
+        }
+        let status = self.status(None, Some(root))?;
+        let Some(workspace_id) = status["workspace_id"].as_str().map(ToOwned::to_owned) else {
+            return Ok(json!({
+                "agents": [],
+                "claims": [],
+                "events": [],
+                "generated_at": now_ms()?,
+                "memories": [],
+                "messages": [],
+                "stats": {
+                    "claims": 0,
+                    "events": 0,
+                    "memories": 0,
+                    "messages": 0,
+                    "running_agents": 0,
+                    "total_agents": 0
+                },
+                "workspace": status["workspace"]
+            }));
+        };
+        let activity =
+            self.read(|connection| dashboard_activity(connection, &workspace_id, limit))?;
+        let agents = status["agents"].as_array().cloned().unwrap_or_default();
+        let claims = status["claims"].as_array().cloned().unwrap_or_default();
+        let running_agents = agents
+            .iter()
+            .filter(|agent| agent["status"] == "running")
+            .count();
+        Ok(json!({
+            "agents": agents,
+            "claims": claims,
+            "events": activity.events,
+            "generated_at": now_ms()?,
+            "memories": activity.memories,
+            "messages": activity.messages,
+            "stats": {
+                "claims": claims.len(),
+                "events": activity.totals.2,
+                "memories": activity.totals.0,
+                "messages": activity.totals.1,
+                "running_agents": running_agents,
+                "total_agents": agents.len()
+            },
+            "workspace": status["workspace"],
+            "workspace_id": workspace_id
+        }))
+    }
+
     pub fn events(&self, agent_id: &str, after: i64, limit: u32) -> Result<Value> {
         self.read(|connection| {
             let agent = Self::agent_row(connection, agent_id)?;
@@ -962,6 +1021,77 @@ fn is_busy(error: &rusqlite::Error) -> bool {
         error.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
     )
+}
+
+fn dashboard_activity(
+    connection: &Connection,
+    workspace_id: &str,
+    limit: u32,
+) -> Result<DashboardActivity> {
+    let mut events_statement = connection.prepare(
+        "SELECT e.sequence, e.agent_id, e.event_type, e.subject,
+                e.data_json, e.created_at, a.name
+         FROM events e LEFT JOIN agents a ON a.id = e.agent_id
+         WHERE e.workspace_id = ? ORDER BY e.sequence DESC LIMIT ?",
+    )?;
+    let event_rows = events_statement.query_map(params![workspace_id, limit], |row| {
+        let data: String = row.get(4)?;
+        Ok(json!({
+            "sequence": row.get::<_, i64>(0)?,
+            "agent_id": row.get::<_, Option<String>>(1)?,
+            "event_type": row.get::<_, String>(2)?,
+            "subject": row.get::<_, Option<String>>(3)?,
+            "data": serde_json::from_str::<Value>(&data).unwrap_or_else(|_| json!({})),
+            "created_at": row.get::<_, i64>(5)?,
+            "agent_name": row.get::<_, Option<String>>(6)?
+        }))
+    })?;
+    let events = event_rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut memories_statement = connection.prepare(
+        "SELECT m.id, m.agent_id, m.kind, m.key, m.content, m.importance,
+                m.created_at, a.name
+         FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
+         WHERE m.workspace_id = ? ORDER BY m.created_at DESC, m.id DESC LIMIT ?",
+    )?;
+    let memory_rows = memories_statement.query_map(params![workspace_id, limit], memory_json)?;
+    let memories = memory_rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut messages_statement = connection.prepare(
+        "SELECT m.id, m.body, m.correlation_id, m.created_at,
+                sender.id, sender.name, recipient.id, recipient.name
+         FROM messages m
+         JOIN agents sender ON sender.id = m.sender_id
+         LEFT JOIN agents recipient ON recipient.id = m.recipient_id
+         WHERE m.workspace_id = ? ORDER BY m.created_at DESC, m.id DESC LIMIT ?",
+    )?;
+    let message_rows = messages_statement.query_map(params![workspace_id, limit], |row| {
+        Ok(json!({
+            "id": row.get::<_, i64>(0)?,
+            "body": row.get::<_, String>(1)?,
+            "correlation_id": row.get::<_, Option<String>>(2)?,
+            "created_at": row.get::<_, i64>(3)?,
+            "sender_id": row.get::<_, String>(4)?,
+            "sender_name": row.get::<_, String>(5)?,
+            "recipient_id": row.get::<_, Option<String>>(6)?,
+            "recipient_name": row.get::<_, Option<String>>(7)?
+        }))
+    })?;
+    let messages = message_rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let totals = connection.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM memories WHERE workspace_id = ?),
+            (SELECT COUNT(*) FROM messages WHERE workspace_id = ?),
+            (SELECT COUNT(*) FROM events WHERE workspace_id = ?)",
+        params![workspace_id, workspace_id, workspace_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(DashboardActivity {
+        events,
+        memories,
+        messages,
+        totals,
+    })
 }
 
 fn memory_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {

@@ -1,6 +1,6 @@
 [package]
 name = "pidmesh"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Local process-aware memory and coordination for concurrent AI agents"
@@ -11,6 +11,7 @@ categories = ["command-line-utilities", "database"]
 
 [dependencies]
 anyhow = "1.0"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }
 nix = { version = "0.31", features = ["process", "signal"] }
@@ -19,7 +20,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.47", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 uuid = { version = "1.26", features = ["v4", "v5"] }
 
 [dev-dependencies]
