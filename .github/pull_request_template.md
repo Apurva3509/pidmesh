@@ -4,9 +4,9 @@ Describe the coordination problem and the behavior this changes.
 
 ## Validation
 
-- [ ] `ruff check .`
-- [ ] `ruff format --check .`
-- [ ] `pytest --cov=pidmesh`
+- [ ] `cargo fmt --check`
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings`
+- [ ] `cargo test --all-targets`
 - [ ] Multiprocess behavior is covered when transaction or liveness semantics change
 
 ## Local-first review

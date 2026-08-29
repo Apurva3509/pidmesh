@@ -9,19 +9,29 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          python-version: ${{ matrix.python-version }}
-          enable-cache: true
-      - run: uv sync --locked --group dev
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run pytest --cov=pidmesh --cov-report=term-missing
+          key: ${{ matrix.os }}
+      - run: cargo test --all-targets --locked
+      - run: cargo build --release --bins --locked
+      - run: target/release/pidmesh --version

@@ -1,0 +1,39 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --bins --locked --target ${{ matrix.target }}
+      - name: Package binaries
+        run: |
+          archive="pidmesh-${{ github.event.release.tag_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" \
+            -C "target/${{ matrix.target }}/release" pidmesh pidmesh-mcp
+          gh release upload "${{ github.event.release.tag_name }}" "$archive"
+        env:
+          GH_TOKEN: ${{ github.token }}
