@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="Local PidMesh agent control room" />
+    <title>PidMesh Control Room</title>
+    <link rel="stylesheet" href="/dashboard.css" />
+    <script src="/dashboard.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="PidMesh dashboard home">
+        <span>PIDMESH</span>
+      </a>
+      <div class="workspace">
+        <span class="eyebrow">Workspace</span>
+        <strong id="workspace-name">Connecting…</strong>
+      </div>
+      <div class="connection"><span class="status-dot"></span><span id="connection-label">Local mesh</span></div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Live process intelligence</p>
+          <h1 id="page-title">Your agents,<br /><em>in formation.</em></h1>
+        </div>
+        <p class="hero-copy">Observe every PID, task lease, memory, and handoff moving through this machine—without sending a byte to the cloud.</p>
+      </section>
+
+      <section class="metrics" aria-label="Mesh totals">
+        <article><span>Running</span><strong id="metric-running">—</strong><small>agents online</small></article>
+        <article><span>Claims</span><strong id="metric-claims">—</strong><small>tasks owned</small></article>
+        <article><span>Memory</span><strong id="metric-memories">—</strong><small>durable records</small></article>
+        <article><span>Traffic</span><strong id="metric-messages">—</strong><small>messages routed</small></article>
+      </section>
+
+      <section class="dashboard-grid">
+        <article class="panel agent-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Process topology</p><h2>Active agents</h2></div>
+            <span class="live-pill"><i></i>Live</span>
+          </div>
+          <div class="agent-list" id="agent-list" aria-live="polite"></div>
+        </article>
+
+        <article class="panel command-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Mesh input</p><h2>Command bar</h2></div>
+          </div>
+          <div class="tabs" role="tablist" aria-label="Mesh action">
+            <button class="tab active" data-tab="memory" role="tab">Remember</button>
+            <button class="tab" data-tab="message" role="tab">Message</button>
+            <button class="tab" data-tab="claim" role="tab">Claim</button>
+          </div>
+          <form id="command-form">
+            <label id="command-label" for="command-text">Memory</label>
+            <textarea id="command-text" rows="4" maxlength="65536" placeholder="Record a decision every agent should know…" required></textarea>
+            <div class="form-row" id="memory-options">
+              <label>Kind<input id="memory-kind" value="decision" maxlength="256" /></label>
+              <label>Key<input id="memory-key" placeholder="architecture" maxlength="256" /></label>
+            </div>
+            <div class="form-row hidden" id="message-options">
+              <label>Recipient<input id="message-recipient" value="*" maxlength="256" /></label>
+            </div>
+            <div class="form-row hidden" id="claim-options">
+              <label>Lease, seconds<input id="claim-lease" type="number" min="1" max="86400" value="300" /></label>
+            </div>
+            <button class="primary-button" type="submit"><span id="submit-label">Commit to mesh</span><b aria-hidden="true">↗</b></button>
+            <p class="form-status" id="form-status" role="status"></p>
+          </form>
+        </article>
+
+        <article class="panel claims-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Exclusive ownership</p><h2>Task leases</h2></div>
+          </div>
+          <div id="claim-list" class="claim-list"></div>
+        </article>
+
+        <article class="panel feed-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Ordered locally</p><h2>Collaboration feed</h2></div>
+            <button class="quiet-button" id="refresh-button" type="button">Refresh</button>
+          </div>
+          <div class="feed" id="event-feed" aria-live="polite"></div>
+        </article>
+
+        <article class="panel memory-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Shared context</p><h2>Memory index</h2></div>
+            <label class="search"><span class="sr-only">Search memories</span><input id="memory-search" type="search" placeholder="Search shared memory" /><b>⌕</b></label>
+          </div>
+          <div class="memory-list" id="memory-list"></div>
+        </article>
+      </section>
+    </main>
+    <footer><span>PIDMESH / LOCAL CONTROL PLANE</span><span>Data never leaves 127.0.0.1</span></footer>
+  </body>
+</html>

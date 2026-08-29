@@ -159,6 +159,13 @@ enum Commands {
         #[arg(last = true, required = true)]
         child_command: Vec<OsString>,
     },
+    #[command(alias = "ui")]
+    Dashboard {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, default_value_t = 4399)]
+        port: u16,
+    },
 }
 
 fn main() -> ExitCode {
@@ -328,6 +335,15 @@ fn run() -> Result<u8> {
                 fail_fast,
                 &child_command,
             );
+        }
+        Commands::Dashboard { workspace, port } => {
+            let workspace = PathBuf::from(workspace_root(workspace.as_deref())?);
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to start dashboard runtime")?;
+            runtime.block_on(pidmesh::dashboard::serve(store, workspace, port))?;
+            return Ok(0);
         }
     }
     Ok(0)

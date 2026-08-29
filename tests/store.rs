@@ -1,3 +1,5 @@
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -49,6 +51,38 @@ fn memory_is_shared_and_workspace_scoped() -> Result<()> {
         .context("recall did not return an array")?;
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0]["agent_name"], "codex");
+    Ok(())
+}
+
+#[test]
+fn dashboard_snapshot_combines_only_the_selected_workspace() -> Result<()> {
+    let (directory, store) = setup()?;
+    let primary = directory.path().join("primary");
+    let other = directory.path().join("other");
+    std::fs::create_dir_all(&primary)?;
+    std::fs::create_dir_all(&other)?;
+    let planner = register(&store, "planner", &primary)?;
+    let worker = register(&store, "worker", &primary)?;
+    let outsider = register(&store, "outsider", &other)?;
+    store.remember(&planner, "primary decision", "decision", None, 0.8)?;
+    store.remember(&outsider, "other decision", "decision", None, 0.8)?;
+    store.send(&planner, "start implementation", "worker", None)?;
+    store.claim(&worker, "src/store.rs", 300, None)?;
+
+    let snapshot = store.dashboard_snapshot(&primary, 100)?;
+    assert_eq!(snapshot["stats"]["total_agents"], 2);
+    assert_eq!(snapshot["stats"]["memories"], 1);
+    assert_eq!(snapshot["stats"]["messages"], 1);
+    assert_eq!(snapshot["stats"]["claims"], 1);
+    assert_eq!(snapshot["memories"][0]["content"], "primary decision");
+    assert_eq!(snapshot["messages"][0]["recipient_name"], "worker");
+    assert!(
+        snapshot["agents"]
+            .as_array()
+            .context("agents")?
+            .iter()
+            .all(|agent| agent["name"] != "outsider")
+    );
     Ok(())
 }
 
@@ -495,4 +529,112 @@ fn swarm_interrupt_terminates_every_worker_and_releases_sessions() -> Result<()>
             .all(|agent| agent["status"] == "stopped")
     );
     Ok(())
+}
+
+#[test]
+fn dashboard_api_is_token_protected_and_cleans_up_its_session() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("dashboard.db");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "dashboard",
+            "--port",
+            "0",
+            "--workspace",
+            directory.path().to_str().context("workspace path")?,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut startup = String::new();
+    BufReader::new(child.stdout.take().context("dashboard stdout")?).read_line(&mut startup)?;
+    let startup: Value = serde_json::from_str(&startup)?;
+    let address = startup["listening"].as_str().context("listening address")?;
+    let token = startup["dashboard"]
+        .as_str()
+        .and_then(|url| url.split("#token=").nth(1))
+        .context("dashboard token")?;
+
+    let health = http_request(address, "GET", "/healthz", &[], "")?;
+    assert_eq!(health.0, 200);
+    assert!(
+        health
+            .1
+            .to_ascii_lowercase()
+            .contains("content-security-policy:")
+    );
+    let unauthorized = http_request(address, "GET", "/api/v1/snapshot", &[], "")?;
+    assert_eq!(unauthorized.0, 401);
+    let authorization = format!("Bearer {token}");
+    let foreign = http_request(
+        address,
+        "GET",
+        "/api/v1/snapshot",
+        &[
+            ("Authorization", authorization.as_str()),
+            ("Origin", "https://attacker.example"),
+        ],
+        "",
+    )?;
+    assert_eq!(foreign.0, 403);
+    let remembered = http_request(
+        address,
+        "POST",
+        "/api/v1/memories",
+        &[("Authorization", authorization.as_str())],
+        r#"{"text":"dashboard memory","kind":"decision","importance":0.9}"#,
+    )?;
+    assert_eq!(remembered.0, 200, "{}", remembered.2);
+    let recalled = http_request(
+        address,
+        "GET",
+        "/api/v1/memories?q=dashboard&limit=10",
+        &[("Authorization", authorization.as_str())],
+        "",
+    )?;
+    assert_eq!(recalled.0, 200);
+    assert!(recalled.2.contains("dashboard memory"));
+
+    kill(Pid::from_raw(i32::try_from(child.id())?), Signal::SIGINT)?;
+    assert!(child.wait()?.success());
+    let store = MeshStore::new(database)?;
+    let status = store.status(None, Some(directory.path()))?;
+    assert_eq!(status["agents"][0]["status"], "stopped");
+    Ok(())
+}
+
+fn http_request(
+    address: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<(u16, String, String)> {
+    let mut stream = TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    )?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    if !body.is_empty() {
+        write!(stream, "Content-Type: application/json\r\n")?;
+    }
+    write!(stream, "\r\n{body}")?;
+    stream.flush()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (head, body) = response.split_once("\r\n\r\n").context("HTTP response")?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("HTTP status")?
+        .parse()?;
+    Ok((status, head.to_owned(), body.to_owned()))
 }
