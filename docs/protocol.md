@@ -4,6 +4,10 @@ PidMesh scopes all state to a canonical workspace path. Agent sessions get immut
 their human-readable name, operating-system PID, and a random suffix. Names are convenient routing
 aliases; IDs are the stable address.
 
+Each Rust process holds one configured SQLite connection for its lifetime. Clones inside that process
+share the connection through a mutex; independent PIDs coordinate through SQLite WAL and immediate
+write transactions. The schema remains compatible with databases created by Python v0.1 and v0.2.
+
 ## Session lifecycle
 
 1. A process joins with its PID, provider, and capabilities.

@@ -1,38 +1,55 @@
 # PidMesh
 
-Local process-aware memory and coordination for concurrent AI agents.
+Fast, local process-aware memory and coordination for concurrent AI agents—implemented in Rust.
 
 Run Codex, Claude Code, Cursor, local models, and custom workers in separate terminals without
-making them work blind. PidMesh gives every process a workspace-scoped identity, shared durable
-memory, an inbox, an ordered event stream, and atomic task leases through one private SQLite file.
+making them work blind. Every process gets a workspace-scoped identity, shared durable memory, an
+inbox, a wakeable event stream, and atomic task leases through one private SQLite database.
 
-No daemon. No cloud account. No API key.
+No daemon. No Python runtime. No cloud account. No API key.
 
 ## Why this exists
 
-Long-term memory systems are good at retrieving old context. Agent message buses are good at chat.
-Neither primitive answers the operating-system questions that matter when many local agents work at
-once:
+Long-term memory systems retrieve old context. Agent message buses move text. Neither primitive
+answers the operating-system questions that matter when many local agents work simultaneously:
 
-- Which sessions are actually alive?
-- Which PID owns the task right now?
+- Which sessions and PIDs are alive?
+- Which process owns a task right now?
 - Can another worker safely take over after a crash?
 - Did two agents start the same edit?
 - What decisions and handoffs happened in order?
 
-PidMesh is a small coordination kernel for those questions. It uses SQLite WAL, short transactions,
-and expiring leases so concurrent processes coordinate without a broker.
+PidMesh is the coordination kernel for those questions. Each process keeps one native SQLite
+connection, while WAL and short `BEGIN IMMEDIATE` transactions coordinate safely across processes.
+
+## Performance
+
+Measured on Apple Silicon with the same SQLite schema and workload:
+
+| Operation | Python v0.2 | Rust v1.0 | Improvement |
+| --- | ---: | ---: | ---: |
+| CLI startup, median of 100 | 34.105 ms | 7.153 ms | 4.8× faster |
+| Durable memory writes | 1,333/sec | 15,596/sec | 11.7× faster |
+| FTS5 recalls over 2,000 memories | 607/sec | 934/sec | 1.5× faster |
+
+Throughput values are medians of five runs with 2,000 committed writes and 500 ranked FTS5 recalls:
+
+```bash
+cargo run --release --example benchmark
+```
 
 ## Install
 
+From source:
+
 ```bash
-uv tool install 'pidmesh[mcp]'
+cargo install --git https://github.com/Apurva3509/pidmesh --locked
 ```
 
-Until a package release is available, install directly from GitHub:
+Release archives contain both `pidmesh` and `pidmesh-mcp`:
 
 ```bash
-uv tool install 'pidmesh[mcp] @ git+https://github.com/Apurva3509/pidmesh.git'
+gh release download --repo Apurva3509/pidmesh --pattern 'pidmesh-*'
 ```
 
 ## Five-minute demo
@@ -57,7 +74,7 @@ pidmesh claim store.claim --lease-seconds 900
 pidmesh recall "architecture SQLite"
 ```
 
-Inspect the mesh from another terminal:
+Inspect or wait on the mesh from another terminal:
 
 ```bash
 pidmesh status
@@ -66,66 +83,64 @@ pidmesh wait --agent "$PIDMESH_AGENT_ID" --after 42 --timeout-seconds 30
 pidmesh gc
 ```
 
-Every command emits JSON so both humans and agents can consume it reliably.
+Every command emits JSON for reliable agent consumption.
 
 ## MCP setup
 
-PidMesh exposes nine tools: status, remember, recall, send, inbox, claim, release, event stream, and
-bounded event waiting.
-Each MCP server process registers its real PID, pulses its heartbeat every five seconds, and marks
-itself stopped during a clean shutdown.
+The native MCP server uses the official Rust SDK and exposes nine tools: status, remember, recall,
+send, inbox, claim, release, event stream, and bounded event waiting.
 
 Claude Code:
 
 ```bash
-claude mcp add --scope user pidmesh -- uvx --from 'pidmesh[mcp]' pidmesh-mcp
+claude mcp add --scope user pidmesh -- pidmesh-mcp
 ```
 
 Codex:
 
 ```toml
 [mcp_servers.pidmesh]
-command = "uvx"
-args = ["--from", "pidmesh[mcp]", "pidmesh-mcp"]
+command = "pidmesh-mcp"
 env = { PIDMESH_AGENT_NAME = "codex", PIDMESH_PROVIDER = "codex" }
 ```
 
-Set `PIDMESH_WORKSPACE` when the host does not launch the server from the project directory. Set
-`PIDMESH_DB` to share a different database; the default is `~/.pidmesh/pidmesh.db`.
+Each MCP process registers its real PID, pulses its heartbeat every five seconds, and releases its
+claims during a clean shutdown. Set `PIDMESH_WORKSPACE` when the host does not start the server from
+the project directory. `PIDMESH_DB` overrides the default `~/.pidmesh/pidmesh.db`.
 
 ## Concurrency guarantees
 
-- WAL mode allows readers while other agents write.
-- Writes use bounded retries and `BEGIN IMMEDIATE` transactions.
-- A task claim has exactly one owner until its lease expires or the owner releases it.
-- Stopped or dead sessions release their claims.
-- Broadcast acknowledgements are tracked independently for every agent.
-- Workspaces are isolated even though all projects can share one database.
-- Long polling wakes an agent on the next event without a tight database polling loop.
+- A persistent connection removes per-operation setup overhead within each process.
+- WAL allows readers while other processes write.
+- Bounded retries and `BEGIN IMMEDIATE` serialize competing mutations.
+- A task claim has exactly one owner until expiry or explicit release.
+- Stopped and dead sessions release their claims.
+- Broadcast acknowledgements are independent for every agent.
+- Workspaces remain isolated inside a shared database.
+- Bounded waits wake agents without a tight polling loop.
 
-The test suite launches eight simultaneous processes to verify write integrity and prove that an
-atomic claim has one winner.
+The test suite launches eight separate processes to verify write integrity and prove that one atomic
+claim has exactly one winner. It also performs a full MCP stdio handshake and native tool call.
 
 ## Architecture
 
 ```text
-Codex PID 4101 ─┐
-Claude PID 4102 ├── CLI / MCP ── SQLite WAL ── memory + inbox + claims + events
-Worker PID 4103 ┘                    │
-                                  pid liveness
+Codex PID 4101 ─┐             one connection / process
+Claude PID 4102 ├── CLI/MCP ───────────┐
+Worker PID 4103 ┘                      ├── SQLite WAL
+                                      └── memory + inbox + claims + events
 ```
 
-See [docs/protocol.md](docs/protocol.md) for the storage and lifecycle contract.
+The Rust runtime reads databases created by the earlier Python releases without a migration. See
+[docs/protocol.md](docs/protocol.md) for the storage and lifecycle contract.
 
 ## Development
 
 ```bash
-uv venv
-source .venv/bin/activate
-uv sync --group dev
-ruff check .
-ruff format --check .
-pytest --cov=pidmesh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --locked
+cargo build --release --bins --locked
 ```
 
 ## License
