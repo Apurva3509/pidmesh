@@ -94,6 +94,14 @@ struct ClaimRequest {
     task: String,
 }
 
+#[derive(Deserialize)]
+struct ResourceRequest {
+    detail: Option<String>,
+    lease_seconds: Option<u64>,
+    resources: Vec<String>,
+    task: Option<String>,
+}
+
 pub async fn serve(store: MeshStore, workspace: PathBuf, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -179,6 +187,12 @@ fn router(state: DashboardState) -> Router {
         .route("/api/v1/messages", post(send))
         .route("/api/v1/claims", post(claim))
         .route("/api/v1/claims/{task}", delete(release))
+        .route(
+            "/api/v1/resources",
+            get(resources)
+                .post(reserve_resources)
+                .delete(release_resources),
+        )
         .layer(DefaultBodyLimit::max(MAX_TEXT_BYTES))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -336,6 +350,64 @@ async fn release(
     Ok(Json(json!({"released": released})))
 }
 
+async fn resources(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let store = state.store.clone();
+    let agent_id = Arc::clone(&state.agent_id);
+    let value = blocking(move || store.resources(&agent_id)).await?;
+    Ok(Json(value))
+}
+
+async fn reserve_resources(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(request): Json<ResourceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    validate_resources(&request.resources)?;
+    if let Some(task) = request.task.as_deref() {
+        validate_label("task", task)?;
+    }
+    if let Some(detail) = request.detail.as_deref() {
+        validate_text("detail", detail)?;
+    }
+    let lease_seconds = request.lease_seconds.unwrap_or(900);
+    if !(1..=86_400).contains(&lease_seconds) {
+        return Err(ApiError::BadRequest(
+            "lease must be between 1 and 86400 seconds".to_owned(),
+        ));
+    }
+    let store = state.store.clone();
+    let agent_id = Arc::clone(&state.agent_id);
+    let value = blocking(move || {
+        store.reserve_resources(
+            &agent_id,
+            &request.resources,
+            request.task.as_deref(),
+            request.detail.as_deref(),
+            lease_seconds,
+        )
+    })
+    .await?;
+    Ok(Json(value))
+}
+
+async fn release_resources(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(request): Json<ResourceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    validate_resources(&request.resources)?;
+    let store = state.store.clone();
+    let agent_id = Arc::clone(&state.agent_id);
+    let released = blocking(move || store.release_resources(&agent_id, &request.resources)).await?;
+    Ok(Json(json!({"released": released})))
+}
+
 fn authorize(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError> {
     let expected = format!("Bearer {}", state.token);
     if headers
@@ -373,6 +445,18 @@ fn validate_label(label: &str, value: &str) -> Result<(), ApiError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_resources(resources: &[String]) -> Result<(), ApiError> {
+    if resources.is_empty() || resources.len() > 64 {
+        return Err(ApiError::BadRequest(
+            "resources must contain between 1 and 64 entries".to_owned(),
+        ));
+    }
+    for resource in resources {
+        validate_label("resource", resource)?;
+    }
+    Ok(())
 }
 
 async fn blocking<T>(operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T, ApiError>

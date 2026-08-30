@@ -4,99 +4,157 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <meta name="description" content="Local PidMesh agent control room" />
-    <title>PidMesh Control Room</title>
+    <meta name="description" content="Local PidMesh agent operations cockpit" />
+    <title>PidMesh Cockpit</title>
     <link rel="stylesheet" href="/dashboard.css" />
     <script src="/dashboard.js" defer></script>
   </head>
   <body>
-    <header class="topbar">
-      <a class="brand" href="/" aria-label="PidMesh dashboard home">
-        <span>PIDMESH</span>
-      </a>
-      <div class="workspace">
-        <span class="eyebrow">Workspace</span>
-        <strong id="workspace-name">Connecting…</strong>
-      </div>
-      <div class="connection"><span class="status-dot"></span><span id="connection-label">Local mesh</span></div>
-    </header>
-
-    <main>
-      <section class="hero" aria-labelledby="page-title">
-        <div>
-          <p class="eyebrow">Live process intelligence</p>
-          <h1 id="page-title">Your agents,<br /><em>in formation.</em></h1>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#overview" aria-label="PidMesh cockpit home">
+          <span class="brand-mark">PM</span>
+          <span><strong>PidMesh</strong><small>Local kernel</small></span>
+        </a>
+        <nav aria-label="Cockpit sections">
+          <p class="nav-label">Workspace</p>
+          <a class="nav-item active" href="#overview"><span>⌂</span>Overview</a>
+          <a class="nav-item" href="#fleet"><span>◉</span>Agent fleet <b id="nav-agent-count">0</b></a>
+          <a class="nav-item" href="#work"><span>◇</span>Active work <b id="nav-work-count">0</b></a>
+          <a class="nav-item" href="#context"><span>⌘</span>Shared context</a>
+          <a class="nav-item" href="#trace"><span>↳</span>Event trace</a>
+        </nav>
+        <div class="sidebar-project">
+          <p class="nav-label">Logical project</p>
+          <strong id="project-name">Connecting…</strong>
+          <span id="project-path">Waiting for local mesh</span>
         </div>
-        <p class="hero-copy">Observe every PID, task lease, memory, and handoff moving through this machine—without sending a byte to the cloud.</p>
-      </section>
+        <div class="privacy-badge">
+          <i></i>
+          <span><strong>Loopback only</strong><small>Nothing leaves this machine</small></span>
+        </div>
+      </aside>
 
-      <section class="metrics" aria-label="Mesh totals">
-        <article><span>Running</span><strong id="metric-running">—</strong><small>agents online</small></article>
-        <article><span>Claims</span><strong id="metric-claims">—</strong><small>tasks owned</small></article>
-        <article><span>Memory</span><strong id="metric-memories">—</strong><small>durable records</small></article>
-        <article><span>Traffic</span><strong id="metric-messages">—</strong><small>messages routed</small></article>
-      </section>
+      <div class="workspace-shell">
+        <header class="topbar">
+          <div>
+            <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Toggle navigation">☰</button>
+            <p class="eyebrow">Agent operations / <span id="workspace-crumb">local</span></p>
+            <h1>Control room</h1>
+          </div>
+          <div class="topbar-actions">
+            <span class="connection"><i></i><span id="connection-label">Connecting</span></span>
+            <button class="secondary-button" id="refresh-button" type="button">Refresh</button>
+            <button class="primary-button" id="new-action-button" type="button">New action <span>⌘K</span></button>
+          </div>
+        </header>
 
-      <section class="dashboard-grid">
-        <article class="panel agent-panel">
-          <div class="panel-heading">
-            <div><p class="eyebrow">Process topology</p><h2>Active agents</h2></div>
-            <span class="live-pill"><i></i>Live</span>
-          </div>
-          <div class="agent-list" id="agent-list" aria-live="polite"></div>
-        </article>
-
-        <article class="panel command-panel">
-          <div class="panel-heading">
-            <div><p class="eyebrow">Mesh input</p><h2>Command bar</h2></div>
-          </div>
-          <div class="tabs" role="tablist" aria-label="Mesh action">
-            <button class="tab active" data-tab="memory" role="tab">Remember</button>
-            <button class="tab" data-tab="message" role="tab">Message</button>
-            <button class="tab" data-tab="claim" role="tab">Claim</button>
-          </div>
-          <form id="command-form">
-            <label id="command-label" for="command-text">Memory</label>
-            <textarea id="command-text" rows="4" maxlength="65536" placeholder="Record a decision every agent should know…" required></textarea>
-            <div class="form-row" id="memory-options">
-              <label>Kind<input id="memory-kind" value="decision" maxlength="256" /></label>
-              <label>Key<input id="memory-key" placeholder="architecture" maxlength="256" /></label>
+        <main>
+          <section class="overview" id="overview" aria-labelledby="overview-title">
+            <div class="section-heading overview-heading">
+              <div>
+                <p class="eyebrow">Live project state</p>
+                <h2 id="overview-title">Five agents should feel like one system.</h2>
+              </div>
+              <p>Track the processes, ownership, collisions, handoffs, and decisions beneath every agent workspace.</p>
             </div>
-            <div class="form-row hidden" id="message-options">
-              <label>Recipient<input id="message-recipient" value="*" maxlength="256" /></label>
+            <div class="metrics" aria-label="Mesh totals">
+              <article><span class="metric-icon green">◉</span><div><small>Running agents</small><strong id="metric-running">—</strong></div><em id="metric-total">— registered</em></article>
+              <article><span class="metric-icon blue">◇</span><div><small>Task claims</small><strong id="metric-claims">—</strong></div><em>atomic ownership</em></article>
+              <article><span class="metric-icon orange">⌁</span><div><small>Resources held</small><strong id="metric-resources">—</strong></div><em>paths, ports, services</em></article>
+              <article><span class="metric-icon violet">⌘</span><div><small>Shared memories</small><strong id="metric-memories">—</strong></div><em id="metric-messages">— messages routed</em></article>
             </div>
-            <div class="form-row hidden" id="claim-options">
-              <label>Lease, seconds<input id="claim-lease" type="number" min="1" max="86400" value="300" /></label>
+            <section class="attention panel" aria-labelledby="attention-title">
+              <div class="panel-heading compact">
+                <div><p class="eyebrow">Operator attention</p><h3 id="attention-title">What needs you now</h3></div>
+                <span class="count-pill" id="attention-count">0</span>
+              </div>
+              <div class="attention-list" id="attention-list"></div>
+            </section>
+          </section>
+
+          <section class="cockpit-grid" id="fleet">
+            <article class="panel fleet-panel">
+              <div class="panel-heading">
+                <div><p class="eyebrow">Process topology</p><h3>Agent fleet</h3></div>
+                <span class="live-pill"><i></i>Live</span>
+              </div>
+              <div class="agent-list" id="agent-list" aria-live="polite"></div>
+            </article>
+            <article class="panel command-panel" id="command-panel">
+              <div class="panel-heading">
+                <div><p class="eyebrow">Human intervention</p><h3>Route an action</h3></div>
+                <kbd>⌘ K</kbd>
+              </div>
+              <div class="tabs" role="tablist" aria-label="Mesh action">
+                <button class="tab active" data-tab="message" role="tab">Message</button>
+                <button class="tab" data-tab="memory" role="tab">Remember</button>
+                <button class="tab" data-tab="claim" role="tab">Claim</button>
+                <button class="tab" data-tab="reserve" role="tab">Reserve</button>
+              </div>
+              <form id="command-form">
+                <label id="command-label" for="command-text">Message</label>
+                <textarea id="command-text" rows="4" maxlength="65536" placeholder="Send a direction or handoff to an agent…" required></textarea>
+                <div class="form-row hidden" id="memory-options">
+                  <label>Kind<input id="memory-kind" value="decision" maxlength="256" /></label>
+                  <label>Key<input id="memory-key" placeholder="architecture" maxlength="256" /></label>
+                </div>
+                <div class="form-row" id="message-options">
+                  <label>Recipient<select id="message-recipient"><option value="*">Everyone</option></select></label>
+                </div>
+                <div class="form-row hidden" id="lease-options">
+                  <label>Lease, seconds<input id="claim-lease" type="number" min="1" max="86400" value="900" /></label>
+                  <label id="reserve-task-label" class="hidden">Task key<input id="reserve-task" maxlength="256" placeholder="dashboard-v1.3" /></label>
+                </div>
+                <button class="submit-button" type="submit"><span id="submit-label">Route message</span><b aria-hidden="true">↗</b></button>
+                <p class="form-status" id="form-status" role="status"></p>
+              </form>
+            </article>
+          </section>
+
+          <section class="work-grid" id="work">
+            <article class="panel resources-panel">
+              <div class="panel-heading">
+                <div><p class="eyebrow">Collision guard</p><h3>Resource ownership</h3></div>
+                <span class="panel-note">hierarchical + atomic</span>
+              </div>
+              <div id="resource-list" class="resource-list"></div>
+            </article>
+            <article class="panel claims-panel">
+              <div class="panel-heading">
+                <div><p class="eyebrow">Execution leases</p><h3>Active tasks</h3></div>
+                <span class="panel-note">crash recoverable</span>
+              </div>
+              <div id="claim-list" class="claim-list"></div>
+            </article>
+          </section>
+
+          <section class="context-grid" id="context">
+            <article class="panel message-panel">
+              <div class="panel-heading">
+                <div><p class="eyebrow">Handoff traffic</p><h3>Agent messages</h3></div>
+                <span class="panel-note" id="message-count">0 routed</span>
+              </div>
+              <div class="message-list" id="message-list"></div>
+            </article>
+            <article class="panel memory-panel">
+              <div class="panel-heading">
+                <div><p class="eyebrow">Durable context</p><h3>Shared memory</h3></div>
+                <label class="search"><span class="sr-only">Search memories</span><input id="memory-search" type="search" placeholder="Search decisions" /><b>⌕</b></label>
+              </div>
+              <div class="memory-list" id="memory-list"></div>
+            </article>
+          </section>
+
+          <section class="panel trace-panel" id="trace">
+            <div class="panel-heading">
+              <div><p class="eyebrow">Causal ledger</p><h3>Event trace</h3></div>
+              <span class="panel-note">SQLite ordered</span>
             </div>
-            <button class="primary-button" type="submit"><span id="submit-label">Commit to mesh</span><b aria-hidden="true">↗</b></button>
-            <p class="form-status" id="form-status" role="status"></p>
-          </form>
-        </article>
-
-        <article class="panel claims-panel">
-          <div class="panel-heading">
-            <div><p class="eyebrow">Exclusive ownership</p><h2>Task leases</h2></div>
-          </div>
-          <div id="claim-list" class="claim-list"></div>
-        </article>
-
-        <article class="panel feed-panel">
-          <div class="panel-heading">
-            <div><p class="eyebrow">Ordered locally</p><h2>Collaboration feed</h2></div>
-            <button class="quiet-button" id="refresh-button" type="button">Refresh</button>
-          </div>
-          <div class="feed" id="event-feed" aria-live="polite"></div>
-        </article>
-
-        <article class="panel memory-panel">
-          <div class="panel-heading">
-            <div><p class="eyebrow">Shared context</p><h2>Memory index</h2></div>
-            <label class="search"><span class="sr-only">Search memories</span><input id="memory-search" type="search" placeholder="Search shared memory" /><b>⌕</b></label>
-          </div>
-          <div class="memory-list" id="memory-list"></div>
-        </article>
-      </section>
-    </main>
-    <footer><span>PIDMESH / LOCAL CONTROL PLANE</span><span>Data never leaves 127.0.0.1</span></footer>
+            <div class="feed" id="event-feed" aria-live="polite"></div>
+          </section>
+        </main>
+      </div>
+    </div>
   </body>
 </html>

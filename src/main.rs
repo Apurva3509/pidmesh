@@ -101,6 +101,28 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
     },
+    Reserve {
+        #[arg(required = true)]
+        resources: Vec<String>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        detail: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        lease_seconds: u64,
+    },
+    Resources {
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    Unreserve {
+        #[arg(required = true)]
+        resources: Vec<String>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
     Status {
         #[arg(long)]
         agent: Option<String>,
@@ -275,6 +297,25 @@ fn run() -> Result<u8> {
         Commands::Release { task, agent } => emit(&json!({
             "released": store.release(&agent_id(agent.as_deref())?, &task)?
         }))?,
+        Commands::Reserve {
+            resources,
+            agent,
+            task,
+            detail,
+            lease_seconds,
+        } => emit(&store.reserve_resources(
+            &agent_id(agent.as_deref())?,
+            &resources,
+            task.as_deref(),
+            detail.as_deref(),
+            lease_seconds,
+        )?)?,
+        Commands::Resources { agent } => {
+            emit(&store.resources(&agent_id(agent.as_deref())?)?)?;
+        }
+        Commands::Unreserve { resources, agent } => emit(&json!({
+            "released": store.release_resources(&agent_id(agent.as_deref())?, &resources)?
+        }))?,
         Commands::Status { agent, workspace } => {
             emit(&store.status(agent.as_deref(), workspace.as_deref())?)?;
         }
@@ -402,7 +443,7 @@ fn run_swarm(
         let registration = store.register_agent(
             &name,
             std::process::id(),
-            Some(std::path::Path::new(&root)),
+            workspace,
             provider,
             &["swarm-worker".to_owned()],
             Some(&agent_id),
@@ -579,7 +620,7 @@ fn run_supervised(
     let mut registration = store.register_agent(
         name,
         std::process::id(),
-        Some(std::path::Path::new(&root)),
+        workspace,
         provider,
         &[],
         Some(&agent_id),

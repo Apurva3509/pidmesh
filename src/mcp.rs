@@ -68,6 +68,20 @@ struct ReleaseParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct ReserveResourcesParams {
+    resources: Vec<String>,
+    task: Option<String>,
+    detail: Option<String>,
+    #[serde(default = "default_lease")]
+    lease_seconds: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReleaseResourcesParams {
+    resources: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct EventParams {
     #[serde(default)]
     after_sequence: i64,
@@ -92,7 +106,15 @@ impl PidMeshMcp {
         let name = env::var("PIDMESH_AGENT_NAME").unwrap_or_else(|_| "mcp-agent".to_owned());
         let provider = env::var("PIDMESH_PROVIDER").unwrap_or_else(|_| "mcp".to_owned());
         let workspace = env::var_os("PIDMESH_WORKSPACE").map(PathBuf::from);
-        let capabilities = ["memory", "messaging", "claims", "events", "wait"].map(str::to_owned);
+        let capabilities = [
+            "memory",
+            "messaging",
+            "claims",
+            "resources",
+            "events",
+            "wait",
+        ]
+        .map(str::to_owned);
         let registration = store.register_agent(
             &name,
             std::process::id(),
@@ -123,7 +145,7 @@ impl PidMeshMcp {
         self.agent_id.clone()
     }
 
-    #[tool(description = "List local agents, process liveness, and active task claims")]
+    #[tool(description = "List local agents, process liveness, task claims, and resource leases")]
     fn mesh_status(&self) -> Result<CallToolResult, McpError> {
         let result = self
             .store
@@ -220,6 +242,32 @@ impl PidMeshMcp {
         )
     }
 
+    #[tool(description = "Atomically reserve paths or other resources before using them")]
+    fn reserve_resources(
+        &self,
+        Parameters(parameters): Parameters<ReserveResourcesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_result(self.store.reserve_resources(
+            &self.agent_id,
+            &parameters.resources,
+            parameters.task.as_deref(),
+            parameters.detail.as_deref(),
+            parameters.lease_seconds,
+        ))
+    }
+
+    #[tool(description = "Release resource leases owned by this agent")]
+    fn release_resources(
+        &self,
+        Parameters(parameters): Parameters<ReleaseResourcesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tool_result(
+            self.store
+                .release_resources(&self.agent_id, &parameters.resources)
+                .map(|released| json!({"released": released})),
+        )
+    }
+
     #[tool(description = "Read ordered coordination events after a sequence number")]
     fn event_stream(
         &self,
@@ -260,8 +308,8 @@ impl PidMeshMcp {
 
 #[tool_handler(
     name = "PidMesh",
-    version = "1.0.0",
-    instructions = "Check status and inbox before work, claim a task before editing, and record decisions as memories."
+    version = "1.3.0",
+    instructions = "Check status and inbox, claim a task, reserve intended paths before editing, and record decisions as memories."
 )]
 impl ServerHandler for PidMeshMcp {}
 
