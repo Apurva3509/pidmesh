@@ -60,8 +60,10 @@ fn stdio_server_negotiates_and_exposes_native_tools() -> Result<()> {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 9);
+    assert_eq!(names.len(), 11);
     assert!(names.contains(&"claim"));
+    assert!(names.contains(&"reserve_resources"));
+    assert!(names.contains(&"release_resources"));
     assert!(names.contains(&"wait_for_events"));
 
     let remembered = exchange(
@@ -80,11 +82,32 @@ fn stdio_server_negotiates_and_exposes_native_tools() -> Result<()> {
     assert_eq!(remembered["result"]["isError"], false);
     assert!(remembered["result"]["structuredContent"]["memory_id"].is_number());
 
+    let reserved = exchange(
+        &mut stdin,
+        &mut stdout,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "reserve_resources",
+                "arguments": {
+                    "resources": ["path:src/mcp.rs", "port:4399"],
+                    "task": "mcp-integration",
+                    "lease_seconds": 60
+                }
+            }
+        }),
+    )?;
+    assert_eq!(reserved["result"]["isError"], false);
+    assert_eq!(reserved["result"]["structuredContent"]["acquired"], true);
+
     drop(stdin);
     let status = child.wait()?;
     assert!(status.success());
     let store = MeshStore::new(directory.path().join("mesh.db"))?;
     let mesh = store.status(None, Some(directory.path()))?;
     assert_eq!(mesh["agents"][0]["status"], "stopped");
+    assert_eq!(mesh["resources"], json!([]));
     Ok(())
 }

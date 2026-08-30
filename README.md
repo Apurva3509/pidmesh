@@ -6,7 +6,8 @@ Fast, local process-aware memory and coordination for concurrent AI agents—imp
 
 Run Codex, Claude Code, Cursor, local models, and custom workers in separate terminals without
 making them work blind. Every process gets a workspace-scoped identity, shared durable memory, an
-inbox, a wakeable event stream, and atomic task leases through one private SQLite database.
+inbox, a wakeable event stream, atomic task leases, and hierarchical resource reservations through
+one private SQLite database.
 
 No daemon. No Python runtime. No cloud account. No API key.
 
@@ -17,6 +18,7 @@ answers the operating-system questions that matter when many local agents work s
 
 - Which sessions and PIDs are alive?
 - Which process owns a task right now?
+- Which agent owns a path, port, or local service before another process collides with it?
 - Can another worker safely take over after a crash?
 - Did two agents start the same edit?
 - What decisions and handoffs happened in order?
@@ -63,10 +65,11 @@ pidmesh dashboard
 ```
 
 PidMesh prints a one-time local URL containing the session token. The dashboard binds only to
-`127.0.0.1` and shows live agent PIDs, task claims, messages, memory, and the event timeline. You can
-also create memories, send handoffs, claim tasks, and release dashboard-owned claims without leaving
-the page. Use `pidmesh dashboard --port 0` to select an available port automatically; `pidmesh ui` is
-an alias.
+`127.0.0.1` and opens the PidMesh Cockpit: operator attention, live agent PIDs, checkout branches,
+task claims, path/port/service ownership, handoffs, memory, and the causal event ledger. You can also
+create memories, send handoffs, claim tasks, and atomically reserve resources without leaving the
+page. Use `pidmesh dashboard --port 0` to select an available port automatically; `pidmesh ui` is an
+alias.
 
 ## Five-minute demo
 
@@ -87,6 +90,7 @@ pidmesh send "Implement the claim transaction" --to implementer
 export PIDMESH_AGENT_ID=implementer-5678-efgh5678
 pidmesh inbox --ack
 pidmesh claim store.claim --lease-seconds 900
+pidmesh reserve path:src/store.rs port:4399 --task store.claim --lease-seconds 900
 pidmesh recall "architecture SQLite"
 ```
 
@@ -94,6 +98,8 @@ Inspect or wait on the mesh from another terminal:
 
 ```bash
 pidmesh status
+pidmesh resources
+pidmesh unreserve path:src/store.rs port:4399
 pidmesh events --agent "$PIDMESH_AGENT_ID"
 pidmesh wait --agent "$PIDMESH_AGENT_ID" --after 42 --timeout-seconds 30
 pidmesh gc
@@ -117,10 +123,14 @@ The supervisor heartbeats every live worker, observes exits independently, and m
 when they finish. `--fail-fast` terminates the remaining workers after the first failure. Ctrl-C,
 SIGTERM, and SIGHUP request a graceful shutdown before forcing stragglers to exit.
 
+Linked git worktrees automatically join the same logical project mesh. PidMesh still records each
+agent's actual checkout path and branch, so a fleet launched by Superset, Intent, Orca, or a manual
+`git worktree` workflow can coordinate through one kernel without losing branch-level visibility.
+
 ## MCP setup
 
-The native MCP server uses the official Rust SDK and exposes nine tools: status, remember, recall,
-send, inbox, claim, release, event stream, and bounded event waiting.
+The native MCP server uses the official Rust SDK and exposes eleven tools: status, remember, recall,
+send, inbox, claim, release, resource reservation/release, event stream, and bounded event waiting.
 
 Claude Code:
 
@@ -137,8 +147,10 @@ env = { PIDMESH_AGENT_NAME = "codex", PIDMESH_PROVIDER = "codex" }
 ```
 
 Each MCP process registers its real PID, pulses its heartbeat every five seconds, and releases its
-claims during a clean shutdown. Set `PIDMESH_WORKSPACE` when the host does not start the server from
-the project directory. `PIDMESH_DB` overrides the default `~/.pidmesh/pidmesh.db`.
+claims and resource reservations during a clean shutdown. Linked git worktrees are detected
+automatically. Set `PIDMESH_WORKSPACE` to override that project identity when the host does not start
+the server from the project directory. `PIDMESH_DB` overrides the default
+`~/.pidmesh/pidmesh.db`.
 
 ## Concurrency guarantees
 
@@ -146,13 +158,16 @@ the project directory. `PIDMESH_DB` overrides the default `~/.pidmesh/pidmesh.db
 - WAL allows readers while other processes write.
 - Bounded retries and `BEGIN IMMEDIATE` serialize competing mutations.
 - A task claim has exactly one owner until expiry or explicit release.
-- Stopped and dead sessions release their claims.
+- Multi-resource reservations are all-or-nothing.
+- `path:src` conflicts with `path:src/store.rs`, while ports and services use exact ownership.
+- Stopped and dead sessions release their claims and resources.
 - Broadcast acknowledgements are independent for every agent.
-- Workspaces remain isolated inside a shared database.
+- Linked git worktrees share one logical project while unrelated workspaces remain isolated.
 - Bounded waits wake agents without a tight polling loop.
 
-The test suite launches eight separate processes to verify write integrity and prove that one atomic
-claim has exactly one winner. It also performs a full MCP stdio handshake and native tool call.
+The test suite launches eight separate processes to verify write integrity and prove that task and
+overlapping-path contention each have exactly one winner. It also tests linked worktree discovery,
+schema upgrades, dashboard security, and a full MCP stdio handshake with native tool calls.
 
 ## Architecture
 
@@ -161,7 +176,7 @@ Codex PID 4101 ─┐             one connection / process
 Claude PID 4102 ├── CLI/MCP ───────────┐
 Worker PID 4103 ┘                      ├── SQLite WAL
 Browser UI ─── localhost/token ────────┘
-                                      └── memory + inbox + claims + events
+                                      └── memory + inbox + claims + resources + events
 
 pidmesh swarm ──┬── Worker PID 5101
                 ├── Worker PID 5102

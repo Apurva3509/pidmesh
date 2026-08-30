@@ -26,6 +26,20 @@ fn register(store: &MeshStore, name: &str, workspace: &std::path::Path) -> Resul
         .to_owned())
 }
 
+fn git(directory: &std::path::Path, arguments: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 #[test]
 fn memory_is_shared_and_workspace_scoped() -> Result<()> {
     let (directory, store) = setup()?;
@@ -51,6 +65,129 @@ fn memory_is_shared_and_workspace_scoped() -> Result<()> {
         .context("recall did not return an array")?;
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0]["agent_name"], "codex");
+    Ok(())
+}
+
+#[test]
+fn implicit_workspace_unifies_linked_worktrees_and_reports_checkout_context() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let repository = directory.path().join("repository");
+    let worktree = directory.path().join("feature-checkout");
+    std::fs::create_dir(&repository)?;
+    git(&repository, &["init"])?;
+    git(
+        &repository,
+        &["config", "user.email", "pidmesh@example.com"],
+    )?;
+    git(&repository, &["config", "user.name", "PidMesh Test"])?;
+    std::fs::write(repository.join("README.md"), "mesh\n")?;
+    git(&repository, &["add", "README.md"])?;
+    git(&repository, &["commit", "-m", "initial"])?;
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/resource-leases",
+            worktree.to_str().context("worktree path")?,
+        ],
+    )?;
+
+    let database = directory.path().join("mesh.db");
+    let binary = env!("CARGO_BIN_EXE_pidmesh");
+    let implicit = Command::new(binary)
+        .current_dir(&worktree)
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "join",
+            "--name",
+            "linked-worker",
+        ])
+        .output()?;
+    assert!(implicit.status.success());
+    let registration: Value = serde_json::from_slice(&implicit.stdout)?;
+    assert_eq!(
+        registration["workspace"],
+        repository.canonicalize()?.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        registration["checkout_path"],
+        worktree.canonicalize()?.to_string_lossy().as_ref()
+    );
+    assert_eq!(registration["git_branch"], "feature/resource-leases");
+
+    let status = Command::new(binary)
+        .current_dir(&worktree)
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "status",
+        ])
+        .output()?;
+    let mesh: Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(mesh["workspace"], registration["workspace"]);
+    assert_eq!(
+        mesh["agents"][0]["checkout_path"],
+        registration["checkout_path"]
+    );
+    assert_eq!(mesh["agents"][0]["git_branch"], registration["git_branch"]);
+
+    let explicit = Command::new(binary)
+        .current_dir(&worktree)
+        .args([
+            "--db",
+            database.to_str().context("database path")?,
+            "join",
+            "--name",
+            "explicit-worker",
+            "--workspace",
+            worktree.to_str().context("worktree path")?,
+        ])
+        .output()?;
+    let explicit_registration: Value = serde_json::from_slice(&explicit.stdout)?;
+    assert_eq!(
+        explicit_registration["workspace"],
+        worktree.canonicalize()?.to_string_lossy().as_ref()
+    );
+    Ok(())
+}
+
+#[test]
+fn existing_agent_schema_gains_checkout_columns_without_data_loss() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("legacy.db");
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute_batch(
+        "CREATE TABLE workspaces (
+            id TEXT PRIMARY KEY,
+            root TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE agents (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            parent_pid INTEGER,
+            provider TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL DEFAULT '[]',
+            started_at INTEGER NOT NULL,
+            heartbeat_at INTEGER NOT NULL,
+            stopped_at INTEGER,
+            status TEXT NOT NULL DEFAULT 'running'
+        );",
+    )?;
+    drop(connection);
+
+    let store = MeshStore::new(&database)?;
+    let agent = register(&store, "migrated", directory.path())?;
+    let status = store.status(Some(&agent), None)?;
+    assert!(status["agents"][0]["checkout_path"].is_string());
+    assert!(status["agents"][0]["git_branch"].is_null());
     Ok(())
 }
 
@@ -130,6 +267,91 @@ fn claims_are_exclusive_and_recover_after_expiry() -> Result<()> {
     let takeover = store.claim(&second, "task", 10, None)?;
     assert_eq!(takeover["acquired"], true);
     assert_eq!(takeover["agent_id"], second);
+    Ok(())
+}
+
+#[test]
+fn resource_leases_detect_hierarchical_conflicts_atomically() -> Result<()> {
+    let (directory, store) = setup()?;
+    let planner = register(&store, "planner", directory.path())?;
+    let worker = register(&store, "worker", directory.path())?;
+    let initial = store.reserve_resources(
+        &planner,
+        &["path:src".to_owned()],
+        Some("refactor"),
+        None,
+        60,
+    )?;
+    assert_eq!(initial["acquired"], true);
+
+    let blocked = store.reserve_resources(
+        &worker,
+        &["path:src/store.rs".to_owned(), "port:4399".to_owned()],
+        Some("dashboard"),
+        None,
+        60,
+    )?;
+    assert_eq!(blocked["acquired"], false);
+    assert_eq!(blocked["conflicts"][0]["agent_id"], planner);
+    assert!(
+        store
+            .resources(&worker)?
+            .as_array()
+            .context("resources")?
+            .iter()
+            .all(|resource| resource["resource_key"] != "4399")
+    );
+
+    let boundary =
+        store.reserve_resources(&worker, &["path:src2/store.rs".to_owned()], None, None, 60)?;
+    assert_eq!(boundary["acquired"], true);
+    assert_eq!(
+        store.release_resources(&worker, &["path:src2/store.rs".to_owned()])?,
+        1
+    );
+    assert!(store.stop_agent(&planner)?);
+    assert_eq!(
+        store.reserve_resources(&worker, &["path:src/store.rs".to_owned()], None, None, 60,)?["acquired"],
+        true
+    );
+    Ok(())
+}
+
+#[test]
+fn resource_lease_expiry_allows_takeover() -> Result<()> {
+    let (directory, store) = setup()?;
+    let first = register(&store, "first", directory.path())?;
+    let second = register(&store, "second", directory.path())?;
+    assert_eq!(
+        store.reserve_resources(&first, &["service:indexer".to_owned()], None, None, 1)?["acquired"],
+        true
+    );
+    thread::sleep(Duration::from_millis(1_050));
+    assert_eq!(
+        store.reserve_resources(&second, &["service:indexer".to_owned()], None, None, 60)?["acquired"],
+        true
+    );
+    assert_eq!(store.resources(&second)?[0]["agent_id"], second);
+    Ok(())
+}
+
+#[test]
+fn dead_agent_collection_releases_resources() -> Result<()> {
+    let (directory, store) = setup()?;
+    let dead = store.register_agent(
+        "dead-worker",
+        u32::MAX,
+        Some(directory.path()),
+        "test",
+        &[],
+        None,
+    )?;
+    let dead_id = dead["agent_id"].as_str().context("dead agent id")?;
+    store.reserve_resources(dead_id, &["port:4399".to_owned()], None, None, 60)?;
+    thread::sleep(Duration::from_millis(2));
+    let collected = store.collect_stale(Duration::ZERO)?;
+    assert_eq!(collected["dead_agents"], 1);
+    assert_eq!(store.resources(dead_id)?, serde_json::json!([]));
     Ok(())
 }
 
@@ -257,6 +479,71 @@ fn eight_processes_produce_one_claim_winner() -> Result<()> {
         );
         let claim: Value = serde_json::from_slice(&output.stdout)?;
         winners += usize::from(claim["acquired"] == true);
+    }
+    assert_eq!(winners, 1);
+    Ok(())
+}
+
+#[test]
+fn eight_processes_produce_one_overlapping_resource_winner() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("resources.db");
+    let binary = env!("CARGO_BIN_EXE_pidmesh");
+    let mut agent_ids = Vec::new();
+    for worker in 0..8 {
+        let output = Command::new(binary)
+            .args([
+                "--db",
+                database.to_str().context("database path")?,
+                "join",
+                "--name",
+                &format!("worker-{worker}"),
+                "--workspace",
+                directory.path().to_str().context("workspace path")?,
+            ])
+            .output()?;
+        let registration: Value = serde_json::from_slice(&output.stdout)?;
+        agent_ids.push(
+            registration["agent_id"]
+                .as_str()
+                .context("agent id")?
+                .to_owned(),
+        );
+    }
+    let mut children = Vec::new();
+    for (worker, agent_id) in agent_ids.iter().enumerate() {
+        let resource = if worker % 2 == 0 {
+            "path:src"
+        } else {
+            "path:src/store.rs"
+        };
+        children.push(
+            Command::new(binary)
+                .args([
+                    "--db",
+                    database.to_str().context("database path")?,
+                    "reserve",
+                    resource,
+                    "--agent",
+                    agent_id,
+                    "--lease-seconds",
+                    "60",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?,
+        );
+    }
+    let mut winners = 0;
+    for child in children {
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reservation: Value = serde_json::from_slice(&output.stdout)?;
+        winners += usize::from(reservation["acquired"] == true);
     }
     assert_eq!(winners, 1);
     Ok(())
@@ -596,6 +883,33 @@ fn dashboard_api_is_token_protected_and_cleans_up_its_session() -> Result<()> {
     )?;
     assert_eq!(recalled.0, 200);
     assert!(recalled.2.contains("dashboard memory"));
+    let reserved = http_request(
+        address,
+        "POST",
+        "/api/v1/resources",
+        &[("Authorization", authorization.as_str())],
+        r#"{"resources":["path:dashboard"],"task":"cockpit","lease_seconds":900}"#,
+    )?;
+    assert_eq!(reserved.0, 200, "{}", reserved.2);
+    assert!(reserved.2.contains(r#""acquired":true"#));
+    let resources = http_request(
+        address,
+        "GET",
+        "/api/v1/resources",
+        &[("Authorization", authorization.as_str())],
+        "",
+    )?;
+    assert_eq!(resources.0, 200, "{}", resources.2);
+    assert!(resources.2.contains("dashboard"));
+    let snapshot = http_request(
+        address,
+        "GET",
+        "/api/v1/snapshot",
+        &[("Authorization", authorization.as_str())],
+        "",
+    )?;
+    assert_eq!(snapshot.0, 200, "{}", snapshot.2);
+    assert!(snapshot.2.contains(r#""resources":1"#));
 
     kill(Pid::from_raw(i32::try_from(child.id())?), Signal::SIGINT)?;
     assert!(child.wait()?.success());

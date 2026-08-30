@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,7 +30,9 @@ CREATE TABLE IF NOT EXISTS agents (
     started_at INTEGER NOT NULL,
     heartbeat_at INTEGER NOT NULL,
     stopped_at INTEGER,
-    status TEXT NOT NULL DEFAULT 'running'
+    status TEXT NOT NULL DEFAULT 'running',
+    checkout_path TEXT,
+    git_branch TEXT
 );
 
 CREATE INDEX IF NOT EXISTS agents_workspace_status
@@ -100,6 +104,25 @@ CREATE TABLE IF NOT EXISTS claims (
 CREATE INDEX IF NOT EXISTS claims_lease
 ON claims(workspace_id, lease_expires_at);
 
+CREATE TABLE IF NOT EXISTS resource_leases (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    resource_kind TEXT NOT NULL,
+    resource_key TEXT NOT NULL,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    task_key TEXT,
+    detail TEXT,
+    acquired_at INTEGER NOT NULL,
+    lease_expires_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, resource_kind, resource_key)
+);
+
+CREATE INDEX IF NOT EXISTS resource_leases_agent
+ON resource_leases(workspace_id, agent_id);
+
+CREATE INDEX IF NOT EXISTS resource_leases_expiry
+ON resource_leases(workspace_id, lease_expires_at);
+
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -124,6 +147,18 @@ pub struct MeshStore {
 struct AgentRow {
     workspace_id: String,
     started_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ResourceKey {
+    kind: String,
+    key: String,
+}
+
+struct WorkspaceContext {
+    branch: Option<String>,
+    checkout: String,
+    root: String,
 }
 
 struct DashboardActivity {
@@ -172,19 +207,19 @@ impl MeshStore {
         capabilities: &[String],
         agent_id: Option<&str>,
     ) -> Result<Value> {
-        let root = workspace_root(root)?;
+        let workspace = workspace_context(root)?;
         let identifier = agent_id.map_or_else(
             || format!("{name}-{pid}-{}", &Uuid::new_v4().simple().to_string()[..8]),
             ToOwned::to_owned,
         );
         let now = now_ms()?;
         self.write(|transaction| {
-            let workspace_id = Self::ensure_workspace(transaction, &root)?;
+            let workspace_id = Self::ensure_workspace(transaction, &workspace.root)?;
             transaction.execute(
                 "INSERT INTO agents(
                     id, workspace_id, name, pid, parent_pid, provider,
-                    capabilities_json, started_at, heartbeat_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    capabilities_json, started_at, heartbeat_at, checkout_path, git_branch
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     identifier,
                     workspace_id,
@@ -194,7 +229,9 @@ impl MeshStore {
                     provider,
                     serde_json::to_string(capabilities)?,
                     now,
-                    now
+                    now,
+                    workspace.checkout,
+                    workspace.branch
                 ],
             )?;
             Self::event(
@@ -210,7 +247,9 @@ impl MeshStore {
                 "name": name,
                 "pid": pid,
                 "provider": provider,
-                "workspace": root,
+                "checkout_path": workspace.checkout,
+                "git_branch": workspace.branch,
+                "workspace": workspace.root,
                 "workspace_id": workspace_id
             }))
         })
@@ -257,6 +296,7 @@ impl MeshStore {
                 params![now, agent_id],
             )?;
             transaction.execute("DELETE FROM claims WHERE agent_id = ?", [agent_id])?;
+            transaction.execute("DELETE FROM resource_leases WHERE agent_id = ?", [agent_id])?;
             Self::event(
                 transaction,
                 &workspace_id,
@@ -585,6 +625,135 @@ impl MeshStore {
         })
     }
 
+    pub fn reserve_resources(
+        &self,
+        agent_id: &str,
+        resources: &[String],
+        task_key: Option<&str>,
+        detail: Option<&str>,
+        lease_seconds: u64,
+    ) -> Result<Value> {
+        let resources = normalize_resources(resources)?;
+        if lease_seconds == 0 || lease_seconds > 86_400 {
+            bail!("lease_seconds must be between 1 and 86400");
+        }
+        let now = now_ms()?;
+        let lease_expires_at = now
+            .checked_add(i64::try_from(lease_seconds)?.saturating_mul(1000))
+            .ok_or_else(|| anyhow!("lease duration is too large"))?;
+        self.write(|transaction| {
+            let agent = Self::agent_row(transaction, agent_id)?;
+            transaction.execute(
+                "DELETE FROM resource_leases
+                 WHERE workspace_id = ? AND lease_expires_at <= ?",
+                params![agent.workspace_id, now],
+            )?;
+            let mut conflicts = Vec::new();
+            let mut seen = HashSet::new();
+            for resource in &resources {
+                for conflict in
+                    resource_conflicts(transaction, &agent.workspace_id, agent_id, resource, now)?
+                {
+                    let identity = (
+                        conflict["resource_kind"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        conflict["resource_key"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                    if seen.insert(identity) {
+                        conflicts.push(conflict);
+                    }
+                }
+            }
+            if !conflicts.is_empty() {
+                return Ok(json!({"acquired": false, "conflicts": conflicts, "resources": []}));
+            }
+            let mut acquired = Vec::new();
+            for resource in &resources {
+                transaction.execute(
+                    "INSERT INTO resource_leases(
+                        workspace_id, resource_kind, resource_key, agent_id, task_key,
+                        detail, acquired_at, lease_expires_at, updated_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(workspace_id, resource_kind, resource_key) DO UPDATE SET
+                        agent_id = excluded.agent_id,
+                        task_key = excluded.task_key,
+                        detail = excluded.detail,
+                        lease_expires_at = excluded.lease_expires_at,
+                        updated_at = excluded.updated_at",
+                    params![
+                        agent.workspace_id,
+                        resource.kind,
+                        resource.key,
+                        agent_id,
+                        task_key,
+                        detail,
+                        now,
+                        lease_expires_at,
+                        now
+                    ],
+                )?;
+                let subject = resource.display();
+                Self::event(
+                    transaction,
+                    &agent.workspace_id,
+                    Some(agent_id),
+                    "resource.reserved",
+                    Some(&subject),
+                    &json!({"lease_expires_at": lease_expires_at, "task_key": task_key}),
+                )?;
+                acquired.push(subject);
+            }
+            Ok(json!({
+                "acquired": true,
+                "conflicts": [],
+                "lease_expires_at": lease_expires_at,
+                "resources": acquired
+            }))
+        })
+    }
+
+    pub fn release_resources(&self, agent_id: &str, resources: &[String]) -> Result<usize> {
+        let resources = normalize_resources(resources)?;
+        self.write(|transaction| {
+            let agent = Self::agent_row(transaction, agent_id)?;
+            let mut released = 0;
+            for resource in &resources {
+                let changed = transaction.execute(
+                    "DELETE FROM resource_leases
+                     WHERE workspace_id = ? AND resource_kind = ?
+                       AND resource_key = ? AND agent_id = ?",
+                    params![agent.workspace_id, resource.kind, resource.key, agent_id],
+                )?;
+                if changed == 1 {
+                    let subject = resource.display();
+                    Self::event(
+                        transaction,
+                        &agent.workspace_id,
+                        Some(agent_id),
+                        "resource.released",
+                        Some(&subject),
+                        &json!({}),
+                    )?;
+                    released += 1;
+                }
+            }
+            Ok(released)
+        })
+    }
+
+    pub fn resources(&self, agent_id: &str) -> Result<Value> {
+        let now = now_ms()?;
+        self.read(|connection| {
+            let agent = Self::agent_row(connection, agent_id)?;
+            workspace_resources(connection, &agent.workspace_id, now)
+        })
+    }
+
     pub fn status(&self, agent_id: Option<&str>, root: Option<&Path>) -> Result<Value> {
         self.read(|connection| {
             let workspace = if let Some(agent_id) = agent_id {
@@ -607,13 +776,19 @@ impl MeshStore {
                     )
                     .optional()?;
                 let Some(found) = found else {
-                    return Ok(json!({"workspace": root, "agents": [], "claims": []}));
+                    return Ok(json!({
+                        "workspace": root,
+                        "agents": [],
+                        "claims": [],
+                        "resources": []
+                    }));
                 };
                 found
             };
             let mut agents_statement = connection.prepare(
                 "SELECT id, name, pid, parent_pid, provider, capabilities_json,
-                        started_at, heartbeat_at, stopped_at, status
+                        started_at, heartbeat_at, stopped_at, status,
+                        checkout_path, git_branch
                  FROM agents WHERE workspace_id = ?
                  ORDER BY status = 'running' DESC, heartbeat_at DESC",
             )?;
@@ -634,6 +809,8 @@ impl MeshStore {
                     "heartbeat_at": heartbeat_at,
                     "stopped_at": row.get::<_, Option<i64>>(8)?,
                     "status": row.get::<_, String>(9)?,
+                    "checkout_path": row.get::<_, Option<String>>(10)?,
+                    "git_branch": row.get::<_, Option<String>>(11)?,
                     "pid_alive": process_is_alive(pid),
                     "heartbeat_age_ms": current_time.saturating_sub(heartbeat_at)
                 }))
@@ -663,11 +840,13 @@ impl MeshStore {
             for row in claim_rows {
                 claims.push(row?);
             }
+            let resources = workspace_resources(connection, &workspace.0, current_time)?;
             Ok(json!({
                 "workspace": workspace.1,
                 "workspace_id": workspace.0,
                 "agents": agents,
-                "claims": claims
+                "claims": claims,
+                "resources": resources
             }))
         })
     }
@@ -685,11 +864,13 @@ impl MeshStore {
                 "generated_at": now_ms()?,
                 "memories": [],
                 "messages": [],
+                "resources": [],
                 "stats": {
                     "claims": 0,
                     "events": 0,
                     "memories": 0,
                     "messages": 0,
+                    "resources": 0,
                     "running_agents": 0,
                     "total_agents": 0
                 },
@@ -700,6 +881,8 @@ impl MeshStore {
             self.read(|connection| dashboard_activity(connection, &workspace_id, limit))?;
         let agents = status["agents"].as_array().cloned().unwrap_or_default();
         let claims = status["claims"].as_array().cloned().unwrap_or_default();
+        let resources = status["resources"].as_array().cloned().unwrap_or_default();
+        let resource_count = resources.len();
         let running_agents = agents
             .iter()
             .filter(|agent| agent["status"] == "running")
@@ -711,11 +894,13 @@ impl MeshStore {
             "generated_at": now_ms()?,
             "memories": activity.memories,
             "messages": activity.messages,
+            "resources": resources,
             "stats": {
                 "claims": claims.len(),
                 "events": activity.totals.2,
                 "memories": activity.totals.0,
                 "messages": activity.totals.1,
+                "resources": resource_count,
                 "running_agents": running_agents,
                 "total_agents": agents.len()
             },
@@ -810,6 +995,8 @@ impl MeshStore {
                     params![now, agent_id],
                 )?;
                 transaction.execute("DELETE FROM claims WHERE agent_id = ?", [agent_id])?;
+                transaction
+                    .execute("DELETE FROM resource_leases WHERE agent_id = ?", [agent_id])?;
                 Self::event(
                     transaction,
                     workspace_id,
@@ -821,7 +1008,15 @@ impl MeshStore {
             }
             let expired =
                 transaction.execute("DELETE FROM claims WHERE lease_expires_at <= ?", [now])?;
-            Ok(json!({"dead_agents": dead.len(), "expired_claims": expired}))
+            let expired_resources = transaction.execute(
+                "DELETE FROM resource_leases WHERE lease_expires_at <= ?",
+                [now],
+            )?;
+            Ok(json!({
+                "dead_agents": dead.len(),
+                "expired_claims": expired,
+                "expired_resources": expired_resources
+            }))
         })
     }
 
@@ -831,7 +1026,9 @@ impl MeshStore {
         for attempt in 0..8 {
             match connection.execute_batch(SCHEMA) {
                 Ok(()) => {
-                    connection.pragma_update(None, "user_version", 1)?;
+                    add_column_if_missing(&connection, "agents", "checkout_path", "TEXT")?;
+                    add_column_if_missing(&connection, "agents", "git_branch", "TEXT")?;
+                    connection.pragma_update(None, "user_version", 2)?;
                     return Ok(());
                 }
                 Err(error) if is_busy(&error) && attempt < 7 => {
@@ -965,17 +1162,79 @@ pub fn default_database_path() -> Result<PathBuf> {
 }
 
 pub fn workspace_root(root: Option<&Path>) -> Result<String> {
-    let selected = root
+    Ok(workspace_context(root)?.root)
+}
+
+fn workspace_context(root: Option<&Path>) -> Result<WorkspaceContext> {
+    let configured = root
         .map(Path::to_path_buf)
-        .or_else(|| env::var_os("PIDMESH_WORKSPACE").map(PathBuf::from))
-        .unwrap_or(env::current_dir()?);
+        .or_else(|| env::var_os("PIDMESH_WORKSPACE").map(PathBuf::from));
+    let explicit = configured.is_some();
+    let selected = configured.unwrap_or(env::current_dir()?);
     let absolute = if selected.is_absolute() {
         selected
     } else {
         env::current_dir()?.join(selected)
     };
     let normalized = absolute.canonicalize().unwrap_or(absolute);
-    Ok(normalized.to_string_lossy().into_owned())
+    let git = git_context(&normalized);
+    let checkout = git
+        .as_ref()
+        .map_or_else(|| normalized.clone(), |context| context.checkout.clone());
+    let root = if explicit {
+        normalized
+    } else {
+        git.as_ref()
+            .map_or_else(|| normalized.clone(), |context| context.primary.clone())
+    };
+    Ok(WorkspaceContext {
+        branch: git.and_then(|context| context.branch),
+        checkout: checkout.to_string_lossy().into_owned(),
+        root: root.to_string_lossy().into_owned(),
+    })
+}
+
+struct GitContext {
+    branch: Option<String>,
+    checkout: PathBuf,
+    primary: PathBuf,
+}
+
+fn git_context(directory: &Path) -> Option<GitContext> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--abbrev-ref",
+            "HEAD",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut lines = text.lines();
+    let checkout = PathBuf::from(lines.next()?).canonicalize().ok()?;
+    let common = PathBuf::from(lines.next()?).canonicalize().ok()?;
+    let branch = lines
+        .next()
+        .filter(|branch| *branch != "HEAD" && !branch.is_empty())
+        .map(ToOwned::to_owned);
+    let primary = if common.file_name().is_some_and(|name| name == ".git") {
+        common.parent()?.to_path_buf()
+    } else {
+        checkout.clone()
+    };
+    Some(GitContext {
+        branch,
+        checkout,
+        primary,
+    })
 }
 
 #[cfg(unix)]
@@ -1021,6 +1280,171 @@ fn is_busy(error: &rusqlite::Error) -> bool {
         error.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
     )
+}
+
+impl ResourceKey {
+    fn display(&self) -> String {
+        format!("{}:{}", self.kind, self.key)
+    }
+}
+
+fn normalize_resources(resources: &[String]) -> Result<Vec<ResourceKey>> {
+    if resources.is_empty() || resources.len() > 64 {
+        bail!("resources must contain between 1 and 64 entries");
+    }
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for resource in resources {
+        let (kind, key) = resource
+            .split_once(':')
+            .ok_or_else(|| anyhow!("resource must use kind:key syntax: {resource}"))?;
+        if kind.is_empty()
+            || kind.len() > 32
+            || !kind.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+            })
+        {
+            bail!("resource kind must be lowercase alphanumeric, '-' or '_': {kind}");
+        }
+        let key = if kind == "path" {
+            normalize_resource_path(key)?
+        } else {
+            let key = key.trim();
+            if key.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
+                bail!("resource key must contain between 1 and 512 printable bytes");
+            }
+            key.to_owned()
+        };
+        let resource = ResourceKey {
+            kind: kind.to_owned(),
+            key,
+        };
+        if seen.insert(resource.clone()) {
+            normalized.push(resource);
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_resource_path(value: &str) -> Result<String> {
+    if value.is_empty() || value.len() > 512 {
+        bail!("path resource must contain between 1 and 512 bytes");
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| anyhow!("path resource must be valid UTF-8"))?;
+                if part.chars().any(char::is_control) {
+                    bail!("path resource must not contain control characters");
+                }
+                parts.push(part);
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("path resource must be relative and must not contain '..'");
+            }
+        }
+    }
+    if parts.is_empty() {
+        bail!("path resource must identify a workspace-relative path");
+    }
+    Ok(parts.join("/"))
+}
+
+fn workspace_resources(connection: &Connection, workspace_id: &str, now: i64) -> Result<Value> {
+    let mut statement = connection.prepare(
+        "SELECT r.resource_kind, r.resource_key, r.agent_id, a.name, a.pid,
+                r.task_key, r.detail, r.lease_expires_at
+         FROM resource_leases r JOIN agents a ON a.id = r.agent_id
+         WHERE r.workspace_id = ? AND r.lease_expires_at > ?
+         ORDER BY r.resource_kind, r.resource_key",
+    )?;
+    let rows = statement.query_map(params![workspace_id, now], resource_lease_json)?;
+    Ok(Value::Array(rows.collect::<rusqlite::Result<Vec<_>>>()?))
+}
+
+fn resource_conflicts(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    agent_id: &str,
+    resource: &ResourceKey,
+    now: i64,
+) -> Result<Vec<Value>> {
+    let sql = if resource.kind == "path" {
+        "SELECT r.resource_kind, r.resource_key, r.agent_id, a.name, a.pid,
+                r.task_key, r.detail, r.lease_expires_at
+         FROM resource_leases r JOIN agents a ON a.id = r.agent_id
+         WHERE r.workspace_id = ? AND r.agent_id != ?
+           AND r.lease_expires_at > ? AND r.resource_kind = ?
+           AND (r.resource_key = ?
+                OR instr(r.resource_key, ? || '/') = 1
+                OR instr(?, r.resource_key || '/') = 1)"
+    } else {
+        "SELECT r.resource_kind, r.resource_key, r.agent_id, a.name, a.pid,
+                r.task_key, r.detail, r.lease_expires_at
+         FROM resource_leases r JOIN agents a ON a.id = r.agent_id
+         WHERE r.workspace_id = ? AND r.agent_id != ?
+           AND r.lease_expires_at > ? AND r.resource_kind = ?
+           AND r.resource_key = ?"
+    };
+    let mut statement = transaction.prepare(sql)?;
+    let rows = if resource.kind == "path" {
+        statement.query_map(
+            params![
+                workspace_id,
+                agent_id,
+                now,
+                resource.kind,
+                resource.key,
+                resource.key,
+                resource.key
+            ],
+            resource_lease_json,
+        )?
+    } else {
+        statement.query_map(
+            params![workspace_id, agent_id, now, resource.kind, resource.key],
+            resource_lease_json,
+        )?
+    };
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn resource_lease_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "resource_kind": row.get::<_, String>(0)?,
+        "resource_key": row.get::<_, String>(1)?,
+        "agent_id": row.get::<_, String>(2)?,
+        "agent_name": row.get::<_, String>(3)?,
+        "agent_pid": row.get::<_, u32>(4)?,
+        "task_key": row.get::<_, Option<String>>(5)?,
+        "detail": row.get::<_, Option<String>>(6)?,
+        "lease_expires_at": row.get::<_, i64>(7)?
+    }))
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|existing| existing == column);
+    drop(statement);
+    if !exists {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
+    Ok(())
 }
 
 fn dashboard_activity(
