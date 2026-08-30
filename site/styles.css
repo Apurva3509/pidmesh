@@ -248,7 +248,7 @@ h1 {
   max-width: 660px;
   margin-bottom: 30px;
   font-size: clamp(64px, 6.4vw, 102px);
-  line-height: 0.88;
+  line-height: 0.98;
 }
 
 h1 em,
@@ -2079,7 +2079,7 @@ h2 em {
     grid-row: 2 / span 3;
     margin-bottom: 0;
     font-size: clamp(54px, 8vw, 62px);
-    line-height: 0.92;
+    line-height: 1.02;
   }
   .hero-lede {
     grid-column: 2;
@@ -2136,6 +2136,9 @@ h2 em {
 }
 
 @media (max-width: 680px) {
+  h1 {
+    line-height: 1.02;
+  }
   .nav-toggle {
     display: block;
   }
