@@ -15,6 +15,7 @@ const state = {
   token: null,
   view: "ide",
   websocket: null,
+  workspaceFilter: "",
 };
 
 const byId = (id) => document.getElementById(id);
@@ -118,7 +119,9 @@ function renderAll() {
 function renderProject() {
   if (!state.snapshot) return;
   const workspace = state.snapshot.workspace || "local";
-  byId("project-name").textContent = basename(workspace);
+  const project = basename(workspace);
+  byId("project-name").textContent = project;
+  byId("rail-project-name").textContent = project;
   byId("project-branch").textContent = selectedSession()?.workstream || "local mesh";
 }
 
@@ -134,6 +137,10 @@ function needsAttention(session) {
 function workstreamGroups() {
   const groups = new Map();
   for (const session of state.sessions) {
+    const searchable = [session.name, session.provider, session.branch, session.task, workstreamName(session)]
+      .join(" ")
+      .toLowerCase();
+    if (state.workspaceFilter && !searchable.includes(state.workspaceFilter)) continue;
     const name = workstreamName(session);
     if (!groups.has(name)) groups.set(name, []);
     groups.get(name).push(session);
@@ -172,7 +179,12 @@ function renderSessions() {
     section.append(list);
     groups.push(section);
   }
-  if (!groups.length) empty(container, "No managed runs yet. Create one to start an isolated agent.", "attention-empty");
+  if (!groups.length) {
+    const message = state.workspaceFilter
+      ? `No workspace matches “${byId("workspace-filter").value.trim()}”.`
+      : "No managed runs yet. Create one to start an isolated agent.";
+    empty(container, message, "attention-empty");
+  }
   else container.replaceChildren(...groups);
 }
 
@@ -236,10 +248,12 @@ function renderSelectedSession() {
   byId("inspector-empty").classList.toggle("hidden", Boolean(session));
   byId("inspector-content").classList.toggle("hidden", !session);
   if (!session) {
-    byId("active-run-title").textContent = "Choose or create a task";
+    byId("active-run-title").textContent = "Choose or create a workspace";
     byId("active-run-subtitle").textContent = "Each agent gets an isolated branch and worktree.";
     byId("active-status").textContent = "No active run";
     byId("active-status-dot").className = "status-dot";
+    byId("activity-diff-count").textContent = "";
+    byId("open-editor-button").disabled = true;
     byId("status-worktree").textContent = "No worktree selected";
     byId("status-process").textContent = "PID —";
     byId("status-changes").textContent = "0 changed files";
@@ -247,6 +261,7 @@ function renderSelectedSession() {
     return;
   }
   const status = normalizeStatus(session.status);
+  byId("open-editor-button").disabled = false;
   byId("active-run-title").textContent = session.name;
   byId("active-run-subtitle").textContent = `${workstreamName(session)} · ${session.branch}`;
   byId("active-status").textContent = statusLabel(session.status);
@@ -265,6 +280,7 @@ function renderSelectedSession() {
   renderInspector(session);
   byId("file-count").textContent = String((session.changed_files || []).length || "");
   byId("diff-count").textContent = String((session.changed_files || []).length || "");
+  byId("activity-diff-count").textContent = String((session.changed_files || []).length || "");
   byId("status-worktree").textContent = session.worktree;
   byId("status-process").textContent = `PID ${session.pid}`;
   byId("status-changes").textContent = `${(session.changed_files || []).length} changed files`;
@@ -561,6 +577,8 @@ function setWorkbenchTab(tab) {
   }
   if (tab === "diff") loadReview();
   if (tab === "files") loadFiles(state.currentDirectory);
+  const session = selectedSession();
+  byId("window-title-label").textContent = session ? `${session.name} — ${tab}` : "Local agent workspace";
 }
 
 function setAppView(view) {
@@ -576,7 +594,22 @@ function setAppView(view) {
   });
   if (view === "ide" && previousView !== "ide" && selectedSession()) connectTerminal();
   if (view !== "ide" && previousView === "ide") disconnectTerminal();
+  if (view === "operations") byId("window-title-label").textContent = "Local agent fleet";
   renderProject();
+}
+
+async function copyWorktreePath() {
+  const session = selectedSession();
+  if (!session) {
+    setStatus("Select a workspace first", true);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(session.worktree);
+    setStatus("Worktree path copied");
+  } catch {
+    setStatus(`Worktree: ${session.worktree}`, true);
+  }
 }
 
 function taskSlug(value) {
@@ -750,7 +783,7 @@ function closeDrawers() {
 }
 
 function bindEvents() {
-  ["new-task-button", "new-task-rail", "empty-new-task"].forEach((id) => byId(id).addEventListener("click", () => openNewTask()));
+  ["new-task-button", "new-task-rail", "empty-new-task", "rail-add-button"].forEach((id) => byId(id).addEventListener("click", () => openNewTask()));
   document.querySelector(".wordmark").addEventListener("click", (event) => {
     event.preventDefault();
     setAppView("ide");
@@ -775,6 +808,13 @@ function bindEvents() {
   );
   byId("mobile-view-select").addEventListener("change", (event) => setAppView(event.target.value));
   byId("refresh-button").addEventListener("click", refresh);
+  byId("activity-details").addEventListener("click", openInspector);
+  byId("new-terminal-button").addEventListener("click", () => setWorkbenchTab("terminal"));
+  byId("open-editor-button").addEventListener("click", copyWorktreePath);
+  byId("workspace-filter").addEventListener("input", (event) => {
+    state.workspaceFilter = event.target.value.trim().toLowerCase();
+    renderSessions();
+  });
   byId("operations-refresh").addEventListener("click", refresh);
   byId("files-refresh").addEventListener("click", () => loadFiles(state.currentDirectory));
   byId("copy-file").addEventListener("click", async () => {
@@ -812,6 +852,25 @@ function bindEvents() {
     if ((event.metaKey || event.ctrlKey) && ["1", "2"].includes(event.key)) {
       event.preventDefault();
       setAppView({ "1": "ide", "2": "operations" }[event.key]);
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      byId("workspace-filter").focus();
+      byId("workspace-filter").select();
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
+      event.preventDefault();
+      if (window.matchMedia("(max-width: 860px)").matches) openRail();
+      else document.body.classList.toggle("rail-collapsed");
+    }
+    if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      copyWorktreePath();
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      setAppView("ide");
+      setWorkbenchTab("diff");
     }
     if (event.key === "Escape") closeDrawers();
   });

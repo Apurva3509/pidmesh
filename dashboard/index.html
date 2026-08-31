@@ -18,61 +18,80 @@
       <header class="app-header">
         <div class="header-leading">
           <button class="icon-button mobile-only" id="run-rail-toggle" type="button" aria-label="Open task navigator" aria-controls="run-rail" aria-expanded="false">☰</button>
-          <a class="wordmark" href="#" aria-label="PidMesh workspace">PidMesh</a>
-          <span class="header-separator" aria-hidden="true">/</span>
+          <a class="wordmark" href="#" aria-label="PidMesh workspace"><span class="wordmark-glyph" aria-hidden="true">P</span><span>PidMesh</span></a>
           <div class="project-identity">
             <strong id="project-name">Local workspace</strong>
+            <span aria-hidden="true">/</span>
             <span id="project-branch">Connecting…</span>
           </div>
         </div>
 
-        <div class="view-switcher" role="group" aria-label="Product view">
-          <button class="view-switch active" type="button" data-app-view="ide" aria-pressed="true">Workspace</button>
-          <button class="view-switch" type="button" data-app-view="operations" aria-pressed="false">Operations</button>
+        <div class="window-title" aria-hidden="true">
+          <span id="window-title-label">Local agent workspace</span>
         </div>
 
         <div class="header-actions">
           <span class="connection-state" id="connection-state"><i aria-hidden="true"></i><span>Connecting</span></span>
-          <select class="mobile-view-select" id="mobile-view-select" aria-label="Product view"><option value="ide">Workspace</option><option value="operations">Operations</option></select>
+          <select class="mobile-view-select" id="mobile-view-select" aria-label="Product view"><option value="ide">Workspace</option><option value="operations">Fleet</option></select>
           <button class="button secondary inspector-toggle" id="inspector-toggle" type="button" aria-controls="inspector" aria-expanded="false">Details</button>
-          <button class="button primary" id="new-task-button" type="button">New task <kbd>⌘N</kbd></button>
+          <button class="button primary" id="new-task-button" type="button"><span aria-hidden="true">＋</span> New workspace <kbd>⌘N</kbd></button>
         </div>
       </header>
 
-      <div class="ide-layout" id="ide-view">
+      <div class="app-body">
+        <nav class="activity-bar" aria-label="Primary navigation">
+          <div class="activity-primary">
+            <button class="activity-button active" type="button" data-app-view="ide" aria-label="Workspaces" aria-pressed="true" title="Workspaces"><span aria-hidden="true">⌘</span></button>
+            <button class="activity-button" type="button" data-workbench-view="terminal" aria-label="Terminal" aria-selected="false" title="Terminal"><span aria-hidden="true">›_</span></button>
+            <button class="activity-button" type="button" data-workbench-view="files" aria-label="Files" aria-selected="false" title="Files"><span aria-hidden="true">≡</span></button>
+            <button class="activity-button" type="button" data-workbench-view="diff" aria-label="Changes" aria-selected="false" title="Changes"><span aria-hidden="true">±</span><i id="activity-diff-count" aria-hidden="true"></i></button>
+          </div>
+          <div class="activity-secondary">
+            <button class="activity-button" type="button" data-app-view="operations" aria-label="Fleet" aria-pressed="false" title="Fleet"><span aria-hidden="true">◌</span></button>
+            <button class="activity-button" id="activity-details" type="button" aria-label="Workspace details" title="Workspace details"><span aria-hidden="true">ⓘ</span></button>
+          </div>
+        </nav>
+
+        <div class="ide-layout" id="ide-view">
         <aside class="run-rail" id="run-rail" aria-label="Task navigator">
           <div class="rail-heading">
-            <div><span class="overline">Repository</span><h1>Workspaces</h1></div>
+            <div><span class="overline">Project</span><h1 id="rail-project-name">Workspaces</h1></div>
+            <button class="rail-add-button" id="rail-add-button" type="button" aria-label="Create workspace" title="Create workspace">＋</button>
             <button class="icon-button rail-close mobile-only" id="run-rail-close" type="button" aria-label="Close task navigator">×</button>
           </div>
 
+          <label class="workspace-search" for="workspace-filter"><span aria-hidden="true">⌕</span><input id="workspace-filter" type="search" placeholder="Search workspaces" autocomplete="off" /><kbd>⌘K</kbd></label>
+
           <section class="attention-section" aria-labelledby="attention-heading">
-            <div class="section-label"><h2 id="attention-heading">Needs you</h2><span id="attention-count">0</span></div>
+            <div class="section-label"><h2 id="attention-heading"><span aria-hidden="true">⌄</span> Needs you</h2><span id="attention-count">0</span></div>
             <div class="attention-list" id="attention-list"></div>
           </section>
 
           <nav class="session-groups" id="session-groups" aria-label="Agent sessions"></nav>
 
-          <button class="new-task-rail" id="new-task-rail" type="button"><span aria-hidden="true">＋</span> Create task</button>
+          <button class="new-task-rail" id="new-task-rail" type="button"><span aria-hidden="true">＋</span> New workspace</button>
         </aside>
 
         <main class="workbench" id="workbench" tabindex="-1">
           <header class="workbench-header">
             <div class="run-title-block">
               <span class="status-dot" id="active-status-dot" aria-hidden="true"></span>
-              <div><h2 id="active-run-title">Choose or create a task</h2><p id="active-run-subtitle">Each agent gets an isolated branch and worktree.</p></div>
+              <div><h2 id="active-run-title">Choose or create a workspace</h2><p id="active-run-subtitle">Each agent gets an isolated branch and worktree.</p></div>
             </div>
             <div class="run-header-actions">
               <span class="status-badge" id="active-status">No active run</span>
+              <button class="run-action" id="open-editor-button" type="button" title="Copy worktree path">Copy path <kbd>⌘⇧C</kbd></button>
               <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh workspace" title="Refresh workspace">↻</button>
             </div>
           </header>
 
           <div class="workbench-tabs" role="tablist" aria-label="Run workspace">
-            <button class="workbench-tab" id="terminal-tab" type="button" role="tab" data-workbench-view="terminal" aria-controls="terminal-panel" aria-selected="false">Terminal</button>
-            <button class="workbench-tab" id="files-tab" type="button" role="tab" data-workbench-view="files" aria-controls="files-panel" aria-selected="false">Files <span id="file-count"></span></button>
-            <button class="workbench-tab" id="diff-tab" type="button" role="tab" data-workbench-view="diff" aria-controls="diff-panel" aria-selected="false">Changes <span id="diff-count"></span></button>
-            <button class="workbench-tab active" id="overview-tab" type="button" role="tab" data-workbench-view="overview" aria-controls="overview-panel" aria-selected="true">Task</button>
+            <button class="workbench-tab" id="terminal-tab" type="button" role="tab" data-workbench-view="terminal" aria-controls="terminal-panel" aria-selected="false"><span class="tab-icon" aria-hidden="true">›_</span> Agent</button>
+            <button class="workbench-tab" id="files-tab" type="button" role="tab" data-workbench-view="files" aria-controls="files-panel" aria-selected="false"><span class="tab-icon" aria-hidden="true">≡</span> Editor <span id="file-count"></span></button>
+            <button class="workbench-tab" id="diff-tab" type="button" role="tab" data-workbench-view="diff" aria-controls="diff-panel" aria-selected="false"><span class="tab-icon" aria-hidden="true">±</span> Changes <span id="diff-count"></span></button>
+            <button class="workbench-tab active" id="overview-tab" type="button" role="tab" data-workbench-view="overview" aria-controls="overview-panel" aria-selected="true"><span class="tab-icon" aria-hidden="true">◎</span> Task</button>
+            <span class="tab-strip-spacer"></span>
+            <button class="tab-add" id="new-terminal-button" type="button" aria-label="Open agent terminal" title="Open agent terminal">＋</button>
           </div>
 
           <div class="workbench-content">
@@ -96,27 +115,28 @@
 
             <section class="workbench-panel overview-panel" id="overview-panel" role="tabpanel" aria-labelledby="overview-tab">
               <div class="empty-workspace" id="workspace-empty">
-                <span class="empty-orbit" aria-hidden="true">◎</span>
-                <h3>Start an isolated agent workspace.</h3>
-                <p>Describe a task and choose its workstream. PidMesh creates the branch, worktree, terminal, file browser, and change review in one place.</p>
-                <button class="button primary" id="empty-new-task" type="button">Describe a task</button>
+                <span class="empty-orbit" aria-hidden="true">P</span>
+                <h3>One workspace per agent task.</h3>
+                <p>Run Codex, Claude, or a local agent in an isolated worktree. Keep its terminal, files, changes, memory, and approval boundary together.</p>
+                <div class="empty-actions"><button class="button primary" id="empty-new-task" type="button">New workspace</button><span>or press <kbd>⌘N</kbd></span></div>
               </div>
 
               <div class="run-overview hidden" id="run-overview">
-                <section class="task-brief" aria-labelledby="task-brief-heading">
-                  <span class="overline">Task brief</span>
-                  <h3 id="task-brief-heading">Prompt</h3>
-                  <p id="task-prompt">—</p>
-                </section>
-                <div class="overview-grid">
-                  <section class="overview-card" aria-labelledby="execution-heading">
+                <div class="task-layout">
+                  <section class="task-brief" aria-labelledby="task-brief-heading">
+                    <div class="task-brief-heading"><div><span class="overline">Agent instruction</span><h3 id="task-brief-heading">Task</h3></div><span class="task-provider-pill">Managed prompt</span></div>
+                    <p id="task-prompt">—</p>
+                  </section>
+                  <aside class="task-context">
+                    <section class="overview-card" aria-labelledby="execution-heading">
                     <div class="card-heading"><span class="overline">Runtime</span><h3 id="execution-heading">Execution</h3></div>
                     <dl id="execution-details"></dl>
-                  </section>
-                  <section class="overview-card" aria-labelledby="scope-heading">
+                    </section>
+                    <section class="overview-card" aria-labelledby="scope-heading">
                     <div class="card-heading"><span class="overline">Collision guard</span><h3 id="scope-heading">Reserved scope</h3></div>
                     <div class="scope-list" id="scope-list"></div>
-                  </section>
+                    </section>
+                  </aside>
                   <section class="overview-card activity-card" aria-labelledby="activity-heading">
                     <div class="card-heading"><span class="overline">Current state</span><h3 id="activity-heading">Run activity</h3></div>
                     <div class="activity-feed" id="activity-feed"></div>
@@ -178,9 +198,9 @@
             <button class="button danger-quiet full-width" id="stop-button" type="button" disabled>Stop agent</button>
           </div>
         </aside>
-      </div>
+        </div>
 
-      <main class="operations-view hidden" id="operations-view">
+        <main class="operations-view hidden" id="operations-view">
         <header class="operations-heading"><div><span class="overline">Live mesh</span><h1>Operations</h1><p>Process health, ownership, and recent coordination events across the workspace.</p></div><button class="button secondary" id="operations-refresh" type="button">Refresh</button></header>
         <div class="metric-grid" id="operation-metrics"></div>
         <div class="operations-grid">
@@ -188,7 +208,8 @@
           <section class="operation-panel"><div class="pane-heading"><div><span class="overline">Ownership</span><h2>Claims &amp; resources</h2></div></div><div class="operation-list" id="operation-ownership"></div></section>
           <section class="operation-panel full-span"><div class="pane-heading"><div><span class="overline">Ledger</span><h2>Recent events</h2></div></div><div class="operation-list event-list" id="operation-events"></div></section>
         </div>
-      </main>
+        </main>
+      </div>
 
       <footer class="status-bar">
         <span id="status-worktree">No worktree selected</span>
