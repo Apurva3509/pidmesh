@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN, REFERRER_POLICY,
@@ -19,16 +20,20 @@ use tokio::task;
 use uuid::Uuid;
 
 use crate::VERSION;
+use crate::ide::{ApproveRequest, IdeManager, LaunchRequest, TerminalAttachment};
 use crate::store::MeshStore;
 
 const DASHBOARD_HTML: &str = include_str!("../dashboard/index.html");
 const DASHBOARD_CSS: &str = include_str!("../dashboard/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../dashboard/dashboard.js");
+const TERMINAL_CSS: &str = include_str!("../dashboard/vendor/terminal.css");
+const TERMINAL_JS: &str = include_str!("../dashboard/vendor/terminal.js");
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct DashboardState {
     agent_id: Arc<str>,
+    ide: IdeManager,
     origin: Arc<str>,
     store: MeshStore,
     token: Arc<str>,
@@ -38,6 +43,7 @@ struct DashboardState {
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
+    Conflict(String),
     Forbidden,
     Internal,
     Unauthorized,
@@ -47,6 +53,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            Self::Conflict(message) => (StatusCode::CONFLICT, message),
             Self::Forbidden => (StatusCode::FORBIDDEN, "request origin rejected".to_owned()),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -102,6 +109,35 @@ struct ResourceRequest {
     task: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct OutputQuery {
+    after: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TerminalInputRequest {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: Option<String>,
+    session: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TicketQuery {
+    ticket: String,
+}
+
+#[derive(Deserialize)]
+struct ResizeMessage {
+    cols: u16,
+    rows: u16,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 pub async fn serve(store: MeshStore, workspace: PathBuf, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -130,8 +166,10 @@ pub async fn serve(store: MeshStore, workspace: PathBuf, port: u16) -> Result<()
 
     let token = Uuid::new_v4().simple().to_string();
     let origin = format!("http://{address}");
+    let ide = IdeManager::new(store.clone(), workspace.clone());
     let state = DashboardState {
         agent_id: Arc::from(agent_id.clone()),
+        ide,
         origin: Arc::from(origin.clone()),
         store: store.clone(),
         token: Arc::from(token.clone()),
@@ -165,9 +203,10 @@ pub async fn serve(store: MeshStore, workspace: PathBuf, port: u16) -> Result<()
         }
     });
     let server_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(state.ide.clone()))
         .await;
     heartbeat.abort();
+    state.ide.stop_all();
     let stop_store = store;
     task::spawn_blocking(move || stop_store.stop_agent(&agent_id))
         .await
@@ -181,6 +220,8 @@ fn router(state: DashboardState) -> Router {
         .route("/favicon.ico", get(favicon))
         .route("/dashboard.css", get(styles))
         .route("/dashboard.js", get(script))
+        .route("/terminal.css", get(terminal_styles))
+        .route("/terminal.js", get(terminal_script))
         .route("/healthz", get(health))
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/memories", get(recall).post(remember))
@@ -193,6 +234,21 @@ fn router(state: DashboardState) -> Router {
                 .post(reserve_resources)
                 .delete(release_resources),
         )
+        .route("/api/v1/ide/providers", get(ide_providers))
+        .route("/api/v1/ide/sessions", get(ide_sessions).post(ide_launch))
+        .route("/api/v1/ide/sessions/{id}", delete(ide_stop))
+        .route("/api/v1/ide/sessions/{id}/output", get(ide_output))
+        .route("/api/v1/ide/sessions/{id}/input", post(ide_input))
+        .route("/api/v1/ide/sessions/{id}/review", get(ide_review))
+        .route("/api/v1/ide/sessions/{id}/approve", post(ide_approve))
+        .route("/api/v1/ide/sessions/{id}/reject", post(ide_reject))
+        .route(
+            "/api/v1/ide/sessions/{id}/attach-ticket",
+            post(ide_attach_ticket),
+        )
+        .route("/api/v1/ide/sessions/{id}/terminal", get(ide_terminal))
+        .route("/api/v1/ide/files", get(ide_files))
+        .route("/api/v1/ide/file", get(ide_file))
         .layer(DefaultBodyLimit::max(MAX_TEXT_BYTES))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -214,6 +270,17 @@ async fn script() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
         DASHBOARD_JS,
+    )
+}
+
+async fn terminal_styles() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/css; charset=utf-8")], TERMINAL_CSS)
+}
+
+async fn terminal_script() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        TERMINAL_JS,
     )
 }
 
@@ -408,6 +475,244 @@ async fn release_resources(
     Ok(Json(json!({"released": released})))
 }
 
+async fn ide_providers(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.providers()).await?))
+}
+
+async fn ide_sessions(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.sessions()).await?))
+}
+
+async fn ide_launch(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(request): Json<LaunchRequest>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_control(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.launch(request)).await?))
+}
+
+async fn ide_stop(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_control(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.stop(&session_id)).await?))
+}
+
+async fn ide_output(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<OutputQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(
+        ide_blocking(move || ide.output(&session_id, query.after.unwrap_or(0))).await?,
+    ))
+}
+
+async fn ide_input(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(request): Json<TerminalInputRequest>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_control(&state, &headers)?;
+    let ide = state.ide.clone();
+    ide_blocking(move || ide.input(&session_id, &request.text)).await?;
+    Ok(Json(json!({"written": true})))
+}
+
+async fn ide_review(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.review(&session_id)).await?))
+}
+
+async fn ide_approve(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(request): Json<ApproveRequest>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_control(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(
+        ide_blocking(move || ide.approve(&session_id, &request)).await?,
+    ))
+}
+
+async fn ide_reject(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_control(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.reject(&session_id)).await?))
+}
+
+async fn ide_attach_ticket(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authorize_control(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(
+        ide_blocking(move || ide.issue_ticket(&session_id)).await?,
+    ))
+}
+
+async fn ide_terminal(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<TicketQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    authorize_origin(&state, &headers)?;
+    let ide = state.ide.clone();
+    let attachment = ide_blocking(move || ide.attach(&session_id, &query.ticket)).await?;
+    Ok(upgrade
+        .on_upgrade(move |socket| terminal_socket(socket, state.ide, attachment))
+        .into_response())
+}
+
+async fn ide_files(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(
+        ide_blocking(move || {
+            ide.files(
+                query.session.as_deref(),
+                query.path.as_deref().unwrap_or("."),
+            )
+        })
+        .await?,
+    ))
+}
+
+async fn ide_file(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let path = query
+        .path
+        .context("file path is required")
+        .map_err(|_| ApiError::BadRequest("file path is required".to_owned()))?;
+    let ide = state.ide.clone();
+    Ok(Json(
+        ide_blocking(move || ide.file(query.session.as_deref(), &path)).await?,
+    ))
+}
+
+async fn terminal_socket(
+    mut socket: WebSocket,
+    ide: IdeManager,
+    mut attachment: TerminalAttachment,
+) {
+    let session_id = attachment.session["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    for chunk in attachment.backlog {
+        if socket
+            .send(Message::Binary(chunk.data.into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    if socket
+        .send(Message::Text(
+            json!({"type": "status", "session": attachment.session})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut lifecycle = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                let Some(Ok(message)) = incoming else { break; };
+                match message {
+                    Message::Binary(bytes) => {
+                        if bytes.len() > 64 * 1024 || ide.input(
+                            &session_id,
+                            &String::from_utf8_lossy(&bytes),
+                        ).is_err() {
+                            break;
+                        }
+                    }
+                    Message::Text(text) => {
+                        let Ok(message) = serde_json::from_str::<ResizeMessage>(&text) else { continue; };
+                        if message.kind == "resize" {
+                            let _ = ide.resize(
+                                &session_id,
+                                message.cols,
+                                message.rows,
+                            );
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Ping(bytes) => {
+                        if socket.send(Message::Pong(bytes)).await.is_err() { break; }
+                    }
+                    Message::Pong(_) => {}
+                }
+            }
+            output = attachment.receiver.recv() => {
+                match output {
+                    Ok(chunk) => {
+                        if socket.send(Message::Binary(chunk.data.into())).await.is_err() { break; }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = socket.send(Message::Text(json!({"type": "gap"}).to_string().into())).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = lifecycle.tick() => {
+                if !ide.session_is_live(&session_id).unwrap_or(false) {
+                    let _ = socket.send(Message::Text(json!({"type": "status", "state": "closed"}).to_string().into())).await;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn authorize(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError> {
     let expected = format!("Bearer {}", state.token);
     if headers
@@ -422,6 +727,18 @@ fn authorize(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError
         .and_then(|value| value.to_str().ok())
         .is_some_and(|origin| origin != state.origin.as_ref())
     {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+fn authorize_control(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError> {
+    authorize(state, headers)?;
+    authorize_origin(state, headers)
+}
+
+fn authorize_origin(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if headers.get(ORIGIN).and_then(|value| value.to_str().ok()) != Some(state.origin.as_ref()) {
         return Err(ApiError::Forbidden);
     }
     Ok(())
@@ -469,6 +786,18 @@ where
         .map_err(|_| ApiError::Internal)
 }
 
+async fn ide_blocking<T>(
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+{
+    task::spawn_blocking(operation)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .map_err(|error| ApiError::Conflict(format!("{error:#}")))
+}
+
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -476,7 +805,7 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
     headers.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
@@ -484,7 +813,7 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
     response
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(ide: IdeManager) {
     let interrupt = async {
         tokio::signal::ctrl_c()
             .await
@@ -503,4 +832,5 @@ async fn shutdown_signal() {
         () = interrupt => {},
         () = terminate => {},
     }
+    let _ = task::spawn_blocking(move || ide.stop_all()).await;
 }

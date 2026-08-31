@@ -278,6 +278,23 @@ impl MeshStore {
         })
     }
 
+    pub fn update_agent_checkout(
+        &self,
+        agent_id: &str,
+        checkout_path: &Path,
+        git_branch: Option<&str>,
+    ) -> Result<bool> {
+        let checkout_path = checkout_path
+            .canonicalize()
+            .unwrap_or_else(|_| checkout_path.to_path_buf());
+        self.write(|transaction| {
+            Ok(transaction.execute(
+                "UPDATE agents SET checkout_path = ?, git_branch = ? WHERE id = ?",
+                params![checkout_path.to_string_lossy(), git_branch, agent_id],
+            )? == 1)
+        })
+    }
+
     pub fn stop_agent(&self, agent_id: &str) -> Result<bool> {
         let now = now_ms()?;
         self.write(|transaction| {

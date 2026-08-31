@@ -115,19 +115,34 @@ impl PidMeshMcp {
             "wait",
         ]
         .map(str::to_owned);
-        let registration = store.register_agent(
-            &name,
-            std::process::id(),
-            workspace.as_deref(),
-            &provider,
-            &capabilities,
-            None,
-        )?;
-        let agent_id = registration
-            .get("agent_id")
-            .and_then(Value::as_str)
-            .context("registration did not return an agent id")?
-            .to_owned();
+        let managed_agent = env::var("PIDMESH_AGENT_ID").ok();
+        let agent_id = if let Some(agent_id) = managed_agent {
+            if !store.heartbeat(&agent_id)? {
+                store.register_agent(
+                    &name,
+                    std::process::id(),
+                    workspace.as_deref(),
+                    &provider,
+                    &capabilities,
+                    Some(&agent_id),
+                )?;
+            }
+            agent_id
+        } else {
+            store
+                .register_agent(
+                    &name,
+                    std::process::id(),
+                    workspace.as_deref(),
+                    &provider,
+                    &capabilities,
+                    None,
+                )?
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .context("registration did not return an agent id")?
+                .to_owned()
+        };
         Ok(Self {
             store,
             agent_id,
@@ -308,7 +323,7 @@ impl PidMeshMcp {
 
 #[tool_handler(
     name = "PidMesh",
-    version = "1.3.0",
+    version = "1.4.0",
     instructions = "Check status and inbox, claim a task, reserve intended paths before editing, and record decisions as memories."
 )]
 impl ServerHandler for PidMeshMcp {}
