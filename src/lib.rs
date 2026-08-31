@@ -1,4 +1,5 @@
 pub mod dashboard;
+pub mod ide;
 pub mod mcp;
 pub mod store;
 

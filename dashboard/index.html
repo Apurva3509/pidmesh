@@ -4,157 +4,222 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <meta name="description" content="Local PidMesh agent operations cockpit" />
-    <title>PidMesh Cockpit</title>
+    <meta name="description" content="PidMesh local multi-agent workspace" />
+    <title>PidMesh Workspace</title>
+    <link rel="stylesheet" href="/terminal.css" />
     <link rel="stylesheet" href="/dashboard.css" />
+    <script src="/terminal.js" defer></script>
     <script src="/dashboard.js" defer></script>
   </head>
   <body>
+    <a class="skip-link" href="#workbench">Skip to workbench</a>
+
     <div class="app-shell">
-      <aside class="sidebar">
-        <a class="brand" href="#overview" aria-label="PidMesh cockpit home">
-          <span class="brand-mark">PM</span>
-          <span><strong>PidMesh</strong><small>Local kernel</small></span>
-        </a>
-        <nav aria-label="Cockpit sections">
-          <p class="nav-label">Workspace</p>
-          <a class="nav-item active" href="#overview"><span>⌂</span>Overview</a>
-          <a class="nav-item" href="#fleet"><span>◉</span>Agent fleet <b id="nav-agent-count">0</b></a>
-          <a class="nav-item" href="#work"><span>◇</span>Active work <b id="nav-work-count">0</b></a>
-          <a class="nav-item" href="#context"><span>⌘</span>Shared context</a>
-          <a class="nav-item" href="#trace"><span>↳</span>Event trace</a>
-        </nav>
-        <div class="sidebar-project">
-          <p class="nav-label">Logical project</p>
-          <strong id="project-name">Connecting…</strong>
-          <span id="project-path">Waiting for local mesh</span>
-        </div>
-        <div class="privacy-badge">
-          <i></i>
-          <span><strong>Loopback only</strong><small>Nothing leaves this machine</small></span>
-        </div>
-      </aside>
-
-      <div class="workspace-shell">
-        <header class="topbar">
-          <div>
-            <button class="mobile-menu" id="mobile-menu" type="button" aria-label="Toggle navigation">☰</button>
-            <p class="eyebrow">Agent operations / <span id="workspace-crumb">local</span></p>
-            <h1>Control room</h1>
+      <header class="app-header">
+        <div class="header-leading">
+          <button class="icon-button mobile-only" id="run-rail-toggle" type="button" aria-label="Open task navigator" aria-controls="run-rail" aria-expanded="false">☰</button>
+          <a class="wordmark" href="#" aria-label="PidMesh workspace">PidMesh</a>
+          <span class="header-separator" aria-hidden="true">/</span>
+          <div class="project-identity">
+            <strong id="project-name">Local workspace</strong>
+            <span id="project-branch">Connecting…</span>
           </div>
-          <div class="topbar-actions">
-            <span class="connection"><i></i><span id="connection-label">Connecting</span></span>
-            <button class="secondary-button" id="refresh-button" type="button">Refresh</button>
-            <button class="primary-button" id="new-action-button" type="button">New action <span>⌘K</span></button>
-          </div>
-        </header>
+        </div>
 
-        <main>
-          <section class="overview" id="overview" aria-labelledby="overview-title">
-            <div class="section-heading overview-heading">
-              <div>
-                <p class="eyebrow">Live project state</p>
-                <h2 id="overview-title">Five agents should feel like one system.</h2>
-              </div>
-              <p>Track the processes, ownership, collisions, handoffs, and decisions beneath every agent workspace.</p>
+        <div class="view-switcher" role="group" aria-label="Product view">
+          <button class="view-switch active" type="button" data-app-view="ide" aria-pressed="true">Workspace</button>
+          <button class="view-switch" type="button" data-app-view="operations" aria-pressed="false">Operations</button>
+        </div>
+
+        <div class="header-actions">
+          <span class="connection-state" id="connection-state"><i aria-hidden="true"></i><span>Connecting</span></span>
+          <button class="button secondary inspector-toggle" id="inspector-toggle" type="button" aria-controls="inspector" aria-expanded="false">Details</button>
+          <button class="button primary" id="new-task-button" type="button">New task <kbd>⌘N</kbd></button>
+        </div>
+      </header>
+
+      <div class="ide-layout" id="ide-view">
+        <aside class="run-rail" id="run-rail" aria-label="Task navigator">
+          <div class="rail-heading">
+            <div><span class="overline">Local queue</span><h1>Agent runs</h1></div>
+            <button class="icon-button rail-close mobile-only" id="run-rail-close" type="button" aria-label="Close task navigator">×</button>
+          </div>
+
+          <section class="attention-section" aria-labelledby="attention-heading">
+            <div class="section-label"><h2 id="attention-heading">Needs you</h2><span id="attention-count">0</span></div>
+            <div class="attention-list" id="attention-list"></div>
+          </section>
+
+          <nav class="session-groups" id="session-groups" aria-label="Agent sessions"></nav>
+
+          <button class="new-task-rail" id="new-task-rail" type="button"><span aria-hidden="true">＋</span> Create task</button>
+        </aside>
+
+        <main class="workbench" id="workbench" tabindex="-1">
+          <header class="workbench-header">
+            <div class="run-title-block">
+              <span class="status-dot" id="active-status-dot" aria-hidden="true"></span>
+              <div><h2 id="active-run-title">Choose or create a task</h2><p id="active-run-subtitle">Each agent gets an isolated branch and worktree.</p></div>
             </div>
-            <div class="metrics" aria-label="Mesh totals">
-              <article><span class="metric-icon green">◉</span><div><small>Running agents</small><strong id="metric-running">—</strong></div><em id="metric-total">— registered</em></article>
-              <article><span class="metric-icon blue">◇</span><div><small>Task claims</small><strong id="metric-claims">—</strong></div><em>atomic ownership</em></article>
-              <article><span class="metric-icon orange">⌁</span><div><small>Resources held</small><strong id="metric-resources">—</strong></div><em>paths, ports, services</em></article>
-              <article><span class="metric-icon violet">⌘</span><div><small>Shared memories</small><strong id="metric-memories">—</strong></div><em id="metric-messages">— messages routed</em></article>
+            <div class="run-header-actions">
+              <span class="status-badge" id="active-status">No active run</span>
+              <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh workspace" title="Refresh workspace">↻</button>
             </div>
-            <section class="attention panel" aria-labelledby="attention-title">
-              <div class="panel-heading compact">
-                <div><p class="eyebrow">Operator attention</p><h3 id="attention-title">What needs you now</h3></div>
-                <span class="count-pill" id="attention-count">0</span>
+          </header>
+
+          <div class="workbench-tabs" role="tablist" aria-label="Run workspace">
+            <button class="workbench-tab active" id="overview-tab" type="button" role="tab" data-workbench-view="overview" aria-controls="overview-panel" aria-selected="true">Overview</button>
+            <button class="workbench-tab" id="files-tab" type="button" role="tab" data-workbench-view="files" aria-controls="files-panel" aria-selected="false">Files <span id="file-count"></span></button>
+            <button class="workbench-tab" id="diff-tab" type="button" role="tab" data-workbench-view="diff" aria-controls="diff-panel" aria-selected="false">Diff <span id="diff-count"></span></button>
+          </div>
+
+          <div class="workbench-content">
+            <section class="workbench-panel overview-panel" id="overview-panel" role="tabpanel" aria-labelledby="overview-tab">
+              <div class="empty-workspace" id="workspace-empty">
+                <span class="empty-orbit" aria-hidden="true">◎</span>
+                <h3>Give an agent a bounded place to work.</h3>
+                <p>Create a task, choose a provider, and reserve the files it may touch. PidMesh keeps the process, worktree, console, and review together.</p>
+                <button class="button primary" id="empty-new-task" type="button">Create your first task</button>
               </div>
-              <div class="attention-list" id="attention-list"></div>
+
+              <div class="run-overview hidden" id="run-overview">
+                <section class="task-brief" aria-labelledby="task-brief-heading">
+                  <span class="overline">Task brief</span>
+                  <h3 id="task-brief-heading">Prompt</h3>
+                  <p id="task-prompt">—</p>
+                </section>
+                <div class="overview-grid">
+                  <section class="overview-card" aria-labelledby="execution-heading">
+                    <div class="card-heading"><span class="overline">Runtime</span><h3 id="execution-heading">Execution</h3></div>
+                    <dl id="execution-details"></dl>
+                  </section>
+                  <section class="overview-card" aria-labelledby="scope-heading">
+                    <div class="card-heading"><span class="overline">Collision guard</span><h3 id="scope-heading">Reserved scope</h3></div>
+                    <div class="scope-list" id="scope-list"></div>
+                  </section>
+                  <section class="overview-card activity-card" aria-labelledby="activity-heading">
+                    <div class="card-heading"><span class="overline">Current state</span><h3 id="activity-heading">Run activity</h3></div>
+                    <div class="activity-feed" id="activity-feed"></div>
+                  </section>
+                </div>
+              </div>
             </section>
-          </section>
 
-          <section class="cockpit-grid" id="fleet">
-            <article class="panel fleet-panel">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Process topology</p><h3>Agent fleet</h3></div>
-                <span class="live-pill"><i></i>Live</span>
-              </div>
-              <div class="agent-list" id="agent-list" aria-live="polite"></div>
-            </article>
-            <article class="panel command-panel" id="command-panel">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Human intervention</p><h3>Route an action</h3></div>
-                <kbd>⌘ K</kbd>
-              </div>
-              <div class="tabs" role="tablist" aria-label="Mesh action">
-                <button class="tab active" data-tab="message" role="tab">Message</button>
-                <button class="tab" data-tab="memory" role="tab">Remember</button>
-                <button class="tab" data-tab="claim" role="tab">Claim</button>
-                <button class="tab" data-tab="reserve" role="tab">Reserve</button>
-              </div>
-              <form id="command-form">
-                <label id="command-label" for="command-text">Message</label>
-                <textarea id="command-text" rows="4" maxlength="65536" placeholder="Send a direction or handoff to an agent…" required></textarea>
-                <div class="form-row hidden" id="memory-options">
-                  <label>Kind<input id="memory-kind" value="decision" maxlength="256" /></label>
-                  <label>Key<input id="memory-key" placeholder="architecture" maxlength="256" /></label>
-                </div>
-                <div class="form-row" id="message-options">
-                  <label>Recipient<select id="message-recipient"><option value="*">Everyone</option></select></label>
-                </div>
-                <div class="form-row hidden" id="lease-options">
-                  <label>Lease, seconds<input id="claim-lease" type="number" min="1" max="86400" value="900" /></label>
-                  <label id="reserve-task-label" class="hidden">Task key<input id="reserve-task" maxlength="256" placeholder="dashboard-v1.3" /></label>
-                </div>
-                <button class="submit-button" type="submit"><span id="submit-label">Route message</span><b aria-hidden="true">↗</b></button>
-                <p class="form-status" id="form-status" role="status"></p>
+            <section class="workbench-panel files-panel hidden" id="files-panel" role="tabpanel" aria-labelledby="files-tab">
+              <aside class="file-explorer" aria-label="Worktree files">
+                <div class="pane-heading"><div><span class="overline">Worktree</span><h3>Explorer</h3></div><button class="icon-button" id="files-refresh" type="button" aria-label="Refresh file tree">↻</button></div>
+                <div class="file-tree" id="file-tree" role="tree"></div>
+              </aside>
+              <article class="file-viewer">
+                <header class="viewer-heading"><span id="file-path">Select a file</span><button class="copy-button" id="copy-file" type="button" disabled>Copy</button></header>
+                <pre class="code-view" id="file-content" tabindex="0"><code>Choose a text file from the worktree to inspect it.</code></pre>
+              </article>
+            </section>
+
+            <section class="workbench-panel diff-panel hidden" id="diff-panel" role="tabpanel" aria-labelledby="diff-tab">
+              <aside class="change-list-pane" aria-label="Changed files">
+                <div class="pane-heading"><div><span class="overline">Review</span><h3>Changed files</h3></div><span class="change-summary" id="change-summary">0 files</span></div>
+                <div class="change-list" id="change-list"></div>
+              </aside>
+              <article class="diff-viewer">
+                <header class="viewer-heading"><span id="diff-path">No changes selected</span><span id="diff-stats"></span></header>
+                <pre class="code-view diff-code" id="diff-content" tabindex="0"><code>Changes will appear here when the agent updates its worktree.</code></pre>
+              </article>
+            </section>
+          </div>
+
+          <section class="console-drawer" id="console-drawer" aria-labelledby="console-heading">
+            <header class="console-heading">
+              <div><span class="terminal-mark" aria-hidden="true">›_</span><h3 id="console-heading">Agent console</h3><span class="console-state" id="console-state">Idle</span></div>
+              <div><button class="text-button" id="clear-console" type="button">Clear view</button><button class="icon-button" id="console-toggle" type="button" aria-expanded="true" aria-controls="console-body" aria-label="Collapse console">⌄</button></div>
+            </header>
+            <div class="console-body" id="console-body">
+              <div class="console-output" id="console-output" tabindex="0" aria-label="Agent process terminal"></div>
+              <form class="console-input-form" id="console-input-form">
+                <label class="sr-only" for="console-input">Send input to agent</label>
+                <span aria-hidden="true">›</span>
+                <input id="console-input" autocomplete="off" spellcheck="false" placeholder="Send input to the running agent…" disabled />
+                <button type="submit" disabled>Send</button>
               </form>
-            </article>
-          </section>
-
-          <section class="work-grid" id="work">
-            <article class="panel resources-panel">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Collision guard</p><h3>Resource ownership</h3></div>
-                <span class="panel-note">hierarchical + atomic</span>
-              </div>
-              <div id="resource-list" class="resource-list"></div>
-            </article>
-            <article class="panel claims-panel">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Execution leases</p><h3>Active tasks</h3></div>
-                <span class="panel-note">crash recoverable</span>
-              </div>
-              <div id="claim-list" class="claim-list"></div>
-            </article>
-          </section>
-
-          <section class="context-grid" id="context">
-            <article class="panel message-panel">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Handoff traffic</p><h3>Agent messages</h3></div>
-                <span class="panel-note" id="message-count">0 routed</span>
-              </div>
-              <div class="message-list" id="message-list"></div>
-            </article>
-            <article class="panel memory-panel">
-              <div class="panel-heading">
-                <div><p class="eyebrow">Durable context</p><h3>Shared memory</h3></div>
-                <label class="search"><span class="sr-only">Search memories</span><input id="memory-search" type="search" placeholder="Search decisions" /><b>⌕</b></label>
-              </div>
-              <div class="memory-list" id="memory-list"></div>
-            </article>
-          </section>
-
-          <section class="panel trace-panel" id="trace">
-            <div class="panel-heading">
-              <div><p class="eyebrow">Causal ledger</p><h3>Event trace</h3></div>
-              <span class="panel-note">SQLite ordered</span>
             </div>
-            <div class="feed" id="event-feed" aria-live="polite"></div>
           </section>
         </main>
+
+        <aside class="inspector" id="inspector" aria-label="Task inspector">
+          <header class="inspector-heading"><div><span class="overline">Selected run</span><h2>Inspector</h2></div><button class="icon-button inspector-close" id="inspector-close" type="button" aria-label="Close inspector">×</button></header>
+
+          <div class="inspector-empty" id="inspector-empty">Select a task to inspect its provider, worktree, and review state.</div>
+          <div class="inspector-content hidden" id="inspector-content">
+            <section class="inspector-section">
+              <h3>Task</h3>
+              <dl class="inspector-list" id="task-details"></dl>
+            </section>
+            <section class="inspector-section">
+              <h3>Worktree</h3>
+              <dl class="inspector-list" id="worktree-details"></dl>
+            </section>
+            <section class="inspector-section">
+              <h3>Review</h3>
+              <div class="review-state" id="review-state"><span>Not ready</span><p>Review becomes available when the agent produces changes.</p></div>
+              <label class="field compact-field" for="commit-message"><span>Commit message</span><input id="commit-message" maxlength="200" placeholder="feat: describe the change" /></label>
+              <div class="review-actions">
+                <button class="button danger-quiet" id="reject-button" type="button" disabled>Reject</button>
+                <button class="button primary" id="approve-button" type="button" disabled>Approve &amp; merge</button>
+              </div>
+            </section>
+          </div>
+
+          <div class="inspector-footer">
+            <button class="button danger-quiet full-width" id="stop-button" type="button" disabled>Stop agent</button>
+          </div>
+        </aside>
       </div>
+
+      <main class="operations-view hidden" id="operations-view">
+        <header class="operations-heading"><div><span class="overline">Live mesh</span><h1>Operations</h1><p>Process health, ownership, and recent coordination events across the workspace.</p></div><button class="button secondary" id="operations-refresh" type="button">Refresh</button></header>
+        <div class="metric-grid" id="operation-metrics"></div>
+        <div class="operations-grid">
+          <section class="operation-panel"><div class="pane-heading"><div><span class="overline">Fleet</span><h2>Agents</h2></div></div><div class="operation-list" id="operation-agents"></div></section>
+          <section class="operation-panel"><div class="pane-heading"><div><span class="overline">Ownership</span><h2>Claims &amp; resources</h2></div></div><div class="operation-list" id="operation-ownership"></div></section>
+          <section class="operation-panel full-span"><div class="pane-heading"><div><span class="overline">Ledger</span><h2>Recent events</h2></div></div><div class="operation-list event-list" id="operation-events"></div></section>
+        </div>
+      </main>
+
+      <footer class="status-bar">
+        <span id="status-worktree">No worktree selected</span>
+        <span id="status-process">PID —</span>
+        <span id="status-changes">0 changed files</span>
+        <span class="status-spacer"></span>
+        <span id="status-message" role="status" aria-live="polite">Connecting to local mesh…</span>
+      </footer>
     </div>
+
+    <div class="scrim" id="scrim"></div>
+
+    <dialog class="modal new-task-modal" id="new-task-dialog" aria-labelledby="new-task-title">
+      <form id="new-task-form">
+        <header class="modal-heading"><div><span class="overline">Isolated execution</span><h2 id="new-task-title">Create an agent task</h2><p>PidMesh will launch the provider with a bounded task and reserved file scope.</p></div><button class="icon-button" id="new-task-close" type="button" aria-label="Close new task dialog">×</button></header>
+        <div class="modal-body">
+          <div class="form-grid">
+            <label class="field full-field" for="task-name"><span>Run name</span><input id="task-name" name="name" maxlength="80" placeholder="checkout-risk-model" required /><small>A short label for the run and its agent.</small></label>
+            <label class="field" for="task-provider"><span>Provider</span><select id="task-provider" name="provider" required><option value="">Loading providers…</option></select><small id="provider-help">Detected on this machine.</small></label>
+            <label class="field" for="task-key"><span>Task key</span><input id="task-key" name="task" maxlength="120" placeholder="risk-model" required /><small>Used for atomic task ownership.</small></label>
+            <label class="field full-field" for="task-prompt-input"><span>Task prompt</span><textarea id="task-prompt-input" name="prompt" rows="6" maxlength="65536" placeholder="Explain the outcome, constraints, and how to verify it…" required></textarea></label>
+            <label class="field full-field" for="task-scopes"><span>Reserved paths</span><textarea id="task-scopes" name="scopes" rows="3" placeholder="src/risk/&#10;tests/risk/" required></textarea><small>One relative path per line. Absolute paths and parent traversal are not allowed.</small></label>
+          </div>
+          <div class="launch-preview"><span class="overline">Launch summary</span><p id="launch-preview">Choose a provider and describe the task.</p></div>
+          <p class="form-error" id="new-task-error" role="alert"></p>
+        </div>
+        <footer class="modal-actions"><button class="button secondary" id="new-task-cancel" type="button">Cancel</button><button class="button primary" id="create-task-submit" type="submit">Create task</button></footer>
+      </form>
+    </dialog>
+
+    <dialog class="modal confirm-modal" id="confirm-dialog" aria-labelledby="confirm-title">
+      <form id="confirm-form">
+        <header class="modal-heading"><div><span class="overline" id="confirm-overline">Confirm action</span><h2 id="confirm-title">Continue?</h2><p id="confirm-description"></p></div><button class="icon-button" id="confirm-close" type="button" aria-label="Close confirmation">×</button></header>
+        <p class="form-error modal-error" id="confirm-error" role="alert"></p>
+        <footer class="modal-actions"><button class="button secondary" id="confirm-cancel" type="button">Cancel</button><button class="button danger" id="confirm-submit" type="submit">Continue</button></footer>
+      </form>
+    </dialog>
   </body>
 </html>

@@ -855,6 +855,7 @@ fn dashboard_api_is_token_protected_and_cleans_up_its_session() -> Result<()> {
     let unauthorized = http_request(address, "GET", "/api/v1/snapshot", &[], "")?;
     assert_eq!(unauthorized.0, 401);
     let authorization = format!("Bearer {token}");
+    assert_ide_api_security(address, &authorization)?;
     let foreign = http_request(
         address,
         "GET",
@@ -916,6 +917,27 @@ fn dashboard_api_is_token_protected_and_cleans_up_its_session() -> Result<()> {
     let store = MeshStore::new(database)?;
     let status = store.status(None, Some(directory.path()))?;
     assert_eq!(status["agents"][0]["status"], "stopped");
+    Ok(())
+}
+
+fn assert_ide_api_security(address: &str, authorization: &str) -> Result<()> {
+    let providers = http_request(
+        address,
+        "GET",
+        "/api/v1/ide/providers",
+        &[("Authorization", authorization)],
+        "",
+    )?;
+    assert_eq!(providers.0, 200);
+    assert!(providers.2.contains("claude"));
+    let launch_without_origin = http_request(
+        address,
+        "POST",
+        "/api/v1/ide/sessions",
+        &[("Authorization", authorization)],
+        r#"{"name":"blocked","provider":"claude","task":"blocked","prompt":"blocked","scopes":["src"]}"#,
+    )?;
+    assert_eq!(launch_without_origin.0, 403);
     Ok(())
 }
 

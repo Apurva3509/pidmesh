@@ -2,7 +2,7 @@
 
 Fast, local process-aware memory and coordination for concurrent AI agents—implemented in Rust.
 
-[Website](https://apurva3509.github.io/pidmesh/) · [Protocol](docs/protocol.md) · [Releases](https://github.com/Apurva3509/pidmesh/releases)
+[Website](https://pidmesh.patelapurva.com/) · [Protocol](docs/protocol.md) · [Releases](https://github.com/Apurva3509/pidmesh/releases)
 
 Run Codex, Claude Code, Cursor, local models, and custom workers in separate terminals without
 making them work blind. Every process gets a workspace-scoped identity, shared durable memory, an
@@ -56,7 +56,7 @@ Release archives contain both `pidmesh` and `pidmesh-mcp`:
 gh release download --repo Apurva3509/pidmesh --pattern 'pidmesh-*'
 ```
 
-## Open the local control room
+## Open the local agent IDE
 
 Launch a private browser dashboard for the current workspace:
 
@@ -64,12 +64,31 @@ Launch a private browser dashboard for the current workspace:
 pidmesh dashboard
 ```
 
-PidMesh prints a one-time local URL containing the session token. The dashboard binds only to
-`127.0.0.1` and opens the PidMesh Cockpit: operator attention, live agent PIDs, checkout branches,
-task claims, path/port/service ownership, handoffs, memory, and the causal event ledger. You can also
-create memories, send handoffs, claim tasks, and atomically reserve resources without leaving the
-page. Use `pidmesh dashboard --port 0` to select an available port automatically; `pidmesh ui` is an
-alias.
+PidMesh prints a one-time local URL containing the session token and binds only to `127.0.0.1`.
+The default Workspace view is an agent IDE: create a bounded task, select an installed Codex or
+Claude Code profile, reserve its allowed paths, and launch it in a generated branch and isolated git
+worktree. The browser attaches to a real PTY, survives terminal reconnection, browses the worktree,
+shows the unified diff, flags out-of-scope changes, and gates commit/merge approval. The Operations
+view retains live PIDs, claims, path/port/service ownership, shared memory, messages, and the event
+ledger. Use `pidmesh dashboard --port 0` to select an available port automatically; `pidmesh ui` is
+an alias.
+
+Launch profiles are resolved and allowlisted by the Rust server. The HTTP API cannot supply an
+arbitrary command, executable, branch, worktree path, base ref, or environment. A run is limited to
+the generated worktree, but path scope is enforced at the review gate rather than by an operating
+system sandbox: PidMesh refuses approval while changes exist outside the reserved paths.
+
+The primary workflow is:
+
+1. Click **New task** and choose Codex or Claude Code.
+2. Describe the outcome and enter one allowed relative path per line.
+3. Work with the agent through the embedded terminal.
+4. Inspect its Files and Diff tabs.
+5. Stop the agent, resolve any scope violations, then approve and merge.
+
+Managed terminal scrollback and run handles are currently retained in memory for the lifetime of the
+dashboard. Worktrees are deliberately preserved after stop or failure so uncommitted agent work is
+never deleted automatically.
 
 ## Five-minute demo
 
@@ -175,7 +194,9 @@ schema upgrades, dashboard security, and a full MCP stdio handshake with native 
 Codex PID 4101 ─┐             one connection / process
 Claude PID 4102 ├── CLI/MCP ───────────┐
 Worker PID 4103 ┘                      ├── SQLite WAL
-Browser UI ─── localhost/token ────────┘
+Browser IDE ── localhost/token ────────┤
+            ├── PTY + attach ticket ───┤
+            └── worktree/diff/review ──┘
                                       └── memory + inbox + claims + resources + events
 
 pidmesh swarm ──┬── Worker PID 5101
