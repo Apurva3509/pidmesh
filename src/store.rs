@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS footprints (
     digest TEXT,
     base_commit TEXT,
     branch TEXT,
+    ranges TEXT,
     observed_at INTEGER NOT NULL,
     PRIMARY KEY (workspace_id, agent_id, path)
 );
@@ -791,6 +792,190 @@ impl MeshStore {
         })
     }
 
+    /// Withdraw this agent's footprint entirely.
+    ///
+    /// Publishing an empty scan has the same effect, but an agent that is shutting down or whose
+    /// checkout has been removed cannot produce a scan at all.
+    pub fn release_footprint(&self, agent_id: &str) -> Result<Value> {
+        self.write(|transaction| {
+            let agent = Self::agent_row(transaction, agent_id)?;
+            let before = collision_signatures(transaction, &agent.workspace_id)?;
+            let released = transaction.execute(
+                "DELETE FROM footprints WHERE workspace_id = ? AND agent_id = ?",
+                params![agent.workspace_id, agent_id],
+            )?;
+            let after = collision_signatures(transaction, &agent.workspace_id)?;
+            for path in before.keys() {
+                if !after.contains_key(path) {
+                    Self::event(
+                        transaction,
+                        &agent.workspace_id,
+                        Some(agent_id),
+                        "collision.cleared",
+                        Some(path),
+                        &json!({}),
+                    )?;
+                }
+            }
+            Ok(json!({"released": released}))
+        })
+    }
+
+    /// Decide whether this agent can merge without breaking somebody else.
+    ///
+    /// Collision reporting says a conflict exists; this says what to do about it. The caller
+    /// supplies the integration branch's current head, because resolving it is a git question.
+    pub fn merge_readiness(&self, agent_id: &str, integration_head: &str) -> Result<Value> {
+        let now = now_ms()?;
+        self.read(|connection| {
+            let agent = Self::agent_row(connection, agent_id)?;
+            let base_commit: Option<String> = connection
+                .query_row(
+                    "SELECT base_commit FROM footprints
+                     WHERE workspace_id = ? AND agent_id = ? LIMIT 1",
+                    params![agent.workspace_id, agent_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            let mut blockers = Vec::new();
+
+            // A worktree cut from a commit the integration branch has moved past may still merge
+            // cleanly and be wrong, because it was written against code that no longer exists.
+            if let Some(base) = base_commit.as_deref()
+                && base != integration_head
+            {
+                blockers.push(json!({
+                    "code": "stale_base",
+                    "detail": "the integration branch has advanced since this worktree was cut; \
+                               rebase before merging",
+                    "base_commit": base,
+                    "integration_head": integration_head
+                }));
+            }
+
+            // Only live peers block a merge. A stopped agent's preserved worktree is still worth
+            // reporting as a collision, but it cannot be asked to rebase and must not deadlock
+            // the queue.
+            for (path, participants) in workspace_collisions(connection, &agent.workspace_id)? {
+                if !participants
+                    .iter()
+                    .any(|participant| participant.agent_id == agent_id)
+                {
+                    continue;
+                }
+                let Some(mine) = participants
+                    .iter()
+                    .find(|participant| participant.agent_id == agent_id)
+                else {
+                    continue;
+                };
+                // Severity is judged per pair, not per path. Four agents can share one file while
+                // only two of them overlap; blocking the other two because the path as a whole is
+                // contested would serialize a fleet that has no actual conflict.
+                let peers: Vec<Value> = participants
+                    .iter()
+                    .filter(|peer| peer.agent_id != agent_id && peer.status == "running")
+                    .filter_map(|peer| {
+                        let pair = [mine.clone(), peer.clone()];
+                        let severity = classify(&pair);
+                        // Duplicated work is safe to merge, and edits to separable regions of one
+                        // file are what git three-way merges exist to resolve.
+                        if severity == "identical" || severity == "adjacent" {
+                            return None;
+                        }
+                        Some(json!({
+                            "agent_id": peer.agent_id,
+                            "agent_name": peer.agent_name,
+                            "severity": severity
+                        }))
+                    })
+                    .collect();
+                if peers.is_empty() {
+                    continue;
+                }
+                blockers.push(json!({
+                    "code": "contested_path",
+                    "detail": "another live checkout rewrote an overlapping region of this path",
+                    "path": path,
+                    "peers": peers
+                }));
+            }
+
+            // Whoever holds the lease is mid-merge; anyone else would be racing them.
+            let lease: Option<(String, i64)> = connection
+                .query_row(
+                    "SELECT agent_id, lease_expires_at FROM claims
+                     WHERE workspace_id = ? AND task_key = ? AND lease_expires_at > ?",
+                    params![agent.workspace_id, INTEGRATION_TASK_KEY, now],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let holder = lease.as_ref().map(|(holder, _)| holder.clone());
+            if let Some((holder, expires_at)) = lease.as_ref()
+                && holder != agent_id
+            {
+                blockers.push(json!({
+                    "code": "integration_held",
+                    "detail": "another agent holds the integration lease and is merging now",
+                    "held_by": holder,
+                    "lease_expires_at": expires_at
+                }));
+            }
+
+            Ok(json!({
+                "agent_id": agent_id,
+                "mergeable": blockers.is_empty(),
+                "base_commit": base_commit,
+                "integration_head": integration_head,
+                "holds_integration_lease": holder.as_deref() == Some(agent_id),
+                "blockers": blockers
+            }))
+        })
+    }
+
+    /// Live agents in this workspace that have a recorded checkout.
+    ///
+    /// A supervisor uses this to observe a fleet that never calls `sync` itself: every checkout is
+    /// already known from registration, so no agent cooperation is required.
+    pub fn live_checkouts(&self, root: Option<&Path>) -> Result<Vec<AgentCheckout>> {
+        self.read(|connection| {
+            let root = workspace_root(root)?;
+            let workspace_id = connection
+                .query_row("SELECT id FROM workspaces WHERE root = ?", [&root], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?;
+            let Some(workspace_id) = workspace_id else {
+                return Ok(Vec::new());
+            };
+            let mut statement = connection.prepare(
+                "SELECT id, name, pid, checkout_path FROM agents
+                 WHERE workspace_id = ? AND status = 'running' AND checkout_path IS NOT NULL
+                 ORDER BY heartbeat_at DESC",
+            )?;
+            let rows = statement
+                .query_map([&workspace_id], |row| {
+                    Ok((
+                        AgentCheckout {
+                            agent_id: row.get(0)?,
+                            agent_name: row.get(1)?,
+                            checkout_path: PathBuf::from(row.get::<_, String>(3)?),
+                        },
+                        row.get::<_, u32>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // A session marked running whose PID is gone should not have its checkout scanned.
+            Ok(rows
+                .into_iter()
+                .filter(|(_, pid)| process_is_alive(*pid))
+                .map(|(checkout, _)| checkout)
+                .collect())
+        })
+    }
+
     /// Replace this agent's observed footprint and report the collisions that result.
     ///
     /// The footprint is authoritative per agent: a scan that no longer touches a path releases it,
@@ -808,8 +993,8 @@ impl MeshStore {
                 transaction.execute(
                     "INSERT INTO footprints(
                         workspace_id, agent_id, path, change_kind, digest,
-                        base_commit, branch, observed_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        base_commit, branch, ranges, observed_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         agent.workspace_id,
                         agent_id,
@@ -818,6 +1003,7 @@ impl MeshStore {
                         entry.digest,
                         scan.base_commit,
                         scan.branch,
+                        entry.ranges,
                         now
                     ],
                 )?;
@@ -1142,6 +1328,60 @@ impl MeshStore {
                     &json!({}),
                 )?;
             }
+            // A footprint outlives its session on purpose: PidMesh preserves worktrees, so a
+            // stopped or dead agent's uncommitted work still genuinely contests the path. Once
+            // the checkout is gone that contention cannot be real.
+            //
+            // This sweeps every agent that is no longer running rather than only the ones this
+            // pass just marked dead. An agent whose worktree is removed after it died would
+            // otherwise never be revisited, because the liveness query above selects only
+            // 'running' sessions, and its phantom collision would be permanent.
+            let mut orphan_statement = transaction.prepare(
+                "SELECT DISTINCT a.id, a.workspace_id, a.checkout_path
+                 FROM footprints f JOIN agents a ON a.id = f.agent_id
+                 WHERE a.status != 'running'",
+            )?;
+            let orphans = orphan_statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(orphan_statement);
+
+            let mut abandoned_footprints = 0;
+            let mut touched: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (agent_id, workspace_id, checkout) in orphans {
+                if checkout.is_none_or(|path| !Path::new(&path).is_dir()) {
+                    touched.entry(workspace_id).or_default().push(agent_id);
+                }
+            }
+            for (workspace_id, agent_ids) in touched {
+                // Removing a footprint can end a collision, and anything parked on `wait` has to
+                // learn that the same way an explicit withdrawal announces it.
+                let before = collision_signatures(transaction, &workspace_id)?;
+                for agent_id in &agent_ids {
+                    abandoned_footprints += transaction
+                        .execute("DELETE FROM footprints WHERE agent_id = ?", [agent_id])?;
+                }
+                let after = collision_signatures(transaction, &workspace_id)?;
+                for path in before.keys() {
+                    if !after.contains_key(path) {
+                        Self::event(
+                            transaction,
+                            &workspace_id,
+                            None,
+                            "collision.cleared",
+                            Some(path),
+                            &json!({"reason": "checkout removed"}),
+                        )?;
+                    }
+                }
+            }
+
             let expired =
                 transaction.execute("DELETE FROM claims WHERE lease_expires_at <= ?", [now])?;
             let expired_resources = transaction.execute(
@@ -1151,7 +1391,8 @@ impl MeshStore {
             Ok(json!({
                 "dead_agents": dead.len(),
                 "expired_claims": expired,
-                "expired_resources": expired_resources
+                "expired_resources": expired_resources,
+                "abandoned_footprints": abandoned_footprints
             }))
         })
     }
@@ -1164,7 +1405,8 @@ impl MeshStore {
                 Ok(()) => {
                     add_column_if_missing(&connection, "agents", "checkout_path", "TEXT")?;
                     add_column_if_missing(&connection, "agents", "git_branch", "TEXT")?;
-                    connection.pragma_update(None, "user_version", 3)?;
+                    add_column_if_missing(&connection, "footprints", "ranges", "TEXT")?;
+                    connection.pragma_update(None, "user_version", 4)?;
                     return Ok(());
                 }
                 Err(error) if is_busy(&error) && attempt < 7 => {
@@ -1371,6 +1613,81 @@ fn git_context(directory: &Path) -> Option<GitContext> {
         checkout,
         primary,
     })
+}
+
+/// Diagnose whether this workspace is actually one shared mesh.
+///
+/// An explicit `--workspace` or `PIDMESH_WORKSPACE` bypasses linked-worktree discovery, so every
+/// checkout becomes its own mesh. Coordination then silently does nothing while every command
+/// still succeeds, which is the worst failure mode this system has.
+pub fn diagnose(database: &Path, root: Option<&Path>) -> Result<Value> {
+    let store = MeshStore::new(database)?;
+    let here = git_context(&env::current_dir()?);
+    let resolved = workspace_root(root)?;
+    let primary = here.as_ref().map(|context| context.primary.clone());
+
+    let registered = store.read(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT w.root, COUNT(a.id)
+             FROM workspaces w LEFT JOIN agents a
+               ON a.workspace_id = w.id AND a.status = 'running'
+             GROUP BY w.root",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })?;
+
+    // Any two workspace roots that resolve to one repository are a split mesh.
+    let mut siblings = Vec::new();
+    if let Some(primary) = primary.as_ref() {
+        for (root, live) in &registered {
+            let path = Path::new(root);
+            let shares_repository = git_context(path)
+                .is_some_and(|context| context.primary == *primary)
+                || path == primary;
+            if shares_repository {
+                siblings.push(json!({"workspace": root, "live_agents": live}));
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if siblings.len() > 1 {
+        warnings.push(json!({
+            "code": "split_mesh",
+            "detail": format!(
+                "{} workspace roots belong to one repository, so their agents cannot see each \
+                 other. This happens when --workspace or PIDMESH_WORKSPACE is set explicitly \
+                 inside a linked worktree; omit it and let discovery resolve the primary checkout.",
+                siblings.len()
+            ),
+            "roots": siblings
+        }));
+    }
+    if here.is_none() {
+        warnings.push(json!({
+            "code": "not_a_repository",
+            "detail": "This directory is not inside a git repository, so linked-worktree \
+                       discovery cannot group checkouts."
+        }));
+    }
+
+    Ok(json!({
+        "database": database,
+        "resolved_workspace": resolved,
+        "checkout": here.as_ref().map(|context| context.checkout.to_string_lossy()),
+        "primary_repository": primary.as_ref().map(|path| path.to_string_lossy()),
+        "branch": here.as_ref().and_then(|context| context.branch.clone()),
+        "linked_worktree": here
+            .as_ref()
+            .is_some_and(|context| context.checkout != context.primary),
+        "healthy": warnings.is_empty(),
+        "warnings": warnings
+    }))
 }
 
 #[cfg(unix)]
@@ -1583,6 +1900,21 @@ fn add_column_if_missing(
     Ok(())
 }
 
+/// A live agent session and the checkout it is working in.
+/// Task key reserved for the workspace-wide integration lease.
+///
+/// Merges are serialized through the ordinary claim table rather than a new mechanism: it already
+/// guarantees exactly one owner until expiry, survives a crashed holder, and is released with the
+/// rest of an agent's state.
+pub const INTEGRATION_TASK_KEY: &str = "pidmesh:integration";
+
+#[derive(Clone, Debug)]
+pub struct AgentCheckout {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub checkout_path: PathBuf,
+}
+
 /// Every path in the workspace changed in more than one checkout.
 ///
 /// Contention is keyed on checkout rather than agent: a worker that runs both a CLI session and an
@@ -1591,16 +1923,16 @@ fn workspace_collisions(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<(String, Vec<Participant>)>> {
-    // One checkout gets one opinion per path. Several sessions can occupy a worktree, so without
-    // collapsing them first a stale footprint from a co-located session would argue with its own
-    // checkout and fabricate a divergent collision. Deduplicating here rather than only in the
-    // contested-path test keeps the participant list and the contention test derived from the
-    // same rows.
+    // One checkout gets one opinion per path. Several sessions can occupy a worktree and a
+    // watcher publishes the same scan for each of them, so without collapsing them first a stale
+    // footprint from a co-located session would argue with its own checkout and fabricate a
+    // divergent collision. Deduplicating here rather than only in the contested-path test also
+    // keeps the participant list and the contention test derived from the same rows.
     let mut statement = connection.prepare(
         "WITH ranked AS (
              SELECT f.path AS path, f.agent_id AS agent_id, a.name AS agent_name,
                     a.status AS status, f.change_kind AS change_kind, f.digest AS digest,
-                    f.base_commit AS base_commit, f.branch AS branch,
+                    f.base_commit AS base_commit, f.branch AS branch, f.ranges AS ranges,
                     ROW_NUMBER() OVER (
                         PARTITION BY f.path, COALESCE(a.checkout_path, f.agent_id)
                         ORDER BY f.observed_at DESC, f.agent_id
@@ -1609,7 +1941,8 @@ fn workspace_collisions(
              JOIN agents a ON a.id = f.agent_id
              WHERE f.workspace_id = ?1
          )
-         SELECT path, agent_id, agent_name, status, change_kind, digest, base_commit, branch
+         SELECT path, agent_id, agent_name, status, change_kind, digest, base_commit, branch,
+                ranges
          FROM ranked
          WHERE position = 1
            AND path IN (
@@ -1629,6 +1962,7 @@ fn workspace_collisions(
                 digest: row.get(5)?,
                 base_commit: row.get(6)?,
                 branch: row.get(7)?,
+                ranges: row.get(8)?,
             },
         ))
     })?;
@@ -1691,7 +2025,8 @@ fn collision_report(contested: &[(String, Vec<Participant>)], viewer: &str) -> V
                         "change_kind": participant.change_kind,
                         "digest": participant.digest,
                         "base_commit": participant.base_commit,
-                        "branch": participant.branch
+                        "branch": participant.branch,
+                        "ranges": participant.ranges
                     }))
                     .collect::<Vec<Value>>()
             })

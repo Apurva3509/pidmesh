@@ -60,13 +60,17 @@ fn stdio_server_negotiates_and_exposes_native_tools() -> Result<()> {
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 13);
+    assert_eq!(names.len(), 17);
     assert!(names.contains(&"claim"));
     assert!(names.contains(&"reserve_resources"));
     assert!(names.contains(&"release_resources"));
     assert!(names.contains(&"wait_for_events"));
     assert!(names.contains(&"sync_footprint"));
     assert!(names.contains(&"collisions"));
+    assert!(names.contains(&"release_footprint"));
+    assert!(names.contains(&"mergeable"));
+    assert!(names.contains(&"acquire_integration_lease"));
+    assert!(names.contains(&"release_integration_lease"));
 
     let remembered = exchange(
         &mut stdin,
