@@ -97,7 +97,17 @@ otherwise a stale footprint from a co-located session would argue with its own c
 changed in more than one checkout is classified by merge outcome rather than by lock
 ownership. `identical` means every participant reached the same outcome: the same content hash, or every
 checkout deleting the path. `delete_edit` means at least one participant removed the path while
-another still edits it, and outranks content comparison. Everything else is `divergent`. Collisions separately report whether the participants
+another still edits it, and outranks content comparison.
+
+Differing content in one path is not automatically a conflict. A scan also records which regions
+of the *base* file each checkout rewrote, in base-file line numbers rather than working-tree ones,
+because a three-way merge conflicts when two sides rewrote overlapping regions of the common
+ancestor. When every pair of participants rewrote disjoint regions the collision is `adjacent`:
+real contention on a shared file that git will nonetheless merge cleanly. Everything else is
+`divergent`. Regions are taken from a single diff of the base commit against the working tree,
+which already unions committed and uncommitted work. A pure insertion is recorded as the single
+base line it sits against, so two insertions at the same point still register as overlapping, and
+a path whose regions are unknown is assumed to overlap — a downgrade must be provable. Collisions separately report whether the participants
 cut their checkouts from different base commits, because a stale base is how a textually clean merge
 still produces incorrect behaviour.
 
@@ -108,7 +118,67 @@ immediately on a real overlap.
 
 Footprints survive an agent being marked stopped, because PidMesh deliberately preserves worktrees
 and their uncommitted work. Collision reports carry each participant's session status so a reader
-can tell live contention from abandoned contention.
+can tell live contention from abandoned contention. Garbage collection removes a dead agent's
+footprint only once its checkout no longer exists on disk, at which point the contention it
+described cannot be real. An agent may also withdraw its footprint explicitly, which is the only
+option available to a session that is shutting down and can no longer produce a scan.
+
+Because every checkout is recorded at registration, a supervisor can publish footprints on behalf
+of a fleet that never calls the protocol itself. Observation therefore requires no agent
+participation at all, unlike a reservation, which is the property that makes convergence hold for
+agents launched by an arbitrary harness. A sweep scans each distinct checkout once regardless of
+how many sessions occupy it, skips checkouts that have been removed, and ignores sessions whose
+process is gone.
+
+## Symbol footprints
+
+Paths answer who is touching what. They cannot answer whether two agents working on different
+files have broken each other, which happens when one withdraws an exported name the other calls:
+the merge is textually clean and the result does not build.
+
+A scan therefore also records two sets per checkout. The withdrawn set holds exported names
+declared on a line the diff removed and not reintroduced on a line it added, so an edited
+signature — deleted and re-added under the same name — is not a withdrawal. The reference set
+holds identifiers appearing in the checkout's changed files, capped so a generated file cannot
+flood the mesh, and filtered by a short stoplist of language keywords.
+
+Recognising an export is a heuristic covering the common declaration forms of Rust, TypeScript,
+JavaScript, Python and Go. It yields nothing when unsure. The asymmetry is deliberate: a missed
+warning costs an unreported break, while a wrong one costs a false alarm against work that was
+fine, and false alarms are what teach an operator to stop reading the output.
+
+A withdrawn name that another checkout references is a symbol break. It is attributed to the
+checkout doing the removing rather than the one doing the calling, because that is the side whose
+merge introduces the failure, and it is matched across checkouts rather than agents so two
+sessions in one worktree never break each other.
+
+## Merge ordering
+
+A collision report states that two checkouts disagree. Merge readiness decides whether one of them
+may land. The caller supplies the integration branch's current head, because resolving a ref is a
+git question rather than a mesh one, and the mesh compares it against the commit the worktree was
+cut from.
+
+Three conditions block a merge. A stale base means the integration branch advanced after this
+worktree was cut, so the diff may apply cleanly and still be wrong. A contested path means another
+live checkout rewrote an overlapping region of a path this one changed. A held integration lease
+means another agent is merging at this moment.
+
+Contention is judged per pair rather than per path. Four checkouts can share one file while only
+two of them overlap, and the severity of the path as a whole says nothing about whether any
+particular agent may land. Each blocker therefore names the specific peers that conflict with the
+asking agent, and an agent that overlaps nobody merges even while the path it touched is
+contested by others.
+
+Two things deliberately do not block. Byte-identical content is duplicated effort, so merging
+either copy is safe, and so is an `adjacent` collision, which is precisely the case three-way
+merging exists to resolve. A peer that is no longer running does not block either: its preserved worktree
+is still reported as a collision, but it cannot be asked to rebase, and treating it as a blocker
+would deadlock every later merge behind an agent that has already exited.
+
+The integration lease is an ordinary claim under a reserved task key rather than a new mechanism.
+It therefore inherits exactly-one-owner semantics, lease expiry so a crashed holder cannot wedge
+the queue permanently, and release through the existing agent lifecycle.
 
 ## Event stream
 
