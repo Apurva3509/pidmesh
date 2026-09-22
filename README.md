@@ -155,6 +155,65 @@ Every collision also reports `base_divergent`. Two agents can edit different fil
 each other when one cuts its worktree from a base the other has already moved past, which is how a
 clean merge still produces broken behaviour.
 
+### Gate the merge, not just the edit
+
+Collision reporting says a conflict exists. Merge ordering says what to do about it:
+
+```bash
+pidmesh mergeable           # can this checkout merge without breaking anyone?
+pidmesh integrate           # take the workspace-wide lease, then merge
+pidmesh integrate --release
+```
+
+`mergeable` exits non-zero and names every blocker:
+
+| Blocker | Meaning |
+| --- | --- |
+| `stale_base` | The integration branch advanced since this worktree was cut. The diff may still apply cleanly and be wrong, because it was written against code that no longer exists. Rebase. |
+| `contested_path` | Another **live** checkout holds different content on a path this one changed. |
+| `integration_held` | Another agent holds the integration lease and is merging right now. |
+
+Duplicated work never blocks: if two checkouts hold byte-identical content, merging either is safe.
+Neither does a stopped peer — its preserved worktree is still reported as a collision, but it
+cannot be asked to rebase and must not deadlock the queue behind it.
+
+The integration lease is an ordinary task claim under a reserved key, so it already has exactly one
+owner until expiry, survives a crashed holder, and is released with the rest of an agent's state.
+
+### Check the mesh is actually shared
+
+One repository must resolve to one mesh or nothing coordinates. An explicit `--workspace` or
+`PIDMESH_WORKSPACE` inside a linked worktree bypasses discovery and silently gives every checkout
+its own mesh, while every command still reports success:
+
+```bash
+pidmesh doctor
+```
+
+It names the resolved workspace, the primary repository behind the current checkout, and exits
+non-zero when two workspace roots belong to one repository, listing the orphaned roots.
+
+### Observe a fleet that never calls sync
+
+`sync` still has to be invoked by somebody. A watcher removes even that requirement: registration
+already recorded every checkout, so one supervisor can observe the whole fleet without any agent
+cooperating.
+
+```bash
+pidmesh watch                      # sweep every live checkout every 5 seconds
+pidmesh watch --once               # a single pass, for a hook or CI step
+pidmesh watch --interval-seconds 15
+```
+
+Each sweep scans every distinct live checkout once, publishes a footprint for every session in it,
+and reports the resulting collisions. A checkout that has been removed is skipped rather than
+failing the sweep, and a session whose PID is gone is not scanned at all.
+
+`pidmesh unsync` withdraws a footprint explicitly, for an agent that is shutting down and can no
+longer produce a scan. Garbage collection keeps a dead agent's footprint while its checkout still
+exists, because PidMesh preserves worktrees and that uncommitted work genuinely still contests the
+path, and removes it once the checkout is gone.
+
 Detection is a mesh event, not a return value. A new or changed collision appends
 `collision.detected`, and withdrawing from a contested path appends `collision.cleared`, so peers
 already parked on `pidmesh wait` wake the moment an overlap appears:
@@ -188,9 +247,9 @@ agent's actual checkout path and branch, so a fleet launched by Superset, Intent
 
 ## MCP setup
 
-The native MCP server uses the official Rust SDK and exposes thirteen tools: status, remember, recall,
+The native MCP server uses the official Rust SDK and exposes seventeen tools: status, remember, recall,
 send, inbox, claim, release, resource reservation/release, event stream, bounded event waiting,
-footprint sync, and collision reporting.
+footprint sync/release, collision reporting, merge readiness, and integration lease acquire/release.
 
 Claude Code:
 
@@ -226,6 +285,9 @@ the server from the project directory. `PIDMESH_DB` overrides the default
 - Bounded waits wake agents without a tight polling loop.
 - Observed footprints detect overlapping edits that no agent reserved.
 - Collision events fire on transitions only, so steady-state re-scanning is free.
+- A watcher can observe every checkout without any agent participating.
+- A stale base blocks a merge even when the diff would apply cleanly.
+- The integration lease admits one merge at a time and has exactly one owner until expiry.
 
 The test suite launches eight separate processes to verify write integrity and prove that task and
 overlapping-path contention each have exactly one winner. It also tests linked worktree discovery,
