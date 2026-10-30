@@ -382,10 +382,30 @@ async fn enforce_host(
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if host != state.host.as_ref() {
+    if !is_loopback_authority(host, state.host.as_ref()) {
         return reject(request, ApiError::Forbidden("request host rejected")).await;
     }
     next.run(request).await
+}
+
+/// Whether a `Host` names this dashboard on the loopback interface.
+///
+/// The bound authority is numeric, but `localhost` and `[::1]` are the same machine and people
+/// type them. A browser resolves `localhost` to loopback by definition, so accepting the aliases
+/// on the bound port admits nothing a rebound name could reach, while rejecting them turned a
+/// reasonable address into an unexplained refusal.
+#[must_use]
+fn is_loopback_authority(host: &str, bound: &str) -> bool {
+    if host == bound {
+        return true;
+    }
+    let Some(port) = bound.rsplit(':').next() else {
+        return false;
+    };
+    let Some((name, presented)) = host.rsplit_once(':') else {
+        return false;
+    };
+    presented == port && matches!(name, "localhost" | "127.0.0.1" | "[::1]")
 }
 
 async fn unknown_endpoint(request: Request) -> Response {
@@ -951,6 +971,19 @@ async fn shutdown_signal(ide: IdeManager) {
 
 #[cfg(test)]
 mod auth_tests {
+    #[test]
+    fn loopback_aliases_name_the_same_dashboard() {
+        let bound = "127.0.0.1:8080";
+        assert!(super::is_loopback_authority("127.0.0.1:8080", bound));
+        assert!(super::is_loopback_authority("localhost:8080", bound));
+        assert!(super::is_loopback_authority("[::1]:8080", bound));
+        // A different port is a different server, and a foreign name is never this one.
+        assert!(!super::is_loopback_authority("localhost:9090", bound));
+        assert!(!super::is_loopback_authority("evil.com:8080", bound));
+        assert!(!super::is_loopback_authority("evil.com", bound));
+        assert!(!super::is_loopback_authority("", bound));
+    }
+
     #[test]
     fn secret_comparison_rejects_a_matching_prefix() {
         assert!(super::secrets_match("Bearer abc", "Bearer abc"));
