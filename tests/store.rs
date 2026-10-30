@@ -856,6 +856,8 @@ fn dashboard_api_is_token_protected_and_cleans_up_its_session() -> Result<()> {
     let unauthorized = http_request(address, "GET", "/api/v1/snapshot", &[], "")?;
     assert_eq!(unauthorized.0, 401);
     let authorization = format!("Bearer {token}");
+    assert_unauthenticated_requests_stay_opaque(address)?;
+    assert_host_is_validated(address, &authorization)?;
     assert_ide_api_security(address, &authorization)?;
     let foreign = http_request(
         address,
@@ -956,6 +958,48 @@ fn assert_ide_api_security(address: &str, authorization: &str) -> Result<()> {
         r#"{"name":"blocked","provider":"claude","workstream":"runtime","task":"blocked","prompt":"blocked","scopes":["src"]}"#,
     )?;
     assert_eq!(launch_without_origin.0, 403);
+    // The same request from the dashboard's own origin reaches the handler, so the guard layer
+    // gates the body rather than replacing it: an unknown provider is the IDE manager talking.
+    let launch = http_request(
+        address,
+        "POST",
+        "/api/v1/ide/sessions",
+        &[
+            ("Authorization", authorization),
+            ("Origin", &format!("http://{address}")),
+        ],
+        r#"{"name":"probe","provider":"not-a-provider","workstream":"runtime","task":"probe","prompt":"probe","scopes":["src"]}"#,
+    )?;
+    assert_eq!(launch.0, 409, "{}", launch.2);
+    assert!(launch.2.contains("provider"), "{}", launch.2);
+    Ok(())
+}
+
+/// An unauthenticated caller has to learn nothing at all: no parser complaint that would describe
+/// the body, and no difference between a route that exists and one that never did.
+fn assert_unauthenticated_requests_stay_opaque(address: &str) -> Result<()> {
+    let malformed = http_request(address, "POST", "/api/v1/ide/sessions", &[], r#"{"name": "#)?;
+    assert_eq!(malformed.0, 401, "{}", malformed.2);
+    assert_eq!(malformed.2, r#"{"error":"authorization required"}"#);
+    let unknown = http_request(address, "GET", "/api/v1/not-a-route", &[], "")?;
+    assert_eq!(unknown.0, 401, "{}", unknown.2);
+    assert_eq!(unknown.2, malformed.2);
+    Ok(())
+}
+
+/// A rebound name must not reach a handler even when the caller holds the token.
+fn assert_host_is_validated(address: &str, authorization: &str) -> Result<()> {
+    let page = http_request_with_host(address, "evil.example", "GET", "/healthz", &[], "")?;
+    assert_eq!(page.0, 403, "{}", page.2);
+    let api = http_request_with_host(
+        address,
+        "evil.example",
+        "GET",
+        "/api/v1/snapshot",
+        &[("Authorization", authorization)],
+        "",
+    )?;
+    assert_eq!(api.0, 403, "{}", api.2);
     Ok(())
 }
 
@@ -966,11 +1010,22 @@ fn http_request(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Result<(u16, String, String)> {
+    http_request_with_host(address, address, method, path, headers, body)
+}
+
+fn http_request_with_host(
+    address: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<(u16, String, String)> {
     let mut stream = TcpStream::connect(address)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     )?;
     for (name, value) in headers {

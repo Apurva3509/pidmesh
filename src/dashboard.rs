@@ -3,16 +3,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::body::to_bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{
-    AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ORIGIN, REFERRER_POLICY,
-    X_CONTENT_TYPE_OPTIONS,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, ORIGIN,
+    REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{MethodRouter, any, delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,10 +30,12 @@ const DASHBOARD_JS: &str = include_str!("../dashboard/dashboard.js");
 const TERMINAL_CSS: &str = include_str!("../dashboard/vendor/terminal.css");
 const TERMINAL_JS: &str = include_str!("../dashboard/vendor/terminal.js");
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+const ORIGIN_REJECTED: &str = "request origin rejected";
 
 #[derive(Clone)]
 struct DashboardState {
     agent_id: Arc<str>,
+    host: Arc<str>,
     ide: IdeManager,
     origin: Arc<str>,
     store: MeshStore,
@@ -44,8 +47,9 @@ struct DashboardState {
 enum ApiError {
     BadRequest(String),
     Conflict(String),
-    Forbidden,
+    Forbidden(&'static str),
     Internal,
+    NotFound,
     Unauthorized,
 }
 
@@ -54,11 +58,12 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
-            Self::Forbidden => (StatusCode::FORBIDDEN, "request origin rejected".to_owned()),
+            Self::Forbidden(reason) => (StatusCode::FORBIDDEN, reason.to_owned()),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "dashboard operation failed".to_owned(),
             ),
+            Self::NotFound => (StatusCode::NOT_FOUND, "no such endpoint".to_owned()),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "authorization required".to_owned(),
@@ -169,6 +174,7 @@ pub async fn serve(store: MeshStore, workspace: PathBuf, port: u16) -> Result<()
     let ide = IdeManager::new(store.clone(), workspace.clone());
     let state = DashboardState {
         agent_id: Arc::from(agent_id.clone()),
+        host: Arc::from(address.to_string()),
         ide,
         origin: Arc::from(origin.clone()),
         store: store.clone(),
@@ -223,41 +229,167 @@ fn router(state: DashboardState) -> Router {
         .route("/terminal.css", get(terminal_styles))
         .route("/terminal.js", get(terminal_script))
         .route("/healthz", get(health))
-        .route("/api/v1/snapshot", get(snapshot))
-        .route("/api/v1/memories", get(recall).post(remember))
-        .route("/api/v1/messages", post(send))
-        .route("/api/v1/claims", post(claim))
-        .route("/api/v1/claims/{task}", delete(release))
+        .merge(api_router(&state))
+        .layer(DefaultBodyLimit::max(MAX_TEXT_BYTES))
+        .layer(middleware::from_fn_with_state(state.clone(), enforce_host))
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state)
+}
+
+/// Every API route carries its authorization as a layer rather than a call inside the handler.
+///
+/// A layer runs before axum deserializes anything, so an unauthenticated caller gets a bare 401
+/// instead of a parser error that would tell it the route exists and what shape its body takes.
+fn api_router(state: &DashboardState) -> Router<DashboardState> {
+    Router::new()
+        .route("/api/v1/snapshot", read(state, get(snapshot)))
+        .route("/api/v1/memories", read(state, get(recall).post(remember)))
+        .route("/api/v1/messages", read(state, post(send)))
+        .route("/api/v1/claims", read(state, post(claim)))
+        .route("/api/v1/claims/{task}", read(state, delete(release)))
         .route(
             "/api/v1/resources",
-            get(resources)
-                .post(reserve_resources)
-                .delete(release_resources),
+            read(
+                state,
+                get(resources)
+                    .post(reserve_resources)
+                    .delete(release_resources),
+            ),
         )
-        .route("/api/v1/ide/providers", get(ide_providers))
-        .route("/api/v1/ide/sessions", get(ide_sessions).post(ide_launch))
-        .route("/api/v1/ide/sessions/{id}", delete(ide_stop))
-        .route("/api/v1/ide/sessions/{id}/output", get(ide_output))
-        .route("/api/v1/ide/sessions/{id}/input", post(ide_input))
-        .route("/api/v1/ide/sessions/{id}/review", get(ide_review))
-        .route("/api/v1/ide/sessions/{id}/approve", post(ide_approve))
-        .route("/api/v1/ide/sessions/{id}/reject", post(ide_reject))
+        .route("/api/v1/ide/providers", read(state, get(ide_providers)))
+        .route(
+            "/api/v1/ide/sessions",
+            read(state, get(ide_sessions)).merge(control(state, post(ide_launch))),
+        )
+        .route(
+            "/api/v1/ide/sessions/{id}",
+            control(state, delete(ide_stop)),
+        )
+        .route(
+            "/api/v1/ide/sessions/{id}/output",
+            read(state, get(ide_output)),
+        )
+        .route(
+            "/api/v1/ide/sessions/{id}/input",
+            control(state, post(ide_input)),
+        )
+        .route(
+            "/api/v1/ide/sessions/{id}/review",
+            read(state, get(ide_review)),
+        )
+        .route(
+            "/api/v1/ide/sessions/{id}/approve",
+            control(state, post(ide_approve)),
+        )
+        .route(
+            "/api/v1/ide/sessions/{id}/reject",
+            control(state, post(ide_reject)),
+        )
         .route(
             "/api/v1/ide/sessions/{id}/attach-ticket",
-            post(ide_attach_ticket),
+            control(state, post(ide_attach_ticket)),
         )
-        .route("/api/v1/ide/sessions/{id}/terminal", get(ide_terminal))
-        .route("/api/v1/ide/files", get(ide_files))
-        .route("/api/v1/ide/file", get(ide_file))
+        .route(
+            "/api/v1/ide/sessions/{id}/terminal",
+            ticketed(state, get(ide_terminal)),
+        )
+        .route("/api/v1/ide/files", read(state, get(ide_files)))
+        .route("/api/v1/ide/file", read(state, get(ide_file)))
         // Reporting is a read and reclaiming is a delete, so the destructive half cannot be
         // reached by the same request the dashboard makes on every refresh.
         .route(
             "/api/v1/ide/worktrees",
-            get(ide_worktrees).delete(ide_reclaim),
+            read(state, get(ide_worktrees)).merge(control(state, delete(ide_reclaim))),
         )
-        .layer(DefaultBodyLimit::max(MAX_TEXT_BYTES))
-        .layer(middleware::from_fn(security_headers))
-        .with_state(state)
+        // An unknown API path answers exactly like a known one until the caller proves itself,
+        // so probing cannot map the surface.
+        .route("/api/{*rest}", read(state, any(unknown_endpoint)))
+}
+
+/// The token tier: what anyone holding the session token may ask for, with the origin checked
+/// only when the caller sends one.
+fn read(
+    state: &DashboardState,
+    routes: MethodRouter<DashboardState>,
+) -> MethodRouter<DashboardState> {
+    routes.layer(middleware::from_fn_with_state(state.clone(), guard_read))
+}
+
+/// Routes that start, stop, or write to an agent, and so demand the origin as well as the token.
+fn control(
+    state: &DashboardState,
+    routes: MethodRouter<DashboardState>,
+) -> MethodRouter<DashboardState> {
+    routes.layer(middleware::from_fn_with_state(state.clone(), guard_control))
+}
+
+/// The terminal upgrade, which a browser cannot give an `Authorization` header: it presents a
+/// single-use, session-bound ticket minted by a control route instead.
+fn ticketed(
+    state: &DashboardState,
+    routes: MethodRouter<DashboardState>,
+) -> MethodRouter<DashboardState> {
+    routes.layer(middleware::from_fn_with_state(state.clone(), guard_origin))
+}
+
+async fn guard_read(State(state): State<DashboardState>, request: Request, next: Next) -> Response {
+    guard(authorize(&state, request.headers()), request, next).await
+}
+
+async fn guard_control(
+    State(state): State<DashboardState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    guard(authorize_control(&state, request.headers()), request, next).await
+}
+
+async fn guard_origin(
+    State(state): State<DashboardState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    guard(authorize_origin(&state, request.headers()), request, next).await
+}
+
+async fn guard(verdict: Result<(), ApiError>, request: Request, next: Next) -> Response {
+    match verdict {
+        Ok(()) => next.run(request).await,
+        Err(error) => reject(request, error).await,
+    }
+}
+
+/// Answer a refused request only once its body has been read and dropped.
+///
+/// Closing the socket while the client is still writing costs it the response to a TCP reset, so
+/// the bytes are drained — never deserialized — under the same budget a handler would have had.
+async fn reject(request: Request, error: ApiError) -> Response {
+    let _ = to_bytes(request.into_body(), MAX_TEXT_BYTES).await;
+    error.into_response()
+}
+
+/// Reject a request whose `Host` is not the address the dashboard actually bound.
+///
+/// The origin check and the token already defeat DNS rebinding; refusing a foreign name outright
+/// means a rebound page never reaches a handler at all, and costs one string compare.
+async fn enforce_host(
+    State(state): State<DashboardState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if host != state.host.as_ref() {
+        return reject(request, ApiError::Forbidden("request host rejected")).await;
+    }
+    next.run(request).await
+}
+
+async fn unknown_endpoint(request: Request) -> Response {
+    reject(request, ApiError::NotFound).await
 }
 
 async fn index() -> Html<&'static str> {
@@ -296,10 +428,8 @@ async fn health() -> Json<Value> {
 
 async fn snapshot(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     let limit = query.limit.unwrap_or(100);
     if !(1..=500).contains(&limit) {
         return Err(ApiError::BadRequest(
@@ -315,10 +445,8 @@ async fn snapshot(
 
 async fn recall(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Query(query): Query<RecallQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     validate_text("query", &query.q)?;
     let limit = query.limit.unwrap_or(25);
     if !(1..=100).contains(&limit) {
@@ -334,10 +462,8 @@ async fn recall(
 
 async fn remember(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Json(request): Json<RememberRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     validate_text("memory", &request.text)?;
     let kind = request.kind.unwrap_or_else(|| "note".to_owned());
     validate_label("kind", &kind)?;
@@ -362,10 +488,8 @@ async fn remember(
 
 async fn send(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Json(request): Json<SendRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     validate_text("message", &request.text)?;
     let recipient = request.recipient.unwrap_or_else(|| "*".to_owned());
     validate_label("recipient", &recipient)?;
@@ -385,10 +509,8 @@ async fn send(
 
 async fn claim(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Json(request): Json<ClaimRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     validate_label("task", &request.task)?;
     let lease_seconds = request.lease_seconds.unwrap_or(300);
     if !(1..=86_400).contains(&lease_seconds) {
@@ -412,10 +534,8 @@ async fn claim(
 
 async fn release(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(task_key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     validate_label("task", &task_key)?;
     let store = state.store.clone();
     let agent_id = Arc::clone(&state.agent_id);
@@ -423,11 +543,7 @@ async fn release(
     Ok(Json(json!({"released": released})))
 }
 
-async fn resources(
-    State(state): State<DashboardState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+async fn resources(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
     let store = state.store.clone();
     let agent_id = Arc::clone(&state.agent_id);
     let value = blocking(move || store.resources(&agent_id)).await?;
@@ -436,10 +552,8 @@ async fn resources(
 
 async fn reserve_resources(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Json(request): Json<ResourceRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     validate_resources(&request.resources)?;
     if let Some(task) = request.task.as_deref() {
         validate_label("task", task)?;
@@ -470,10 +584,8 @@ async fn reserve_resources(
 
 async fn release_resources(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Json(request): Json<ResourceRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     validate_resources(&request.resources)?;
     let store = state.store.clone();
     let agent_id = Arc::clone(&state.agent_id);
@@ -481,71 +593,49 @@ async fn release_resources(
     Ok(Json(json!({"released": released})))
 }
 
-async fn ide_providers(
-    State(state): State<DashboardState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+async fn ide_providers(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.providers()).await?))
 }
 
-async fn ide_sessions(
-    State(state): State<DashboardState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+async fn ide_sessions(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.sessions()).await?))
 }
 
-async fn ide_worktrees(
-    State(state): State<DashboardState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
+async fn ide_worktrees(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.worktrees()).await?))
 }
 
 /// Reclaiming is gated on the control token rather than the read token: it is the only IDE
 /// operation that removes something from disk, so it sits beside launch, stop, and approve.
-async fn ide_reclaim(
-    State(state): State<DashboardState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    authorize_control(&state, &headers)?;
+async fn ide_reclaim(State(state): State<DashboardState>) -> Result<Json<Value>, ApiError> {
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.reclaim()).await?))
 }
 
 async fn ide_launch(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Json(request): Json<LaunchRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_control(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.launch(request)).await?))
 }
 
 async fn ide_stop(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_control(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.stop(&session_id)).await?))
 }
 
 async fn ide_output(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
     Query(query): Query<OutputQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(
         ide_blocking(move || ide.output(&session_id, query.after.unwrap_or(0))).await?,
@@ -554,11 +644,9 @@ async fn ide_output(
 
 async fn ide_input(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(request): Json<TerminalInputRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_control(&state, &headers)?;
     let ide = state.ide.clone();
     ide_blocking(move || ide.input(&session_id, &request.text)).await?;
     Ok(Json(json!({"written": true})))
@@ -566,21 +654,17 @@ async fn ide_input(
 
 async fn ide_review(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.review(&session_id)).await?))
 }
 
 async fn ide_approve(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(request): Json<ApproveRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_control(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(
         ide_blocking(move || ide.approve(&session_id, &request)).await?,
@@ -589,20 +673,16 @@ async fn ide_approve(
 
 async fn ide_reject(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_control(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.reject(&session_id)).await?))
 }
 
 async fn ide_attach_ticket(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize_control(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(
         ide_blocking(move || ide.issue_ticket(&session_id)).await?,
@@ -611,12 +691,10 @@ async fn ide_attach_ticket(
 
 async fn ide_terminal(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Path(session_id): Path<String>,
     Query(query): Query<TicketQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    authorize_origin(&state, &headers)?;
     let ide = state.ide.clone();
     let attachment = ide_blocking(move || ide.attach(&session_id, &query.ticket)).await?;
     Ok(upgrade
@@ -626,10 +704,8 @@ async fn ide_terminal(
 
 async fn ide_files(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(
         ide_blocking(move || {
@@ -644,10 +720,8 @@ async fn ide_files(
 
 async fn ide_file(
     State(state): State<DashboardState>,
-    headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&state, &headers)?;
     let path = query
         .path
         .context("file path is required")
@@ -694,7 +768,7 @@ async fn terminal_socket(
                 let Some(Ok(message)) = incoming else { break; };
                 match message {
                     Message::Binary(bytes) => {
-                        if bytes.len() > 64 * 1024 || ide.input(
+                        if bytes.len() > MAX_TEXT_BYTES || ide.input(
                             &session_id,
                             &String::from_utf8_lossy(&bytes),
                         ).is_err() {
@@ -767,7 +841,7 @@ fn authorize(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError
         .and_then(|value| value.to_str().ok())
         .is_some_and(|origin| origin != state.origin.as_ref())
     {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::Forbidden(ORIGIN_REJECTED));
     }
     Ok(())
 }
@@ -779,7 +853,7 @@ fn authorize_control(state: &DashboardState, headers: &HeaderMap) -> Result<(), 
 
 fn authorize_origin(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError> {
     if headers.get(ORIGIN).and_then(|value| value.to_str().ok()) != Some(state.origin.as_ref()) {
-        return Err(ApiError::Forbidden);
+        return Err(ApiError::Forbidden(ORIGIN_REJECTED));
     }
     Ok(())
 }
@@ -838,7 +912,7 @@ where
         .map_err(|error| ApiError::Conflict(format!("{error:#}")))
 }
 
-async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
+async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
