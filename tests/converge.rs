@@ -1885,3 +1885,85 @@ fn a_checkout_that_was_never_synced_cannot_merge() -> Result<()> {
     assert_eq!(observed["mergeable"], true, "{observed}");
     Ok(())
 }
+
+/// The event ledger is the last thing on a long-lived machine that grew without bound.
+///
+/// Consumers checkpoint on a sequence and long-poll, so they only ever read the recent tail.
+/// Keeping an unbounded history serves nobody, and nothing else prunes it.
+#[test]
+fn garbage_collection_bounds_the_event_ledger() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+
+    // Drive real changes so the ledger genuinely grows; idle sweeps are deliberately silent.
+    for round in 0..60 {
+        std::fs::write(
+            alpha_tree.join("src/shared.rs"),
+            format!("fn shared() {{ /* {round} */ }}\n"),
+        )?;
+        fleet.sync(&alpha, &alpha_tree)?;
+    }
+    let before = fleet.store.events(&alpha, 0, 100_000)?;
+    let before = before.as_array().context("events")?.len();
+    assert!(before > 0, "the ledger must actually have grown");
+
+    let swept = fleet.store.collect_stale(Duration::from_secs(3600))?;
+    assert!(swept["trimmed_events"].is_number(), "{swept}");
+
+    // Under the retention ceiling nothing is discarded: pruning must never cost a live consumer
+    // the tail it is about to read.
+    let after = fleet.store.events(&alpha, 0, 100_000)?;
+    assert_eq!(
+        after.as_array().context("events")?.len(),
+        before,
+        "a small ledger is left alone: {swept}"
+    );
+
+    // Past the ceiling it prunes, keeps the newest, and does so without re-ranking the ledger
+    // per row — the first version of this was quadratic and took minutes.
+    fleet.store.seed_events_for_test(&alpha, 25_000)?;
+    let started = std::time::Instant::now();
+    let swept = fleet.store.collect_stale(Duration::from_secs(3600))?;
+    let elapsed = started.elapsed();
+    assert!(
+        swept["trimmed_events"].as_u64().unwrap_or(0) > 0,
+        "an over-sized ledger is trimmed: {swept}"
+    );
+    let kept = fleet.store.events(&alpha, 0, 100_000)?;
+    let kept = kept.as_array().context("events")?.len();
+    assert!(kept <= 20_000, "the ceiling is respected, kept {kept}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "pruning must not be quadratic, took {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// Regression: a recycled pid must not keep a dead session alive forever.
+///
+/// Liveness was confirmed by pid alone, and the operating system reuses them. An unrelated
+/// process inheriting a dead agent's pid kept that agent `running` indefinitely, holding its
+/// claims and blocking every peer that shared a path with it.
+#[test]
+fn a_long_silent_session_dies_even_if_its_pid_was_reused() -> Result<()> {
+    let fleet = Fleet::new()?;
+    // pid 1 always exists, which is exactly the situation a recycled pid creates.
+    let registration =
+        fleet
+            .store
+            .register_agent("ghost", 1, Some(&fleet.repository), "test", &[], None)?;
+    let ghost = registration["agent_id"]
+        .as_str()
+        .context("agent id")?
+        .to_owned();
+
+    // A recent heartbeat with a live pid is left alone.
+    let fresh = fleet.store.collect_stale(Duration::from_secs(0))?;
+    assert_eq!(fresh["dead_agents"], 0, "a live session is not reaped");
+
+    // Age the heartbeat past the abandonment ceiling.
+    fleet.store.backdate_heartbeat_for_test(&ghost, 7_200_000)?;
+    let reaped = fleet.store.collect_stale(Duration::from_secs(0))?;
+    assert_eq!(reaped["dead_agents"], 1, "{reaped}");
+    Ok(())
+}
