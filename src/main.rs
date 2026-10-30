@@ -914,6 +914,7 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     let mut published = 0usize;
     let mut skipped = Vec::new();
     let mut witness = None;
+    let mut batch: Vec<(String, WorktreeScan)> = Vec::new();
     for (index, result) in scanned {
         let Some((path, agents)) = checkouts.get(index) else {
             continue;
@@ -930,11 +931,14 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
             }
         };
         for agent in *agents {
-            store.publish_footprint(&agent.agent_id, &scan)?;
             witness.get_or_insert_with(|| agent.agent_id.clone());
+            batch.push((agent.agent_id.clone(), scan.clone()));
             published += 1;
         }
     }
+    // One transaction for the whole sweep: publishing agent by agent recomputes the collision
+    // set twice per agent, which is most of a tick once a fleet gets large.
+    store.publish_footprints(&batch)?;
     let collisions = match witness {
         Some(agent_id) => store.collisions(&agent_id)?,
         None => json!({"collisions": [], "collision_count": 0}),

@@ -1481,3 +1481,65 @@ fn a_copy_of_a_declaration_is_not_a_reference_to_it() -> Result<()> {
     );
     Ok(())
 }
+
+/// A sweep is one logical observation, so it publishes in one transaction.
+///
+/// Publishing agent by agent recomputes the workspace collision set twice per agent, which is
+/// most of a tick once a fleet is large. Batching must not change what peers observe: the same
+/// collisions, and the same transition events they would have been woken by.
+#[test]
+fn a_batched_sweep_reports_what_serial_publishing_would() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+
+    let batch = vec![
+        (alpha.clone(), scan_worktree(&alpha_tree, Some("main"))?),
+        (bravo.clone(), scan_worktree(&bravo_tree, Some("main"))?),
+    ];
+    let report = fleet.store.publish_footprints(&batch)?;
+    assert_eq!(report["published"], 2);
+    assert_eq!(report["collision_count"], 1, "{report}");
+
+    let collisions = fleet.collisions(&alpha)?;
+    let shared = at(&collisions, "src/shared.rs").context("expected a collision")?;
+    assert_eq!(shared["severity"], "divergent");
+
+    // The overlap must have been announced exactly once, to a workspace-scoped listener.
+    let detected = fleet.store.events(&bravo, 0, 500)?;
+    let detected = detected
+        .as_array()
+        .context("events")?
+        .iter()
+        .filter(|event| event["event_type"] == "collision.detected")
+        .count();
+    assert_eq!(detected, 1, "one transition, one announcement");
+
+    // Re-publishing unchanged state must stay silent, exactly as the serial path does.
+    fleet.store.publish_footprints(&batch)?;
+    let again = fleet.store.events(&bravo, 0, 500)?;
+    let again = again
+        .as_array()
+        .context("events")?
+        .iter()
+        .filter(|event| event["event_type"] == "collision.detected")
+        .count();
+    assert_eq!(again, detected, "steady state must not re-announce");
+    Ok(())
+}
+
+#[test]
+fn an_empty_sweep_is_not_an_error() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let report = fleet.store.publish_footprints(&[])?;
+    assert_eq!(report["published"], 0);
+    Ok(())
+}
