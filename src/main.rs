@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use pidmesh::converge::{WorktreeScan, integration_head, scan_worktree};
+use pidmesh::render::{self, Shape};
 use pidmesh::store::{
     AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, default_database_path, diagnose, workspace_root,
 };
@@ -24,6 +25,10 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(name = "pidmesh", version, about)]
 struct Cli {
+    /// Emit JSON even when stdout is a terminal.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[arg(long, global = true, env = "PIDMESH_DB")]
     db: Option<PathBuf>,
     #[command(subcommand)]
@@ -254,6 +259,8 @@ enum Commands {
     },
 }
 
+static FORCE_JSON: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(code),
@@ -267,6 +274,7 @@ fn main() -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn run() -> Result<u8> {
     let cli = Cli::parse();
+    FORCE_JSON.store(cli.json, Ordering::Relaxed);
     let database = match cli.db {
         Some(path) => path,
         None => default_database_path()?,
@@ -390,10 +398,16 @@ fn run() -> Result<u8> {
                 None => std::env::current_dir()?,
             };
             let scan = scan_worktree(&directory, base.as_deref())?;
-            emit(&store.publish_footprint(&agent_id(agent.as_deref())?, &scan)?)?;
+            present(
+                Shape::Sync,
+                &store.publish_footprint(&agent_id(agent.as_deref())?, &scan)?,
+            )?;
         }
         Commands::Collisions { agent } => {
-            emit(&store.collisions(&agent_id(agent.as_deref())?)?)?;
+            present(
+                Shape::Collisions,
+                &store.collisions(&agent_id(agent.as_deref())?)?,
+            )?;
         }
         Commands::Mergeable {
             agent,
@@ -407,7 +421,7 @@ fn run() -> Result<u8> {
             let (_, head) = integration_head(&directory, base.as_deref())?;
             let readiness = store.merge_readiness(&agent_id(agent.as_deref())?, &head)?;
             let mergeable = readiness["mergeable"] == true;
-            emit(&readiness)?;
+            present(Shape::Mergeable, &readiness)?;
             if !mergeable {
                 return Ok(1);
             }
@@ -439,7 +453,7 @@ fn run() -> Result<u8> {
         Commands::Doctor { workspace } => {
             let report = diagnose(&database, workspace.as_deref())?;
             let healthy = report["healthy"] == true;
-            emit(&report)?;
+            present(Shape::Doctor, &report)?;
             if !healthy {
                 return Ok(1);
             }
@@ -842,7 +856,7 @@ fn watch(
     ctrlc::set_handler(move || signal_running.store(false, Ordering::Relaxed))
         .context("failed to install interrupt handler")?;
     loop {
-        emit(&watch_pass(store, workspace, base)?)?;
+        present(Shape::Watch, &watch_pass(store, workspace, base)?)?;
         if once {
             break;
         }
@@ -956,4 +970,21 @@ fn bail_duration<T>() -> Result<T> {
 fn emit(value: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+/// Print for whoever is reading: prose at a terminal, JSON everywhere else.
+///
+/// The JSON contract predates this and agents depend on it, so a pipe or a redirect always gets
+/// JSON and only a human at a prompt sees the rendered form.
+fn present(shape: Shape, value: &Value) -> Result<()> {
+    if FORCE_JSON.load(Ordering::Relaxed) || !render::is_interactive() {
+        return emit(value);
+    }
+    match render::render(shape, value) {
+        Some(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        None => emit(value),
+    }
 }
