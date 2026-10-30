@@ -23,6 +23,33 @@ const MAX_HASHED_BYTES: u64 = 64 * 1024 * 1024;
 /// Cap on identifiers recorded per checkout, so a generated file cannot flood the mesh.
 const MAX_REFERENCES: usize = 5_000;
 
+/// Largest file read when harvesting identifiers.
+///
+/// Hashing already refuses oversized files; this read had no bound at all, so a sweep scanning a
+/// checkout holding a large generated file spiked memory by roughly the file's size, every tick.
+const MAX_SCANNED_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Extensions whose contents are treated as code.
+///
+/// Export detection matches bare `class`, `type`, `def` and `func`, which are ordinary English
+/// words. Run over a changelog or a design note they manufacture exports nobody declared, and a
+/// peer whose only change was a comment mentioning them gets blocked. A blocker that fires on
+/// prose teaches people to ignore blockers, which costs more than the breaks it would have caught.
+const SOURCE_EXTENSIONS: [&str; 18] = [
+    "c", "cc", "cjs", "cpp", "cs", "go", "h", "hpp", "java", "js", "jsx", "kt", "mjs", "py", "rb",
+    "rs", "ts", "tsx",
+];
+
+/// Whether a path's contents should be read as code.
+fn is_source(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            SOURCE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+}
+
 /// Words that look like identifiers but never name an export worth tracking.
 const REFERENCE_STOPLIST: [&str; 24] = [
     "and", "ary", "class", "const", "def", "else", "enum", "export", "false", "fn", "for", "from",
@@ -393,6 +420,7 @@ fn read_diff(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
         } else if let Some(rest) = line.strip_prefix('-')
             && !rest.starts_with("--")
             && let Some(path) = current.as_ref()
+            && is_source(path)
             && let Some(symbol) = exported_name(rest)
         {
             removed.push((symbol, path.clone()));
@@ -496,8 +524,19 @@ fn exported_name(line: &str) -> Option<String> {
 /// copies as usages reports every edited file as breaking every other one.
 fn referenced_symbols(checkout: &Path, paths: &[String]) -> (Vec<String>, bool) {
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut truncated = false;
     for path in paths {
-        let Ok(content) = fs::read_to_string(checkout.join(path)) else {
+        if !is_source(path) {
+            continue;
+        }
+        let absolute = checkout.join(path);
+        if fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.len() > MAX_SCANNED_BYTES) {
+            // Too large to hold in memory every tick. Treated like any other unknown: it
+            // contributes no references, and the truncation flag keeps the verdict conservative.
+            truncated = true;
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&absolute) else {
             continue;
         };
         let declared: BTreeSet<String> = content.lines().filter_map(exported_name).collect();
@@ -521,7 +560,7 @@ fn referenced_symbols(checkout: &Path, paths: &[String]) -> (Vec<String>, bool) 
             }
         }
     }
-    (seen.into_iter().collect(), false)
+    (seen.into_iter().collect(), truncated)
 }
 
 fn take_word(word: &mut String, seen: &mut BTreeSet<String>) {

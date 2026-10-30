@@ -857,6 +857,17 @@ impl MeshStore {
 
             let mut blockers = Vec::new();
 
+            // No footprint means nothing has been observed about this checkout, which is not the
+            // same as having observed that it is clear. A script doing `mergeable && git merge`
+            // would otherwise merge blind.
+            if base_commit.is_none() {
+                blockers.push(json!({
+                    "code": "never_synced",
+                    "detail": "this checkout has not been observed yet; run pidmesh sync or let a \
+                               watcher sweep before merging"
+                }));
+            }
+
             // A worktree cut from a commit the integration branch has moved past may still merge
             // cleanly and be wrong, because it was written against code that no longer exists.
             if let Some(base) = base_commit.as_deref()

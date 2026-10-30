@@ -1826,3 +1826,62 @@ fn the_dashboard_snapshot_carries_workspace_convergence() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression: prose must not manufacture blockers.
+///
+/// `class`, `type`, `def` and `func` are ordinary English words, and export detection matched
+/// them in any file. Trimming a changelog whose lines began with them, against a peer whose only
+/// change was a comment mentioning them, produced real blockers over work that was fine. A
+/// blocker that fires on prose teaches people to ignore blockers.
+#[test]
+fn prose_does_not_manufacture_blockers() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("CHANGELOG.md"),
+        "class Registry was added\ntype Widget was renamed\ndef process was removed\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "notes"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    // alpha trims the changelog; bravo only writes a comment naming those words.
+    std::fs::write(alpha_tree.join("CHANGELOG.md"), "nothing to report\n")?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "// Registry, Widget and process are described in the changelog.\nfn shared() {}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(
+        report["mergeable"], true,
+        "a changelog edit is not an API change: {report}"
+    );
+    Ok(())
+}
+
+/// Regression: an unobserved checkout is not a clear one.
+///
+/// With no footprint there is no base commit, so no staleness could be detected and `mergeable`
+/// returned true with exit code 0 — a script doing `mergeable && git merge` would merge blind.
+#[test]
+fn a_checkout_that_was_never_synced_cannot_merge() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    // Deliberately no sync.
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
+    assert!(blocker_codes(&report).contains(&"never_synced".to_owned()));
+
+    // Observing it clears the blocker.
+    fleet.sync(&alpha, &alpha_tree)?;
+    let observed = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(observed["mergeable"], true, "{observed}");
+    Ok(())
+}
