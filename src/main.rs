@@ -296,7 +296,7 @@ fn run() -> Result<u8> {
             workspace,
         } => emit(&store.register_agent(
             &name,
-            pid.unwrap_or_else(std::process::id),
+            pid.unwrap_or_else(calling_pid),
             workspace.as_deref(),
             &provider,
             &capabilities,
@@ -878,8 +878,10 @@ fn watch(
 /// One observation sweep over every distinct live checkout.
 fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -> Result<Value> {
     // Several sessions can share one checkout, so scan each checkout once and reuse the result.
+    let live = store.live_checkouts(workspace)?;
+    let stale = live.stale;
     let mut grouped: BTreeMap<PathBuf, Vec<AgentCheckout>> = BTreeMap::new();
-    for checkout in store.live_checkouts(workspace)? {
+    for checkout in live.checkouts {
         grouped
             .entry(checkout.checkout_path.clone())
             .or_default()
@@ -942,6 +944,11 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     // One transaction for the whole sweep: publishing agent by agent recomputes the collision
     // set twice per agent, which is most of a tick once a fleet gets large.
     store.publish_footprints(&batch)?;
+
+    // Nothing else reaps dead sessions, and a crashed agent holds its claims, its reservations
+    // and its share of every contested path until something does — which blocks its peers from
+    // merging indefinitely. A watcher is the one process reliably running, so it reaps.
+    let reaped = store.collect_stale(Duration::from_secs(STALE_AFTER_SECONDS))?;
     let collisions = match witness {
         Some(agent_id) => store.collisions(&agent_id)?,
         None => json!({"collisions": [], "collision_count": 0}),
@@ -949,10 +956,29 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     Ok(json!({
         "checkouts": grouped.len(),
         "published": published,
+        "stale_agents": stale,
+        "reaped": reaped,
         "skipped": skipped,
         "collision_count": collisions["collision_count"],
         "collisions": collisions["collisions"]
     }))
+}
+
+/// How long a session may be quiet before a sweep checks whether its process is still alive.
+///
+/// Liveness is confirmed by PID before anything is marked dead, so this only bounds how long a
+/// genuinely crashed agent keeps blocking its peers.
+const STALE_AFTER_SECONDS: u64 = 30;
+
+/// The process to treat as the agent when `--pid` is not given.
+///
+/// This CLI exits the moment it registers, so recording its own pid marks the agent dead
+/// immediately: `watch` skips checkouts whose process is gone, and a fleet registered with a plain
+/// `pidmesh join` was reported as an empty, healthy workspace. The parent is the shell or agent
+/// that will actually keep working in the checkout.
+fn calling_pid() -> u32 {
+    let parent = nix::unistd::getppid();
+    u32::try_from(parent.as_raw()).unwrap_or_else(|_| std::process::id())
 }
 
 fn agent_id(explicit: Option<&str>) -> Result<String> {

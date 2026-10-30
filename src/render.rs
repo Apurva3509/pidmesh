@@ -228,10 +228,34 @@ fn watch(value: &Value, palette: &Palette) -> String {
             palette.warn, palette.reset
         );
     }
+    let stale = value["stale_agents"].as_u64().unwrap_or(0);
     if checkouts == 0 {
+        // An empty sweep has two very different causes, and reporting a clean workspace for the
+        // second one is the failure: nobody joined, or everybody who joined is already gone.
+        if stale > 0 {
+            return format!(
+                "{head}\n{}{} registered, but no live process.{}\n  {}They exited, or joined without a surviving --pid. Re-join from the shell that keeps working in each checkout.{}",
+                palette.warn,
+                plural(
+                    usize::try_from(stale).unwrap_or(0),
+                    "agent is",
+                    "agents are"
+                ),
+                palette.reset,
+                palette.dim,
+                palette.reset
+            );
+        }
         return format!(
             "{head}\n{}No agents have joined this workspace yet.{}\n  {}Run `pidmesh join --name <agent>` from inside each checkout, then sweep again.{}",
             palette.warn, palette.reset, palette.dim, palette.reset
+        );
+    }
+    if stale > 0 {
+        let _ = write!(
+            head,
+            " {}({stale} registered without a live process){}",
+            palette.warn, palette.reset
         );
     }
     let body = collisions(value, palette);
@@ -397,6 +421,19 @@ mod tests {
         );
         assert!(rendered.contains("No agents have joined"), "{rendered}");
         assert!(rendered.contains("pidmesh join"), "{rendered}");
+    }
+
+    #[test]
+    fn a_fleet_whose_processes_died_is_not_reported_as_healthy() {
+        let rendered = watch(
+            &json!({"checkouts": 0, "published": 0, "stale_agents": 3, "skipped": [], "collisions": []}),
+            &plain(),
+        );
+        assert!(rendered.contains("no live process"), "{rendered}");
+        assert!(
+            !rendered.contains("No contested paths"),
+            "a dead fleet must not read as a clean one: {rendered}"
+        );
     }
 
     #[test]

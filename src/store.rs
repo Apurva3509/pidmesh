@@ -957,7 +957,7 @@ impl MeshStore {
     ///
     /// A supervisor uses this to observe a fleet that never calls `sync` itself: every checkout is
     /// already known from registration, so no agent cooperation is required.
-    pub fn live_checkouts(&self, root: Option<&Path>) -> Result<Vec<AgentCheckout>> {
+    pub fn live_checkouts(&self, root: Option<&Path>) -> Result<LiveCheckouts> {
         self.read(|connection| {
             let root = workspace_root(root)?;
             let workspace_id = connection
@@ -966,7 +966,7 @@ impl MeshStore {
                 })
                 .optional()?;
             let Some(workspace_id) = workspace_id else {
-                return Ok(Vec::new());
+                return Ok(LiveCheckouts::default());
             };
             let mut statement = connection.prepare(
                 "SELECT id, name, pid, checkout_path FROM agents
@@ -986,12 +986,55 @@ impl MeshStore {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             // A session marked running whose PID is gone should not have its checkout scanned.
-            Ok(rows
+            // The count is returned rather than discarded: a fleet that registered without a
+            // surviving process would otherwise sweep to an empty, healthy-looking workspace.
+            let (live, dead): (Vec<_>, Vec<_>) = rows
                 .into_iter()
-                .filter(|(_, pid)| process_is_alive(*pid))
-                .map(|(checkout, _)| checkout)
-                .collect())
+                .partition(|(_, pid)| process_is_alive(*pid));
+            Ok(LiveCheckouts {
+                checkouts: live.into_iter().map(|(checkout, _)| checkout).collect(),
+                stale: dead.len(),
+            })
         })
+    }
+
+    /// Whether this scan says anything the stored footprint does not already say.
+    ///
+    /// A watcher re-scans on an interval, and most ticks observe nothing new. Writing and
+    /// announcing regardless cost a row per agent per tick in the event log, which is how an
+    /// idle machine accumulated gigabytes, and it rewrote rows nobody had changed.
+    fn footprint_is_current(
+        transaction: &Transaction<'_>,
+        workspace_id: &str,
+        agent_id: &str,
+        scan: &WorktreeScan,
+    ) -> Result<bool> {
+        let mut statement = transaction.prepare(
+            "SELECT path, change_kind, digest, ranges, base_commit FROM footprints
+             WHERE workspace_id = ? AND agent_id = ? ORDER BY path",
+        )?;
+        let stored = statement
+            .query_map(params![workspace_id, agent_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if stored.len() != scan.entries.len() {
+            return Ok(false);
+        }
+        // Scan entries arrive sorted by path, matching the query's ordering.
+        Ok(stored.iter().zip(&scan.entries).all(|(row, entry)| {
+            row.0 == entry.path
+                && row.1 == entry.change_kind.as_str()
+                && row.2 == entry.digest
+                && row.3 == entry.ranges
+                && row.4.as_ref() == Some(&scan.base_commit)
+        }))
     }
 
     /// Replace one agent's footprint and symbol rows inside an open transaction.
@@ -1045,6 +1088,16 @@ impl MeshStore {
                 params![workspace_id, agent_id, symbol],
             )?;
         }
+        if scan.symbols.truncated {
+            // The reference set is incomplete, so it can rule a break in but never out. One
+            // sentinel row makes this checkout match every withdrawn export.
+            transaction.execute(
+                "INSERT OR IGNORE INTO symbol_footprints(
+                    workspace_id, agent_id, kind, symbol, path
+                 ) VALUES (?, ?, 'reference_truncated', '*', NULL)",
+                params![workspace_id, agent_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -1064,6 +1117,7 @@ impl MeshStore {
             let first = Self::agent_row(transaction, &batch[0].0)?;
             let workspace_id = first.workspace_id;
             let before = collision_signatures(transaction, &workspace_id)?;
+            let mut moved: Vec<&String> = Vec::new();
             for (agent_id, scan) in batch {
                 let agent = Self::agent_row(transaction, agent_id)?;
                 // A sweep is scoped to one workspace; anything else is a caller error rather
@@ -1072,7 +1126,11 @@ impl MeshStore {
                     agent.workspace_id == workspace_id,
                     "batch spans more than one workspace"
                 );
+                if Self::footprint_is_current(transaction, &workspace_id, agent_id, scan)? {
+                    continue;
+                }
                 Self::write_footprint_rows(transaction, &workspace_id, agent_id, scan, now)?;
+                moved.push(agent_id);
             }
             let contested = workspace_collisions(transaction, &workspace_id)?;
             let after = signatures_of(&contested);
@@ -1100,7 +1158,7 @@ impl MeshStore {
                     )?;
                 }
             }
-            for (agent_id, scan) in batch {
+            for (agent_id, scan) in batch.iter().filter(|(id, _)| moved.contains(&id)) {
                 Self::event(
                     transaction,
                     &workspace_id,
@@ -1115,7 +1173,7 @@ impl MeshStore {
                 )?;
             }
             Ok(json!({
-                "published": batch.len(),
+                "published": moved.len(),
                 "collisions": collision_report(&contested, ""),
                 "collision_count": contested.len()
             }))
@@ -1131,7 +1189,11 @@ impl MeshStore {
         self.write(|transaction| {
             let agent = Self::agent_row(transaction, agent_id)?;
             let before = collision_signatures(transaction, &agent.workspace_id)?;
-            Self::write_footprint_rows(transaction, &agent.workspace_id, agent_id, scan, now)?;
+            let unchanged =
+                Self::footprint_is_current(transaction, &agent.workspace_id, agent_id, scan)?;
+            if !unchanged {
+                Self::write_footprint_rows(transaction, &agent.workspace_id, agent_id, scan, now)?;
+            }
 
             let contested = workspace_collisions(transaction, &agent.workspace_id)?;
             let after = signatures_of(&contested);
@@ -1163,18 +1225,20 @@ impl MeshStore {
                 }
             }
 
-            Self::event(
-                transaction,
-                &agent.workspace_id,
-                Some(agent_id),
-                "footprint.published",
-                scan.branch.as_deref(),
-                &json!({
-                    "paths": scan.entries.len(),
-                    "base_ref": scan.base_ref,
-                    "base_commit": scan.base_commit
-                }),
-            )?;
+            if !unchanged {
+                Self::event(
+                    transaction,
+                    &agent.workspace_id,
+                    Some(agent_id),
+                    "footprint.published",
+                    scan.branch.as_deref(),
+                    &json!({
+                        "paths": scan.entries.len(),
+                        "base_ref": scan.base_ref,
+                        "base_commit": scan.base_commit
+                    }),
+                )?;
+            }
 
             Ok(json!({
                 "agent_id": agent_id,
@@ -2033,6 +2097,14 @@ fn add_column_if_missing(
     Ok(())
 }
 
+/// Live checkouts in a workspace, and how many registrations were skipped as dead.
+#[derive(Clone, Debug, Default)]
+pub struct LiveCheckouts {
+    pub checkouts: Vec<AgentCheckout>,
+    /// Registered agents whose process no longer exists.
+    pub stale: usize,
+}
+
 /// A live agent session and the checkout it is working in.
 /// Task key reserved for the workspace-wide integration lease.
 ///
@@ -2131,7 +2203,9 @@ fn workspace_symbol_breaks(
         "SELECT DISTINCT r.symbol, r.path, r.agent_id, u.agent_id, a.name
          FROM symbol_footprints r
          JOIN symbol_footprints u
-           ON u.workspace_id = r.workspace_id AND u.symbol = r.symbol AND u.kind = 'reference'
+           ON u.workspace_id = r.workspace_id
+          AND u.kind IN ('reference', 'reference_truncated')
+          AND (u.kind = 'reference_truncated' OR u.symbol = r.symbol)
          JOIN agents ra ON ra.id = r.agent_id
          JOIN agents a ON a.id = u.agent_id
          WHERE r.workspace_id = ?1
