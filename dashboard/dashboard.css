@@ -213,6 +213,7 @@ dd { overflow: hidden; margin: 0; color: var(--text-2); font-family: ui-monospac
 .viewer-heading > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .code-view { min-width: 0; min-height: 0; overflow: auto; margin: 0; padding: 13px 15px; color: #c7cdd6; background: #090b0e; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .61rem; line-height: 1.58; tab-size: 2; white-space: pre; }
 .change-list { display: grid; align-content: start; gap: 1px; }
+.pane-actions { display: flex; gap: 8px; align-items: center; }
 .change-summary { color: var(--dim); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .49rem; }
 .change-item { display: grid; width: 100%; grid-template-columns: auto minmax(0, 1fr); gap: 6px; align-items: center; min-height: 32px; padding: 4px 5px; border: 1px solid transparent; border-radius: 4px; color: var(--text-2); background: transparent; text-align: left; }
 .change-item:hover, .change-item.active { border-color: var(--line); background: var(--surface-2); }

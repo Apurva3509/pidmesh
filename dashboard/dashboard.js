@@ -16,6 +16,7 @@ const state = {
   view: "ide",
   websocket: null,
   workspaceFilter: "",
+  worktrees: null,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -91,12 +92,16 @@ function setConnection(connected) {
 
 async function refresh() {
   try {
-    const [snapshot, sessions] = await Promise.all([
+    const [snapshot, sessions, worktrees] = await Promise.all([
       api("/api/v1/snapshot?limit=100"),
       api("/api/v1/ide/sessions"),
+      // Managed worktrees outlive the dashboard process that created them, so the inventory is
+      // read on every refresh rather than derived from the session list.
+      api("/api/v1/ide/worktrees"),
     ]);
     state.snapshot = snapshot;
     state.sessions = sessions;
+    state.worktrees = worktrees;
     if (state.selectedSessionId && !selectedSession()) state.selectedSessionId = null;
     if (!state.selectedSessionId && sessions.length) state.selectedSessionId = sessions[0].id;
     renderAll();
@@ -551,6 +556,7 @@ function renderOperations() {
     ...(snapshot.resources || []).map((resource) => ({ title: `${resource.resource_type}:${resource.resource_key}`, detail: resource.agent_name, state: "scope" })),
   ];
   renderOperationRows(byId("operation-ownership"), ownership, (item) => [item.title, item.detail, item.state]);
+  renderWorktrees();
   renderOperationRows(
     byId("operation-events"),
     snapshot.events || [],
@@ -658,6 +664,42 @@ function renderMergeReadiness(convergence, snapshot) {
       convergenceRow("blocked", "divergent", entry.agent_name, (entry.blockers || []).map(blockerSummary).join(" · ")),
     ),
   );
+}
+
+// Retained worktrees are listed first and never hidden: an accumulating checkout the operator
+// cannot see is the whole bug, and the reason for keeping each one is the reason reclaiming it
+// would have destroyed work.
+function renderWorktrees() {
+  const inventory = state.worktrees || { reclaimable: [], retained: [] };
+  const reclaimable = inventory.reclaimable || [];
+  const retained = inventory.retained || [];
+  byId("worktree-summary").textContent =
+    `${retained.length} retained · ${reclaimable.length} reclaimable`;
+  const button = byId("reclaim-button");
+  button.disabled = reclaimable.length === 0;
+  button.textContent = reclaimable.length ? `Reclaim ${reclaimable.length} safe` : "Reclaim safe";
+  const rows = [...retained, ...reclaimable];
+  if (!rows.length) {
+    empty(byId("operation-worktrees"), "No managed worktrees are using disk.");
+    return;
+  }
+  renderOperationRows(
+    byId("operation-worktrees"),
+    rows,
+    (entry) => [entry.branch || basename(entry.path), entry.reason, entry.reclaimable ? "reclaimable" : "retained"],
+  );
+}
+
+function confirmReclaim() {
+  const reclaimable = state.worktrees?.reclaimable || [];
+  if (!reclaimable.length) return;
+  openConfirm({
+    overline: "Reclaim disk",
+    title: `Remove ${reclaimable.length} spent worktree(s)?`,
+    description: "Only worktrees with no uncommitted changes whose commits are already in the primary checkout are removed. Everything listed as retained is left exactly where it is.",
+    label: "Reclaim",
+    action: () => api("/api/v1/ide/worktrees", { method: "DELETE" }),
+  });
 }
 
 function renderOperationRows(container, items, mapper) {
@@ -928,6 +970,7 @@ function bindEvents() {
     renderSessions();
   });
   byId("operations-refresh").addEventListener("click", refresh);
+  byId("reclaim-button").addEventListener("click", confirmReclaim);
   byId("files-refresh").addEventListener("click", () => loadFiles(state.currentDirectory));
   byId("copy-file").addEventListener("click", async () => {
     if (state.currentFile) await navigator.clipboard.writeText(state.currentFile.content);
