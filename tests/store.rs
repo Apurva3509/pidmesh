@@ -211,6 +211,7 @@ fn dashboard_snapshot_combines_only_the_selected_workspace() -> Result<()> {
     assert_eq!(snapshot["stats"]["memories"], 1);
     assert_eq!(snapshot["stats"]["messages"], 1);
     assert_eq!(snapshot["stats"]["claims"], 1);
+    assert_eq!(snapshot["stats"]["contested_paths"], 0);
     assert_eq!(snapshot["memories"][0]["content"], "primary decision");
     assert_eq!(snapshot["messages"][0]["recipient_name"], "worker");
     assert!(
@@ -911,12 +912,29 @@ fn dashboard_api_is_token_protected_and_cleans_up_its_session() -> Result<()> {
     )?;
     assert_eq!(snapshot.0, 200, "{}", snapshot.2);
     assert!(snapshot.2.contains(r#""resources":1"#));
+    assert_quiet_convergence(&snapshot.2)?;
 
     kill(Pid::from_raw(i32::try_from(child.id())?), Signal::SIGINT)?;
     assert!(child.wait()?.success());
     let store = MeshStore::new(database)?;
     let status = store.status(None, Some(directory.path()))?;
     assert_eq!(status["agents"][0]["status"], "stopped");
+    Ok(())
+}
+
+/// The dashboard renders convergence from the snapshot alone, so the whole block has to be
+/// present and quiet for a workspace nobody has swept yet rather than absent.
+fn assert_quiet_convergence(body: &str) -> Result<()> {
+    let snapshot: Value = serde_json::from_str(body)?;
+    assert_eq!(snapshot["convergence"]["collision_count"], 0, "{body}");
+    assert_eq!(snapshot["convergence"]["symbol_break_count"], 0, "{body}");
+    assert_eq!(snapshot["convergence"]["integration_lease"], Value::Null);
+    assert_eq!(snapshot["convergence"]["severity"]["divergent"], 0);
+    assert_eq!(
+        snapshot["convergence"]["blocked"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(snapshot["stats"]["blocked_agents"], 0);
     Ok(())
 }
 
