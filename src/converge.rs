@@ -478,25 +478,37 @@ fn exported_name(line: &str) -> Option<String> {
     Some(name)
 }
 
-/// Identifiers appearing in a checkout's changed files.
+/// Names a checkout's changed files use but do not themselves declare.
+///
+/// The exclusion is what makes this a dependency rather than a word list. Two checkouts that both
+/// changed one file each still hold their own copy of every declaration in it, and counting those
+/// copies as usages reports every edited file as breaking every other one.
 fn referenced_symbols(checkout: &Path, paths: &[String]) -> Vec<String> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for path in paths {
         let Ok(content) = fs::read_to_string(checkout.join(path)) else {
             continue;
         };
+        let declared: BTreeSet<String> = content.lines().filter_map(exported_name).collect();
+        let mut words: BTreeSet<String> = BTreeSet::new();
         let mut word = String::new();
         for character in content.chars() {
             if character.is_alphanumeric() || character == '_' {
                 word.push(character);
                 continue;
             }
-            take_word(&mut word, &mut seen);
+            take_word(&mut word, &mut words);
+        }
+        take_word(&mut word, &mut words);
+        for candidate in words {
+            if declared.contains(&candidate) {
+                continue;
+            }
+            seen.insert(candidate);
             if seen.len() >= MAX_REFERENCES {
                 return seen.into_iter().collect();
             }
         }
-        take_word(&mut word, &mut seen);
     }
     seen.into_iter().collect()
 }

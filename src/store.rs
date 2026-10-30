@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS symbol_footprints (
 );
 
 CREATE INDEX IF NOT EXISTS symbol_footprints_lookup
-ON symbol_footprints(workspace_id, kind, symbol);
+ON symbol_footprints(workspace_id, kind, symbol, agent_id);
 ";
 
 #[derive(Clone, Debug)]

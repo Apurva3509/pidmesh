@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use pidmesh::converge::{integration_head, scan_worktree};
+use pidmesh::converge::{WorktreeScan, integration_head, scan_worktree};
 use pidmesh::store::{
     AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, default_database_path, diagnose, workspace_root,
 };
@@ -866,11 +868,43 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
             .or_default()
             .push(checkout);
     }
+    // Scanning is git and file I/O with no shared state, so checkouts are observed in parallel.
+    // Publishing stays serial: it is one short transaction each and the store holds one
+    // connection, so contending for it would only add lock traffic.
+    let checkouts: Vec<(&PathBuf, &Vec<AgentCheckout>)> = grouped.iter().collect();
+    let cursor = AtomicUsize::new(0);
+    let scans: Mutex<Vec<(usize, Result<WorktreeScan>)>> = Mutex::new(Vec::new());
+    let workers = thread::available_parallelism()
+        .map_or(4, NonZeroUsize::get)
+        .min(checkouts.len().max(1));
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, _)) = checkouts.get(index) else {
+                        return;
+                    };
+                    let scanned = scan_worktree(path, base);
+                    if let Ok(mut guard) = scans.lock() {
+                        guard.push((index, scanned));
+                    }
+                }
+            });
+        }
+    });
+
+    let mut scanned = scans.into_inner().unwrap_or_default();
+    scanned.sort_by_key(|(index, _)| *index);
+
     let mut published = 0usize;
     let mut skipped = Vec::new();
     let mut witness = None;
-    for (path, agents) in &grouped {
-        let scan = match scan_worktree(path, base) {
+    for (index, result) in scanned {
+        let Some((path, agents)) = checkouts.get(index) else {
+            continue;
+        };
+        let scan = match result {
             Ok(scan) => scan,
             Err(error) => {
                 // A checkout can be removed or rewritten underneath us; that is not fatal.
@@ -881,7 +915,7 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
                 continue;
             }
         };
-        for agent in agents {
+        for agent in *agents {
             store.publish_footprint(&agent.agent_id, &scan)?;
             witness.get_or_insert_with(|| agent.agent_id.clone());
             published += 1;

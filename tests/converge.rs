@@ -1441,3 +1441,43 @@ fn a_withdrawn_export_nobody_uses_does_not_block() -> Result<()> {
     assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
     Ok(())
 }
+
+/// Regression: another checkout's copy of a declaration is not a usage of it.
+///
+/// References were every identifier in a changed file, so two agents who each edited one shared
+/// module both "referenced" every name that module declares. At 24 agents that produced 8,336
+/// phantom breaks and a 2.8s query — the false-alarm flood that teaches an operator to stop
+/// reading the output.
+#[test]
+fn a_copy_of_a_declaration_is_not_a_reference_to_it() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn alpha_owned() {}\npub fn shared_helper() {}\npub fn bravo_owned() {}\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // alpha retires shared_helper. bravo edits the same file but only its own function, so its
+    // copy still *declares* shared_helper without ever calling it.
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn alpha_owned() {}\npub fn bravo_owned() {}\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/api.rs"),
+        "pub fn alpha_owned() {}\npub fn shared_helper() {}\npub fn bravo_owned_v2() {}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    assert_eq!(
+        fleet.store.collisions(&alpha)?["symbol_break_count"],
+        0,
+        "holding a copy of a declaration is not depending on it"
+    );
+    Ok(())
+}
