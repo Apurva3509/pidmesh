@@ -946,7 +946,7 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     scanned.sort_by_key(|(index, _)| *index);
 
     let mut published = 0usize;
-    let mut skipped = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
     let mut witness = None;
     let mut batch: Vec<(String, WorktreeScan)> = Vec::new();
     for (index, result) in scanned {
@@ -972,7 +972,13 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     }
     // One transaction for the whole sweep: publishing agent by agent recomputes the collision
     // set twice per agent, which is most of a tick once a fleet gets large.
-    store.publish_footprints(&batch)?;
+    // A watcher runs for hours. A publish that fails — a locked database, a vanished agent — is
+    // one bad tick, not a reason to stop observing the fleet, so it is reported like a failed
+    // scan rather than propagated out of the loop.
+    if let Err(error) = store.publish_footprints(&batch) {
+        skipped.push(json!({"publish": "failed", "error": format!("{error:#}")}));
+        published = 0;
+    }
 
     // Nothing else reaps dead sessions, and a crashed agent holds its claims, its reservations
     // and its share of every contested path until something does — which blocks its peers from

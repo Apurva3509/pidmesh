@@ -217,6 +217,9 @@ impl MeshStore {
             path,
             connection: Arc::new(Mutex::new(connection)),
         };
+        // Before initialize(), because the first write creates the -wal and -shm sidecars and
+        // they inherit the mode of the moment, not a later chmod of the main file.
+        store.restrict_permissions()?;
         store.initialize()?;
         store.restrict_permissions()?;
         Ok(store)
@@ -1746,6 +1749,16 @@ impl MeshStore {
     fn restrict_permissions(&self) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+        // The write-ahead log and shared-memory file hold the same contents as the database and
+        // are created by SQLite with the process umask, so they need the same restriction.
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = self.path.clone().into_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.exists() {
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))?;
+            }
+        }
         Ok(())
     }
 
@@ -2223,6 +2236,13 @@ struct SymbolBreak {
 ///
 /// This is the conflict path-level comparison cannot see: two agents edit different files, one
 /// removes or renames an export, and the merge is textually clean but behaviourally broken.
+/// Largest number of symbol breaks reported at once.
+///
+/// A large fleet can produce tens of thousands, which is megabytes of JSON nobody reads and a
+/// report that hides its own first line. The count is reported separately so truncation is
+/// visible rather than implied.
+const MAX_SYMBOL_BREAKS: i64 = 200;
+
 fn workspace_symbol_breaks(
     connection: &Connection,
     workspace_id: &str,
@@ -2240,10 +2260,11 @@ fn workspace_symbol_breaks(
            AND r.kind = 'removed_export'
            AND r.agent_id != u.agent_id
            AND COALESCE(ra.checkout_path, r.agent_id) != COALESCE(a.checkout_path, u.agent_id)
-         ORDER BY r.symbol, u.agent_id",
+         ORDER BY r.symbol, u.agent_id
+         LIMIT ?2",
     )?;
     let rows = statement
-        .query_map(params![workspace_id], |row| {
+        .query_map(params![workspace_id, MAX_SYMBOL_BREAKS], |row| {
             Ok(SymbolBreak {
                 symbol: row.get(0)?,
                 removed_from: row.get(1)?,
