@@ -418,6 +418,9 @@ enum Commands {
 
 static FORCE_JSON: AtomicBool = AtomicBool::new(false);
 
+/// Set when stdout went away mid-write, so the exit status says so without a panic.
+static PIPE_CLOSED: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(code),
@@ -439,7 +442,7 @@ fn run() -> Result<u8> {
     // nobody reading the quickstart has a mesh to open yet.
     match cli.command {
         Commands::Completions { shell } => {
-            completions(shell);
+            completions(shell)?;
             Ok(0)
         }
         Commands::Quickstart => {
@@ -743,7 +746,7 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
         }
         // Both are answered in run() before the store is ever opened. They are repeated here so
         // the match stays total without a panic, and so either path behaves identically.
-        Commands::Completions { shell } => completions(shell),
+        Commands::Completions { shell } => completions(shell)?,
         Commands::Quickstart => quickstart()?,
     }
     Ok(0)
@@ -755,13 +758,12 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
 /// stdout is sourced by a shell: wrapping it in an object would make it unusable. Completions are
 /// generated from the live `Cli` definition, so a subcommand or flag added above completes without
 /// anyone remembering to update a checked-in script.
-fn completions(shell: Shell) {
-    clap_complete::generate(
-        shell,
-        &mut Cli::command(),
-        "pidmesh",
-        &mut std::io::stdout(),
-    );
+fn completions(shell: Shell) -> Result<()> {
+    // Generated into memory first: writing straight to stdout puts the panic on a closed pipe
+    // inside the generator, where it cannot be handled.
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "pidmesh", &mut script);
+    write_out(String::from_utf8(script)?.trim_end())
 }
 
 /// The three commands that take a fresh checkout to a guarded merge.
@@ -836,8 +838,7 @@ fn quickstart() -> Result<()> {
     if FORCE_JSON.load(Ordering::Relaxed) || !render::is_interactive() {
         return emit(&quickstart_steps());
     }
-    println!("{QUICKSTART_PROSE}");
-    Ok(())
+    write_out(QUICKSTART_PROSE)
 }
 
 struct SwarmWorker {
@@ -1297,8 +1298,31 @@ fn bail_duration<T>() -> Result<T> {
 }
 
 fn emit(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
+    write_out(&serde_json::to_string_pretty(value)?)
+}
+
+/// Write a line to stdout, treating a closed pipe as an ordinary end rather than a failure.
+///
+/// Rust ignores `SIGPIPE`, so a write to a reader that has gone away surfaces as an error and the
+/// print macros turn it into a panic with a backtrace. `pidmesh collisions | head` is a completely
+/// reasonable thing to type, and every other tool in the pipeline exits quietly when it happens.
+/// Restoring the default disposition would need `unsafe`, which this crate denies, so the error is
+/// handled where it arrives instead.
+fn write_out(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            PIPE_CLOSED.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Print for whoever is reading: prose at a terminal, JSON everywhere else.
@@ -1310,10 +1334,7 @@ fn present(shape: Shape, value: &Value) -> Result<()> {
         return emit(value);
     }
     match render::render(shape, value) {
-        Some(text) => {
-            println!("{text}");
-            Ok(())
-        }
+        Some(text) => write_out(&text),
         None => emit(value),
     }
 }

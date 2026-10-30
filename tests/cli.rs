@@ -150,3 +150,34 @@ fn every_subcommand_explains_itself_in_the_top_level_help() -> Result<()> {
     }
     Ok(())
 }
+
+/// A pipeline ending early is an ordinary end, not a crash.
+///
+/// Rust ignores `SIGPIPE`, so a write to a reader that has gone away surfaces as an error and the
+/// print macros turn it into a panic with a backtrace. `pidmesh collisions | head` is a reasonable
+/// thing to type, and every other tool in the pipeline exits quietly when it happens.
+#[test]
+fn a_closed_pipe_is_not_a_crash() -> Result<()> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    // Completions are comfortably larger than a pipe buffer, so the write genuinely fails
+    // rather than being absorbed and discarded after the reader leaves.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .args(["completions", "zsh"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drop the read end immediately; the child is still writing.
+    drop(child.stdout.take());
+    let mut stderr = String::new();
+    if let Some(mut handle) = child.stderr.take() {
+        handle.read_to_string(&mut stderr)?;
+    }
+    child.wait()?;
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe must not panic: {stderr}"
+    );
+    Ok(())
+}
