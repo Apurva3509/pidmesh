@@ -1967,3 +1967,39 @@ fn a_long_silent_session_dies_even_if_its_pid_was_reused() -> Result<()> {
     assert_eq!(reaped["dead_agents"], 1, "{reaped}");
     Ok(())
 }
+
+/// Regression: a local variable sharing a name with a withdrawn export is not a dependency.
+///
+/// Reference matching is textual, so any file holding the word counted as using it. Two unrelated
+/// pieces of code that happened to pick the same name blocked each other's merge.
+#[test]
+fn a_local_binding_is_not_a_dependency_on_someone_elses_export() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn compute_total() -> u32 {\n    7\n}\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn compute_subtotal() -> u32 {\n    7\n}\n",
+    )?;
+    // bravo binds its own `compute_total`; it never calls anyone else's.
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn local() -> u32 {\n    let compute_total = 3;\n    compute_total\n}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(
+        report["mergeable"], true,
+        "two unrelated uses of one name are not a conflict: {report}"
+    );
+    Ok(())
+}

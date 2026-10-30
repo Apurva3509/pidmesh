@@ -517,6 +517,24 @@ fn exported_name(line: &str) -> Option<String> {
     Some(name)
 }
 
+/// The local name a line binds, if it binds one.
+///
+/// A file that introduces its own `compute_total` is not depending on anybody else's. Without
+/// this, a local binding that happens to share a name with a withdrawn export reads as a usage
+/// and blocks a merge over two unrelated pieces of code.
+#[must_use]
+fn bound_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = ["let mut ", "let ", "const ", "var ", "static "]
+        .into_iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (name.len() >= 2).then_some(name)
+}
+
 /// Names a checkout's changed files use but do not themselves declare.
 ///
 /// The exclusion is what makes this a dependency rather than a word list. Two checkouts that both
@@ -539,7 +557,10 @@ fn referenced_symbols(checkout: &Path, paths: &[String]) -> (Vec<String>, bool) 
         let Ok(content) = fs::read_to_string(&absolute) else {
             continue;
         };
-        let declared: BTreeSet<String> = content.lines().filter_map(exported_name).collect();
+        let declared: BTreeSet<String> = content
+            .lines()
+            .filter_map(|line| exported_name(line).or_else(|| bound_name(line)))
+            .collect();
         let mut words: BTreeSet<String> = BTreeSet::new();
         let mut word = String::new();
         for character in content.chars() {
