@@ -9,7 +9,40 @@ making them work blind. Every process gets a workspace-scoped identity, shared d
 inbox, a wakeable event stream, atomic task leases, and hierarchical resource reservations through
 one private SQLite database.
 
-No daemon. No Python runtime. No cloud account. No API key.
+No daemon. No Python runtime. No cloud account. No API key. Nothing leaves the machine.
+
+## Guard a fleet in one command
+
+Agents work in their own git worktrees and collide anyway: two rewrite the same lines, one deletes
+what another is editing, one withdraws a function a third still calls. Git merges most of that
+without complaint, and the result does not build.
+
+Point a watcher at the repository. It observes every checkout from git alone — no agent has to
+call anything, which matters because an agent launched by some other harness never will:
+
+```console
+$ pidmesh watch
+8 checkouts scanned, 8 published
+2 contested paths
+  x src/routes.rs               divergent    agent1, agent2, agent3, agent4
+  · src/shared.rs               identical    agent5, agent6
+
+1 symbol break
+  x compute_total() removed from src/api.rs, still used by agent8
+```
+
+Then gate the merge instead of discovering it afterwards:
+
+```console
+$ pidmesh mergeable
+Cannot merge yet — 1 blocker
+  x removes compute_total() which agent8 still calls
+```
+
+`mergeable` exits non-zero, so `pidmesh mergeable && git merge …` is a safe thing to write. Nothing
+here is advisory: an agent that overlaps nobody merges freely, and one that would break a live peer
+does not.
+
 
 ## Why this exists
 
@@ -27,6 +60,21 @@ PidMesh is the coordination kernel for those questions. Each process keeps one n
 connection, while WAL and short `BEGIN IMMEDIATE` transactions coordinate safely across processes.
 
 ## Performance
+
+A sweep observes every checkout in parallel and publishes the whole fleet in one transaction.
+Measured on Apple Silicon, 40 changed files per checkout:
+
+| Fleet | `watch --once` | `collisions` |
+| ---: | ---: | ---: |
+| 24 agents | 0.64 s | 0.03 s |
+| 96 agents | 2.48 s | 0.05 s |
+
+An unchanged sweep writes nothing at all, so leaving a watcher running costs no storage growth.
+What time remains is git itself rather than SQLite.
+
+
+
+### CLI and storage
 
 Measured on Apple Silicon with the same SQLite schema and workload:
 
@@ -328,6 +376,10 @@ the server from the project directory. `PIDMESH_DB` overrides the default
 - Observed footprints detect overlapping edits that no agent reserved.
 - Collision events fire on transitions only, so steady-state re-scanning is free.
 - A watcher can observe every checkout without any agent participating.
+- Scanning is pinned against user git configuration, so detection cannot be switched off by a setting.
+- An incomplete scan reports conflict rather than clearance; a downgrade always needs proof.
+- An unobserved checkout is a blocker, not a clean verdict.
+- A sweep that changes nothing writes nothing, and the event ledger is bounded.
 - Edits to separable regions of one file are distinguished from edits that overwrite each other.
 - Withdrawing an export a live checkout still calls is caught even when no file is shared.
 - A stale base blocks a merge even when the diff would apply cleanly.
