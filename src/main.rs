@@ -264,8 +264,11 @@ static FORCE_JSON: AtomicBool = AtomicBool::new(false);
 fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(code),
-        Err(error) => {
-            eprintln!("{}", json!({"error": format!("{error:#}")}));
+        Err(failure) => {
+            eprintln!(
+                "{}",
+                render::error(&format!("{failure:#}"), FORCE_JSON.load(Ordering::Relaxed))
+            );
             ExitCode::from(2)
         }
     }

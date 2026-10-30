@@ -1724,9 +1724,10 @@ fn git_context(directory: &Path) -> Option<GitContext> {
         ])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    // A repository with no commits yet cannot resolve HEAD, so git exits non-zero while still
+    // printing the toplevel and common directory it did resolve. Treating that as "not a
+    // repository" would drop linked-worktree discovery and silently split the mesh, so the
+    // output is parsed on its own terms: a genuine non-repository prints nothing at all.
     let text = String::from_utf8(output.stdout).ok()?;
     let mut lines = text.lines();
     let checkout = PathBuf::from(lines.next()?).canonicalize().ok()?;

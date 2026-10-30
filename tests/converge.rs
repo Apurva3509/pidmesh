@@ -1543,3 +1543,48 @@ fn an_empty_sweep_is_not_an_error() -> Result<()> {
     assert_eq!(report["published"], 0);
     Ok(())
 }
+
+/// Regression: a repository with no commits is still a repository.
+///
+/// `git rev-parse` cannot resolve an unborn HEAD and exits non-zero even though it printed the
+/// toplevel and git directory it did resolve. Treating that as "not a repository" dropped
+/// linked-worktree discovery, which silently splits one repository into unrelated meshes — the
+/// exact failure `pidmesh doctor` exists to catch.
+#[test]
+fn a_repository_with_no_commits_is_still_discovered() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let repository = directory.path().join("unborn");
+    std::fs::create_dir(&repository)?;
+    git(&repository, &["init", "-b", "main"])?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .current_dir(&repository)
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            directory
+                .path()
+                .join("mesh.db")
+                .to_str()
+                .context("database path")?,
+            "--json",
+            "doctor",
+        ])
+        .output()?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let codes: Vec<&str> = report["warnings"]
+        .as_array()
+        .context("warnings")?
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"not_a_repository"),
+        "an empty repository is still a repository: {report}"
+    );
+    assert!(
+        report["primary_repository"].is_string(),
+        "the repository root must resolve: {report}"
+    );
+    Ok(())
+}

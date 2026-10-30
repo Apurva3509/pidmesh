@@ -83,6 +83,18 @@ pub fn is_interactive() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// Render a failure for whoever is reading stderr.
+///
+/// A person gets a sentence; anything else keeps the `{"error": ...}` object that scripts match on.
+#[must_use]
+pub fn error(message: &str, force_json: bool) -> String {
+    if force_json || !std::io::stderr().is_terminal() {
+        return serde_json::json!({"error": message}).to_string();
+    }
+    let palette = Palette::new();
+    format!("{}error:{} {message}", palette.bad, palette.reset)
+}
+
 /// Render a value for a terminal, or `None` when the shape does not apply to it.
 #[must_use]
 pub fn render(shape: Shape, value: &Value) -> Option<String> {
@@ -214,6 +226,12 @@ fn watch(value: &Value, palette: &Palette) -> String {
             head,
             " {}({skipped} skipped){}",
             palette.warn, palette.reset
+        );
+    }
+    if checkouts == 0 {
+        return format!(
+            "{head}\n{}No agents have joined this workspace yet.{}\n  {}Run `pidmesh join --name <agent>` from inside each checkout, then sweep again.{}",
+            palette.warn, palette.reset, palette.dim, palette.reset
         );
     }
     let body = collisions(value, palette);
@@ -369,6 +387,23 @@ mod tests {
             .filter_map(|line| line.split_whitespace().nth(1))
             .collect();
         assert_eq!(order, vec!["b.rs", "c.rs", "a.rs"], "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_workspace_explains_how_to_fill_it() {
+        let rendered = watch(
+            &json!({"checkouts": 0, "published": 0, "skipped": [], "collisions": []}),
+            &plain(),
+        );
+        assert!(rendered.contains("No agents have joined"), "{rendered}");
+        assert!(rendered.contains("pidmesh join"), "{rendered}");
+    }
+
+    #[test]
+    fn an_error_is_a_sentence_for_people_and_json_for_scripts() {
+        let forced = error("agent id required", true);
+        assert!(forced.starts_with('{'), "{forced}");
+        assert!(forced.contains("agent id required"));
     }
 
     #[test]
