@@ -80,6 +80,17 @@ struct ReleaseParams {
     task: String,
 }
 
+/// The integration lease has a fixed task key, so the only thing a caller chooses is how long to
+/// hold it.
+///
+/// Reusing `ClaimParams` here advertised a required `task` the tool then threw away, which made
+/// the obvious call -- `acquire_integration_lease` with no arguments -- fail to deserialize.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct IntegrationLeaseParams {
+    #[serde(default = "default_lease")]
+    lease_seconds: u64,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ReserveResourcesParams {
     resources: Vec<String>,
@@ -316,15 +327,18 @@ impl PidMeshMcp {
         let store = self.store.clone();
         let agent_id = self.agent_id.clone();
         let result = tokio::task::spawn_blocking(move || {
-            if !parameters.timeout_seconds.is_finite()
-                || parameters.timeout_seconds.is_sign_negative()
-            {
-                anyhow::bail!("timeout_seconds must be a finite non-negative number");
-            }
+            // `Duration::from_secs_f64` panics on a negative, non-finite, or too-large value,
+            // and a panic inside a tool call reaches the calling agent as an opaque
+            // "task N panicked" internal error it cannot act on. Converting fallibly turns
+            // every one of those into an ordinary tool failure naming the argument at fault.
+            let timeout =
+                Duration::try_from_secs_f64(parameters.timeout_seconds).map_err(|_| {
+                    anyhow::anyhow!("timeout_seconds must be a finite non-negative number")
+                })?;
             store.wait_for_events(
                 &agent_id,
                 parameters.after_sequence,
-                Duration::from_secs_f64(parameters.timeout_seconds),
+                timeout,
                 Duration::from_millis(100),
                 parameters.limit,
             )
@@ -373,7 +387,7 @@ impl PidMeshMcp {
     #[tool(description = "Take the workspace-wide integration lease so merges do not race")]
     fn acquire_integration_lease(
         &self,
-        Parameters(parameters): Parameters<ClaimParams>,
+        Parameters(parameters): Parameters<IntegrationLeaseParams>,
     ) -> Result<CallToolResult, McpError> {
         tool_result(self.store.claim(
             &self.agent_id,
