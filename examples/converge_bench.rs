@@ -17,6 +17,9 @@
 //! 3. `publish_footprints` — one `SQLite` write transaction for the whole sweep.
 //! 4. `collect_stale` — the reap the watcher performs every tick.
 //! 5. `collisions` — the report the watcher prints.
+//! 6. coverage — one `git worktree list --porcelain`, which `watch_pass` ends every sweep with
+//!    so a repository whose agents never joined cannot report a clean mesh. One process per
+//!    sweep rather than per checkout, but it is on the critical path of every tick.
 //!
 //! # How git is separated from `SQLite`
 //!
@@ -31,6 +34,14 @@
 //!   in-process work: diff parsing, `digest_of`, and `referenced_symbols`.
 //! * A spawn floor is measured separately with the cheapest possible git invocation, so the fixed
 //!   cost of starting a process can be told apart from the work git then does.
+//! * One *extra* git call per scan is priced alongside it, using the `git check-attr` probe whose
+//!   cost is the open question, so "would one more invocation matter?" has a number rather than
+//!   an argument.
+//!
+//! Every git process here is started through `converge::git_program()`, the same resolution the
+//! scan uses. Spawning `git` from `PATH` instead meant the replay timed the macOS shim while the
+//! code under test timed the binary behind it — a 3.5x difference that reported git shares above
+//! 100 %.
 //!
 //! The replay is an estimate, not an instrumented trace: it pays cache effects the real scan has
 //! already paid, so it slightly *under*-reports git. Treat the git share as a lower bound.
@@ -41,8 +52,9 @@
 //! cargo run --release --example converge_bench -- --scratch /tmp/pm-bench --suite all --reps 5
 //! ```
 //!
-//! Suites are `scale`, `phases`, `growth`, `pathological`, or `all`. Every number printed is the
-//! median of `--reps` repetitions after one discarded warm-up sweep; the report says how many.
+//! Suites are `scale`, `contested`, `phases`, `growth`, `pathological`, or `all`. Every number
+//! printed is the median of `--reps` repetitions after one discarded warm-up sweep; the report
+//! says how many.
 //! Fixtures are built under `--scratch` and removed afterwards unless `--keep` is passed.
 
 // Durations and byte counts are reported as approximate milliseconds and megabytes. Precision
@@ -62,7 +74,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use pidmesh::converge::{WorktreeScan, scan_worktree};
+use pidmesh::converge::{WorktreeScan, git_program, scan_worktree, worktree_paths};
 use pidmesh::store::MeshStore;
 use serde_json::{Value, json};
 
@@ -101,6 +113,7 @@ fn main() -> Result<()> {
     for suite in &options.suites {
         let outcome = match suite.as_str() {
             "scale" => scale_suite(&scratch, &options)?,
+            "contested" => contested_suite(&scratch, &options)?,
             "phases" => phase_suite(&scratch, &options)?,
             "growth" => growth_suite(&scratch, &options)?,
             "pathological" => pathological_suite(&scratch, &options)?,
@@ -153,7 +166,7 @@ impl Options {
         ensure!(reps >= 1, "--reps must be at least 1");
         ensure!(ticks >= 1, "--ticks must be at least 1");
         let suites = if suite == "all" {
-            ["scale", "phases", "growth", "pathological"]
+            ["scale", "contested", "phases", "growth", "pathological"]
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect()
@@ -272,6 +285,29 @@ impl Fixture {
         Ok(())
     }
 
+    /// Dirty the *same* `shared` files in every checkout, so every changed path is contested.
+    ///
+    /// `dirty` deliberately spreads each checkout's edits across its own band of the repository
+    /// and leaves only `HUB_FILES` overlapping, which means the whole scaling matrix exercises
+    /// the collision query with two contested paths however large the fleet gets. Contention is
+    /// its own axis: the collision report groups by path and compares every participant against
+    /// every other, so it grows with contested paths times participants, not with fleet size.
+    /// Nothing measured that, so nothing would have noticed it going quadratic.
+    fn contest(&self, checkouts: usize, shared: usize, revision: usize) -> Result<()> {
+        ensure!(
+            shared <= self.repo_files,
+            "cannot contest more files than exist"
+        );
+        for (index, checkout) in self.checkouts.iter().take(checkouts).enumerate() {
+            for file in 0..shared {
+                // Same path in every checkout, different content in each, so the path is
+                // contested and the participants genuinely disagree.
+                write_source(checkout, file, revision * 1_000 + index + 1)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Register one agent per checkout and return their ids.
     ///
     /// The working directory is moved into each worktree first, because registering with an
@@ -345,8 +381,14 @@ fn api_source(from: usize, to: usize) -> String {
 }
 
 /// Run git in a directory, mirroring the configuration neutralisation `converge` applies.
+///
+/// Through `converge::git_program()`, not `Command::new("git")`. The scan resolves the macOS
+/// `/usr/bin/git` shim past to the developer-tools binary it forwards to; `PATH` does not. A
+/// replay that spawned the shim was timing a process 3.5x more expensive than the one
+/// `scan_worktree` actually starts, which reported a git share above 100 % of the scan it was
+/// supposedly a part of, and a "spawn floor" that was the shim's rather than this tool's.
 fn git(directory: &Path, arguments: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = Command::new(git_program())
         .arg("-C")
         .arg(directory)
         .args(["-c", "core.quotePath=false"])
@@ -375,6 +417,8 @@ struct Sweep {
     publish: f64,
     reap: f64,
     report: f64,
+    /// The `git worktree list` coverage cross-check `watch_pass` ends every sweep with.
+    coverage: f64,
     published: usize,
     collisions: usize,
     paths: usize,
@@ -460,6 +504,15 @@ fn sweep(store: &MeshStore, workspace: &Path, base: Option<&str>) -> Result<Swee
     };
     let report_elapsed = millis(started.elapsed());
 
+    // `watch_pass` ends every sweep by asking git what is actually checked out and diffing that
+    // against what it just swept, so a repository whose agents never joined cannot report a
+    // clean mesh. It is one `git worktree list --porcelain` for the whole sweep — not one per
+    // checkout — but it is a git process on the critical path of every tick, and leaving it out
+    // of the replay made the benchmark cheaper than the thing it models.
+    let started = Instant::now();
+    let _ = worktree_paths(workspace);
+    let coverage_elapsed = millis(started.elapsed());
+
     Ok(Sweep {
         total: millis(whole.elapsed()),
         live: live_elapsed,
@@ -467,6 +520,7 @@ fn sweep(store: &MeshStore, workspace: &Path, base: Option<&str>) -> Result<Swee
         publish: publish_elapsed,
         reap: reap_elapsed,
         report: report_elapsed,
+        coverage: coverage_elapsed,
         published: usize::try_from(published["published"].as_u64().unwrap_or(0)).unwrap_or(0),
         collisions: usize::try_from(collisions).unwrap_or(0),
         paths,
@@ -503,6 +557,9 @@ fn medians(samples: &[Sweep]) -> Value {
         "publish_ms": pick(|s| s.publish),
         "reap_ms": pick(|s| s.reap),
         "collisions_ms": pick(|s| s.report),
+        // One `git worktree list` per sweep. Reported on its own rather than folded into
+        // `sqlite_ms`, which names the phases that contain no git at all.
+        "coverage_ms": pick(|s| s.coverage),
         "sqlite_ms": pick(|s| s.live + s.publish + s.reap + s.report),
         "published": samples.last().map_or(0, |s| s.published),
         "collisions": samples.last().map_or(0, |s| s.collisions),
@@ -630,6 +687,7 @@ fn git_share(checkout: &Path, reps: usize) -> Result<Value> {
     let mut scans = Vec::with_capacity(reps);
     let mut gits = Vec::with_capacity(reps);
     let mut spawns = Vec::with_capacity(reps);
+    let mut attrs = Vec::with_capacity(reps);
     // Warm-up: the first call pays for cold caches in both directions.
     let _ = scan_worktree(checkout, Some("main"))?;
     let _ = replay_git(checkout, &base_commit)?;
@@ -641,24 +699,47 @@ fn git_share(checkout: &Path, reps: usize) -> Result<Value> {
         let started = Instant::now();
         git(checkout, &["rev-parse", "HEAD"])?;
         spawns.push(millis(started.elapsed()));
+        // One more git process per scan, priced with the call actually being argued about: the
+        // `.gitattributes` `merge` probe, deferred on the grounds that invocation count is the
+        // dominant cost. Reading a single attribute for one path is as close to a bare spawn as
+        // a useful git command gets, so this doubles as the price of *any* fifth invocation.
+        let started = Instant::now();
+        let _ = git(checkout, &["check-attr", "merge", "--", "src/m0/f0.rs"]);
+        attrs.push(millis(started.elapsed()));
     }
     let scan = median(&scans);
     let git_time = median(&gits);
+    let extra = median(&attrs);
     Ok(json!({
         "scan_ms": scan,
         "git_subprocess_ms": git_time,
         "in_process_ms": ((scan - git_time) * 100.0).round() / 100.0,
         "git_share_percent": if scan > 0.0 { (git_time / scan * 1_000.0).round() / 10.0 } else { 0.0 },
         "git_spawn_floor_ms": median(&spawns),
-        "git_calls_per_scan": 5
+        // Four in the steady state. A fifth, `diff --name-status -z`, is issued only when the
+        // unified diff announced more paths than it named — a binary blob, a `-diff` attribute
+        // or a mode-only change — so an ordinary text-only scan never pays for it.
+        "git_calls_per_scan": 4,
+        "one_extra_git_call_ms": extra,
+        "one_extra_git_call_percent_of_scan": if scan > 0.0 {
+            (extra / scan * 1_000.0).round() / 10.0
+        } else { 0.0 }
     }))
 }
 
 /// Replay the exact git invocations `scan_worktree` makes and sum their wall time.
+///
+/// Four, not five. `scan_worktree` is called with an explicit base here, exactly as the watcher
+/// calls it after resolving the branch once for the whole sweep, and `resolve_base_ref` then
+/// returns without asking git anything. Replaying a `rev-parse --verify` that the real scan does
+/// not issue charged every checkout for a process it never started, which inflated the measured
+/// git share by one spawn floor per scan.
+///
+/// `--no-textconv` matters for the same reason the scan passes it: a `textconv` driver makes git
+/// diff a converted rendering, which is both a different answer and a different cost.
 fn replay_git(checkout: &Path, base_commit: &str) -> Result<f64> {
     let started = Instant::now();
     let _ = git(checkout, &["rev-parse", "--abbrev-ref", "HEAD"]);
-    let _ = git(checkout, &["rev-parse", "--verify", "--quiet", "main"]);
     let _ = git(checkout, &["merge-base", "main", "HEAD"]);
     let _ = git(
         checkout,
@@ -667,6 +748,7 @@ fn replay_git(checkout: &Path, base_commit: &str) -> Result<f64> {
             "--unified=0",
             "--no-renames",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-color",
             "--src-prefix=a/",
             "--dst-prefix=b/",
@@ -722,6 +804,58 @@ fn phase_suite(scratch: &Path, options: &Options) -> Result<Value> {
             "git_over_sqlite": if sqlite_ms > 0.0 {
                 (estimated_git / sqlite_ms * 100.0).round() / 100.0
             } else { 0.0 }
+        }));
+        let _ = fs::remove_dir_all(&root);
+    }
+    Ok(Value::Array(results))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Suite: contested paths
+// ---------------------------------------------------------------------------------------------
+
+/// Hold the fleet still and scale the number of paths every agent is fighting over.
+///
+/// The scaling matrix varies fleet size, repository size and changed files, and under all three
+/// the number of *contested* paths stays at `HUB_FILES`. That is the one input the collision
+/// query is actually shaped by, so it is the one input most likely to hide a superlinear term —
+/// and this project has already shipped one correlated subquery that was fine until it was not.
+/// Doubling the contested set should double the publish and report cost and nothing more.
+fn contested_suite(scratch: &Path, options: &Options) -> Result<Value> {
+    let checkouts = 16usize;
+    let mut results = Vec::new();
+    for shared in [25usize, 50, 100, 200, 400, 800] {
+        eprintln!("[contested] {shared} contested paths across {checkouts} checkouts");
+        let root = scratch.join("contested");
+        let fixture = Fixture::build(&root, 2_000, checkouts)?;
+        fixture.contest(checkouts, shared, 1)?;
+        let store = MeshStore::new(fixture.database())?;
+        fixture.register(&store, checkouts)?;
+
+        // Warm-up, then force a real write every tick so publish and the report both do work.
+        sweep(&store, &fixture.repo, Some("main"))?;
+        let mut samples = Vec::with_capacity(options.reps);
+        for revision in 0..options.reps {
+            fixture.contest(checkouts, shared, revision + 2)?;
+            samples.push(sweep(&store, &fixture.repo, Some("main"))?);
+        }
+        let phases = medians(&samples);
+        let collisions = phases["collisions"].as_u64().unwrap_or(0);
+        let report_ms = phases["collisions_ms"].as_f64().unwrap_or(0.0);
+        let publish_ms = phases["publish_ms"].as_f64().unwrap_or(0.0);
+        let per_path = |total: f64| (total * 1_000.0 / shared as f64 * 10.0).round() / 10.0;
+        drop(store);
+        results.push(json!({
+            "contested_paths": shared,
+            "checkouts": checkouts,
+            "participants_per_path": checkouts,
+            "sweep": phases,
+            "collisions_reported": collisions,
+            // The two numbers that would betray a quadratic. Divided through by the input so a
+            // flat column means linear and a rising one means something is re-scanning.
+            "report_us_per_contested_path": per_path(report_ms),
+            "publish_us_per_contested_path": per_path(publish_ms),
+            "database_mb": megabytes(&fixture.database())
         }));
         let _ = fs::remove_dir_all(&root);
     }

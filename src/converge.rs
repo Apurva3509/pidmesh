@@ -544,6 +544,21 @@ fn read_diff(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
     }
     // A rewritten signature reads as a delete plus an add. Only a name that never comes back was
     // genuinely withdrawn.
+    //
+    // Membership is asked once per withdrawn name, so the side being searched has to be a set.
+    // Scanning a `Vec` instead made this O(removed x added), which is quiet until a diff
+    // rewrites a whole file of declarations — regenerated bindings are exactly that shape, and
+    // the file that truncates the reference set is usually the same one. Neither size guard
+    // reaches it: `MAX_SCANNED_BYTES` bounds the identifier harvest and `MAX_HASHED_BYTES` the
+    // digest, but a diff is parsed whole however large it is. Measured on one checkout
+    // re-emitting a bindings file, every exported name changing, per `pidmesh sync`:
+    //
+    //   exports    8 000   16 000   32 000   64 000
+    //   Vec         165ms    381ms   1 505ms  7 124ms
+    //   set          47ms     66ms      91ms    122ms
+    //
+    // Four times the input for sixteen times the work is the signature; the set makes it linear.
+    let added: BTreeSet<String> = added.into_iter().collect();
     removed.retain(|(symbol, _)| !added.contains(symbol));
     if desynced {
         // No regions at all means every contested path is treated as overlapping, which is the
