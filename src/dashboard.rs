@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -490,7 +490,14 @@ async fn remember(
     if let Some(key) = request.key.as_deref() {
         validate_label("key", key)?;
     }
+    // The store bounds this too, but only as an `anyhow` refusal that `blocking` flattens into a
+    // 500. Bounding it here answers the same mistake the way the sibling lease checks do.
     let importance = request.importance.unwrap_or(0.5);
+    if !(0.0..=1.0).contains(&importance) {
+        return Err(ApiError::BadRequest(
+            "importance must be between 0 and 1".to_owned(),
+        ));
+    }
     let store = state.store.clone();
     let agent_id = Arc::clone(&state.agent_id);
     let value = blocking(move || {
@@ -911,8 +918,63 @@ fn validate_resources(resources: &[String]) -> Result<(), ApiError> {
     }
     for resource in resources {
         validate_label("resource", resource)?;
+        validate_resource_identity(resource)?;
     }
     Ok(())
+}
+
+/// Hold a resource identifier to the `kind:key` grammar the store parses.
+///
+/// The store refuses anything else, but it refuses through `anyhow`, and `blocking` can only
+/// report that as the 500 reserved for a dashboard that is itself broken. A caller who writes
+/// `src` instead of `path:src` then sees "dashboard operation failed" and has nothing to act on.
+/// Checking the same grammar at the edge keeps the caller's mistake a 400 and leaves 500 meaning
+/// what it says. The rules below mirror `store::normalize_resources`; a request that passes here
+/// and is still refused there is a drift between the two and stays a 500 on purpose.
+fn validate_resource_identity(resource: &str) -> Result<(), ApiError> {
+    let reject = |reason: &str| Err(ApiError::BadRequest(reason.to_owned()));
+    let Some((kind, key)) = resource.split_once(':') else {
+        return reject("resource must use kind:key syntax");
+    };
+    if kind.is_empty()
+        || kind.len() > 32
+        || !kind.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+    {
+        return reject("resource kind must be lowercase alphanumeric, '-' or '_'");
+    }
+    if kind != "path" {
+        let key = key.trim();
+        if key.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
+            return reject("resource key must contain between 1 and 512 printable bytes");
+        }
+        return Ok(());
+    }
+    if key.is_empty() || key.len() > 512 {
+        return reject("path resource must contain between 1 and 512 bytes");
+    }
+    let mut named = false;
+    for component in std::path::Path::new(key).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => match part.to_str() {
+                None => return reject("path resource must be valid UTF-8"),
+                Some(part) if part.chars().any(char::is_control) => {
+                    return reject("path resource must not contain control characters");
+                }
+                Some(_) => named = true,
+            },
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return reject("path resource must be relative and must not contain '..'");
+            }
+        }
+    }
+    if named {
+        Ok(())
+    } else {
+        reject("path resource must identify a workspace-relative path")
+    }
 }
 
 async fn blocking<T>(operation: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T, ApiError>
