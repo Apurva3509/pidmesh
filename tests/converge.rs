@@ -1679,30 +1679,7 @@ fn unusual_filenames_are_still_scanned() -> Result<()> {
 fn an_unchanged_sweep_writes_no_events() -> Result<()> {
     let fleet = Fleet::new()?;
     let (alpha, alpha_tree) = fleet.agent("alpha")?;
-    let (bravo, bravo_tree) = fleet.agent("bravo")?;/// What the local dashboard has to be able to say without the operator opening a terminal.
-///
-/// A watcher holds no footprint of its own, so the snapshot must report the whole workspace,
-/// rank it by severity, and name both sides of a symbol break rather than an opaque session id.
-#[test]
-fn the_dashboard_snapshot_carries_workspace_convergence() -> Result<()> {
-    let fleet = Fleet::new()?;
-    std::fs::write(
-        fleet.repository.join("src/api.rs"),
-        "pub fn compute_total() -> u32 {\n    7\n}\n",
-    )?;
-    std::fs::write(fleet.repository.join("src/caller.rs"), "fn unused() {}\n")?;
-    std::fs::write(
-        fleet.repository.join("src/duplicate.rs"),
-        "fn duplicate() {}\n",
-    )?;
-    git(&fleet.repository, &["add", "-A"])?;
-    git(&fleet.repository, &["commit", "-m", "api"])?;
-
-    let (alpha, alpha_tree) = fleet.agent("alpha")?;
     let (bravo, bravo_tree) = fleet.agent("bravo")?;
-
-    // A real conflict on one path, duplicated effort on another, and a merge that is textually
-    // clean and still broken.
     std::fs::write(
         alpha_tree.join("src/shared.rs"),
         "fn shared() { /* a */ }\n",
@@ -1746,7 +1723,43 @@ fn the_dashboard_snapshot_carries_workspace_convergence() -> Result<()> {
         report["published"], 1,
         "only the agent that moved: {report}"
     );
-    assert!(count(&fleet)? > settled, "a real change is still announced");    std::fs::write(
+    assert!(count(&fleet)? > settled, "a real change is still announced");
+    Ok(())
+}
+
+/// What the local dashboard has to be able to say without the operator opening a terminal.
+///
+/// A watcher holds no footprint of its own, so the snapshot must report the whole workspace,
+/// rank it by severity, and name both sides of a symbol break rather than an opaque session id.
+#[test]
+fn the_dashboard_snapshot_carries_workspace_convergence() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn compute_total() -> u32 {\n    7\n}\n",
+    )?;
+    std::fs::write(fleet.repository.join("src/caller.rs"), "fn unused() {}\n")?;
+    std::fs::write(
+        fleet.repository.join("src/duplicate.rs"),
+        "fn duplicate() {}\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // A real conflict on one path, duplicated effort on another, and a merge that is textually
+    // clean and still broken.
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+    std::fs::write(
         alpha_tree.join("src/duplicate.rs"),
         "fn duplicate() { same() }\n",
     )?;

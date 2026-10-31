@@ -1575,7 +1575,7 @@ mod tests {
         );
 
         let (report, closed) = reclaim_worktrees(&repository, &root, &runs)?;
-        assert!(closed.is_empty());
+        assert_eq!(closed, Vec::<String>::new(), "no run was decided");
         assert!(report["reclaimed"].as_array().is_some_and(Vec::is_empty));
         assert!(worktree.is_dir());
         Ok(())
