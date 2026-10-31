@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::VERSION;
 use crate::ide::{ApproveRequest, IdeManager, LaunchRequest, TerminalAttachment};
-use crate::store::MeshStore;
+use crate::store::{MeshStore, Refusal, RefusalKind};
 
 const DASHBOARD_HTML: &str = include_str!("../dashboard/index.html");
 const DASHBOARD_CSS: &str = include_str!("../dashboard/dashboard.css");
@@ -49,8 +49,35 @@ enum ApiError {
     Conflict(String),
     Forbidden(&'static str),
     Internal,
+    /// Something the request named does not exist — as opposed to `NotFound`, which is the
+    /// router saying the endpoint itself does not.
+    Missing(String),
     NotFound,
     Unauthorized,
+}
+
+impl ApiError {
+    /// Classify a store failure.
+    ///
+    /// The store answers through `anyhow`, and flattening all of that into a 500 was the whole
+    /// defect: naming an agent that has exited is an ordinary thing for a caller to do, and it
+    /// came back indistinguishable from a broken server. The store now says which it is with a
+    /// type, so this reads the type — never the text, which is fragile and is how database
+    /// detail would creep into a reply.
+    ///
+    /// A fault keeps saying nothing at all. Note that the reason carried back is
+    /// `Refusal::reason`, not the `anyhow` chain the refusal arrived in: the chain can pick up
+    /// context on the way out, and only that one string is known to have been written by the
+    /// store rather than by sqlite.
+    fn from_store(error: &anyhow::Error) -> Self {
+        let Some(refusal) = Refusal::of(error) else {
+            return Self::Internal;
+        };
+        match refusal.kind() {
+            RefusalKind::Invalid => Self::BadRequest(refusal.reason().to_owned()),
+            RefusalKind::Missing => Self::Missing(refusal.reason().to_owned()),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -63,6 +90,7 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "dashboard operation failed".to_owned(),
             ),
+            Self::Missing(what) => (StatusCode::NOT_FOUND, what),
             Self::NotFound => (StatusCode::NOT_FOUND, "no such endpoint".to_owned()),
             Self::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
@@ -490,8 +518,9 @@ async fn remember(
     if let Some(key) = request.key.as_deref() {
         validate_label("key", key)?;
     }
-    // The store bounds this too, but only as an `anyhow` refusal that `blocking` flattens into a
-    // 500. Bounding it here answers the same mistake the way the sibling lease checks do.
+    // The store bounds this too, and now refuses it in a way `blocking` answers with the same
+    // 400. Bounding it here keeps the wording the sibling lease checks use, and keeps a number
+    // that was never going to be stored off the blocking pool.
     let importance = request.importance.unwrap_or(0.5);
     if !(0.0..=1.0).contains(&importance) {
         return Err(ApiError::BadRequest(
@@ -925,12 +954,12 @@ fn validate_resources(resources: &[String]) -> Result<(), ApiError> {
 
 /// Hold a resource identifier to the `kind:key` grammar the store parses.
 ///
-/// The store refuses anything else, but it refuses through `anyhow`, and `blocking` can only
-/// report that as the 500 reserved for a dashboard that is itself broken. A caller who writes
-/// `src` instead of `path:src` then sees "dashboard operation failed" and has nothing to act on.
-/// Checking the same grammar at the edge keeps the caller's mistake a 400 and leaves 500 meaning
-/// what it says. The rules below mirror `store::normalize_resources`; a request that passes here
-/// and is still refused there is a drift between the two and stays a 500 on purpose.
+/// The store refuses anything else as an invalid argument, which `blocking` now answers with a
+/// 400 of its own, so this is no longer the only thing standing between a caller who wrote `src`
+/// instead of `path:src` and "dashboard operation failed". It stays because it answers at the
+/// edge, in this file's wording, without occupying a blocking worker. The rules below mirror
+/// `store::normalize_resources`; a request that passes here and is still refused there is a
+/// drift between the two, and now surfaces as a 400 in the store's wording rather than a 500.
 fn validate_resource_identity(resource: &str) -> Result<(), ApiError> {
     let reject = |reason: &str| Err(ApiError::BadRequest(reason.to_owned()));
     let Some((kind, key)) = resource.split_once(':') else {
@@ -984,7 +1013,7 @@ where
     task::spawn_blocking(operation)
         .await
         .map_err(|_| ApiError::Internal)?
-        .map_err(|_| ApiError::Internal)
+        .map_err(|error| ApiError::from_store(&error))
 }
 
 async fn ide_blocking<T>(

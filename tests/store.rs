@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use pidmesh::store::MeshStore;
+use pidmesh::store::{MeshStore, Refusal, RefusalKind};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -253,6 +253,80 @@ fn messages_have_independent_receipts() -> Result<()> {
             .context("observer inbox")?
             .len(),
         1
+    );
+    Ok(())
+}
+
+/// The store says which failures are the caller's, so a transport does not have to guess.
+///
+/// Flattening every store error into one class is what made `POST /api/v1/messages` answer a
+/// typo with a 500. The classification lives here, in a type, because the alternative is a
+/// transport matching on the text of a message — which breaks the first time the wording moves,
+/// and quietly starts forwarding sqlite's wording the first time it does not break.
+///
+/// The last case is the one that matters most: a genuine sqlite failure must *not* be a refusal,
+/// or everything above becomes a way to describe the database to whoever is asking.
+#[test]
+fn the_store_tells_a_caller_s_mistake_apart_from_a_fault() -> Result<()> {
+    let (directory, store) = setup()?;
+    let agent = register(&store, "classifier", directory.path())?;
+
+    // Something that is not there. The caller named it, so the name comes back with it.
+    let error = store
+        .send(&agent, "hello", "no-such-agent", None)
+        .expect_err("sending to an agent that is not running must fail");
+    let refusal = Refusal::of(&error).context("an unknown recipient must be a refusal")?;
+    assert_eq!(refusal.kind(), RefusalKind::Missing, "{error:#}");
+    assert!(refusal.reason().contains("no-such-agent"), "{error:#}");
+
+    // Arguments the store will not take, from three different call paths.
+    for error in [
+        store
+            .remember(&agent, "text", "note", None, 2.0)
+            .expect_err("an importance outside 0..=1 must fail"),
+        store
+            .claim(&agent, "task", u64::MAX, None)
+            .expect_err("a lease that cannot be represented must fail"),
+        store
+            .reserve_resources(&agent, &["src".to_owned()], None, None, 60)
+            .expect_err("a resource with no kind must fail"),
+        store
+            .reserve_resources(&agent, &["path:../escape".to_owned()], None, None, 60)
+            .expect_err("a path resource that climbs out must fail"),
+        store
+            .dashboard_snapshot(directory.path(), 0)
+            .expect_err("a limit outside 1..=500 must fail"),
+    ] {
+        let refusal = Refusal::of(&error).with_context(|| format!("not a refusal: {error:#}"))?;
+        assert_eq!(refusal.kind(), RefusalKind::Invalid, "{error:#}");
+    }
+
+    // A refusal survives `anyhow` context, so a caller that adds its own does not lose the class.
+    let error = store
+        .send(&agent, "hello", "no-such-agent", None)
+        .context("while delivering a message")
+        .expect_err("still a failure");
+    assert_eq!(
+        Refusal::of(&error).map(Refusal::kind),
+        Some(RefusalKind::Missing)
+    );
+    // ... and the reason stays the store's own sentence rather than the decorated chain.
+    assert_eq!(
+        Refusal::of(&error).map(Refusal::reason),
+        Some("active recipient not found: no-such-agent")
+    );
+
+    // And a real sqlite failure is not a refusal, whatever it says.
+    let connection = rusqlite::Connection::open(directory.path().join("mesh.db"))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.execute_batch("ALTER TABLE messages RENAME TO messages_taken_away")?;
+    drop(connection);
+    let error = store
+        .send(&agent, "hello", "*", None)
+        .expect_err("the messages table is gone");
+    assert!(
+        Refusal::of(&error).is_none(),
+        "a database failure must not be reported as the caller's mistake: {error:#}"
     );
     Ok(())
 }
