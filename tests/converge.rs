@@ -187,7 +187,12 @@ fn work_on_separate_paths_never_collides() -> Result<()> {
     let report = fleet.sync(&bravo, &bravo_tree)?;
 
     assert_eq!(report["collision_count"], 0);
-    assert!(fleet.collisions(&alpha)?.is_empty());
+    let collisions = fleet.collisions(&alpha)?;
+    assert_eq!(
+        collisions.len(),
+        0,
+        "expected no contention, got {collisions:?}"
+    );
     Ok(())
 }
 
@@ -247,7 +252,12 @@ fn a_footprint_is_authoritative_so_abandoned_work_clears_its_collision() -> Resu
     git(&alpha_tree, &["checkout", "--", "src/shared.rs"])?;
     fleet.sync(&alpha, &alpha_tree)?;
 
-    assert!(fleet.collisions(&alpha)?.is_empty());
+    let collisions = fleet.collisions(&alpha)?;
+    assert_eq!(
+        collisions.len(),
+        0,
+        "expected no contention, got {collisions:?}"
+    );
     let cleared = fleet.store.events(&alpha, 0, 500)?;
     let cleared = cleared
         .as_array()
@@ -903,7 +913,12 @@ fn withdrawing_a_footprint_clears_contention_without_a_scan() -> Result<()> {
     // An agent shutting down cannot always produce a scan, so withdrawal is explicit.
     let released = fleet.store.release_footprint(&alpha)?;
     assert_eq!(released["released"], 1);
-    assert!(fleet.collisions(&bravo)?.is_empty());
+    let collisions = fleet.collisions(&bravo)?;
+    assert_eq!(
+        collisions.len(),
+        0,
+        "expected no contention, got {collisions:?}"
+    );
 
     let cleared = fleet.store.events(&bravo, 0, 500)?;
     let cleared = cleared
@@ -990,7 +1005,12 @@ fn a_worktree_removed_after_its_agent_died_stops_contesting() -> Result<()> {
     )?;
     let swept = fleet.store.collect_stale(Duration::from_secs(0))?;
     assert_eq!(swept["abandoned_footprints"], 1, "{swept}");
-    assert!(fleet.collisions(&bravo)?.is_empty());
+    let collisions = fleet.collisions(&bravo)?;
+    assert_eq!(
+        collisions.len(),
+        0,
+        "expected no contention, got {collisions:?}"
+    );
 
     // Anything parked on `wait` has to learn the collision ended.
     let events = fleet.store.events(&bravo, 0, 500)?;
