@@ -935,6 +935,122 @@ fn merge_readiness_tracks_observation_and_the_moving_base() -> Result<()> {
     Ok(())
 }
 
+/// A managed agent observes the worktree it was started in, not the mesh root it was pointed at.
+///
+/// `src/ide.rs` spawns a provider with `cwd` set to the agent's own worktree and
+/// `PIDMESH_WORKSPACE` set to the primary repository, because those are two different things:
+/// the mesh every agent shares, and the checkout this one is editing. The MCP server used to
+/// read both out of `PIDMESH_WORKSPACE`, so a managed agent published a footprint describing the
+/// repository it was not touching — silently, and in the unsafe direction.
+///
+/// This is asserted on the branch and the path count first: before the fix the scan ran in the
+/// repository, which is on `main` and clean, so the agent reported a perfectly healthy footprint
+/// for the wrong directory.
+#[test]
+fn a_managed_agent_publishes_its_own_worktree_not_the_mesh_root() -> Result<()> {
+    let workspace = Workspace::repository()?;
+    let tree = workspace.worktree("managed")?;
+    rewrite_line(&tree.join("shared.txt"), 4, "managed rewrote this")?;
+
+    // Exactly the pairing src/ide.rs, `pidmesh swarm`, and `pidmesh run` spawn an agent with.
+    let mut managed = Session::start("managed", &workspace.database, &tree, Some(&workspace.root))?;
+
+    let published = managed.ok("sync_footprint", json!({}))?;
+    assert_eq!(
+        published["branch"],
+        json!("feat/managed"),
+        "the footprint must describe the worktree the agent is editing: {published}"
+    );
+    assert_eq!(
+        published["paths"],
+        json!(1),
+        "the one edited path has to be published, not the mesh root's empty diff: {published}"
+    );
+    assert_eq!(
+        published["checkout_path"],
+        json!(tree.to_string_lossy()),
+        "sync_footprint names the checkout it observed: {published}"
+    );
+
+    // Registration records the same checkout, because `pidmesh watch` rescans agents from that
+    // column without ever asking the agent again.
+    let status = managed.ok("mesh_status", json!({}))?;
+    let agent = status["agents"]
+        .as_array()
+        .context("mesh_status returned no agent list")?
+        .iter()
+        .find(|agent| agent["name"] == json!("managed"))
+        .context("the managed agent is not in its own roster")?;
+    assert_eq!(
+        agent["checkout_path"],
+        json!(tree.to_string_lossy()),
+        "the registered checkout is the worktree, not the repository: {agent}"
+    );
+    assert_eq!(agent["git_branch"], json!("feat/managed"), "{agent}");
+
+    // The mesh root is still the repository: that is what groups agents into one mesh.
+    assert_eq!(
+        status["workspace"],
+        json!(workspace.root.to_string_lossy()),
+        "the mesh root stays the repository every agent shares: {status}"
+    );
+
+    managed.shut_down()?;
+    Ok(())
+}
+
+/// Two managed agents editing one file in separate worktrees must collide.
+///
+/// This is the user-visible consequence of the bug above, and the worst failure this product
+/// has: before the fix both agents scanned the same clean repository, so each published an empty
+/// footprint, `collisions` reported nothing, and `mergeable` cleared a merge that would have
+/// overwritten the other agent's work.
+#[test]
+fn two_managed_agents_editing_one_file_collide() -> Result<()> {
+    let workspace = Workspace::repository()?;
+    let alpha_tree = workspace.worktree("alpha")?;
+    let beta_tree = workspace.worktree("beta")?;
+    rewrite_line(&alpha_tree.join("shared.txt"), 5, "alpha rewrote this")?;
+    rewrite_line(&beta_tree.join("shared.txt"), 5, "beta rewrote this")?;
+
+    let mut alpha = Session::start(
+        "alpha",
+        &workspace.database,
+        &alpha_tree,
+        Some(&workspace.root),
+    )?;
+    let mut beta = Session::start(
+        "beta",
+        &workspace.database,
+        &beta_tree,
+        Some(&workspace.root),
+    )?;
+
+    alpha.ok("sync_footprint", json!({}))?;
+    let published = beta.ok("sync_footprint", json!({}))?;
+    assert_eq!(
+        published["collision_count"],
+        json!(1),
+        "two managed agents rewriting one region must contest it: {published}"
+    );
+
+    let report = alpha.ok("collisions", json!({}))?;
+    let shared = contested(&report["collisions"], "shared.txt")
+        .context("shared.txt is contested and must be reported")?;
+    assert_eq!(shared["severity"], json!("divergent"), "{shared}");
+
+    let readiness = alpha.ok("mergeable", json!({}))?;
+    assert_eq!(
+        readiness["mergeable"],
+        json!(false),
+        "clearing this merge is the false safe the mesh exists to prevent: {readiness}"
+    );
+
+    beta.shut_down()?;
+    alpha.shut_down()?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // 3. Error behaviour
 // ---------------------------------------------------------------------------------------------

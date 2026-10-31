@@ -674,7 +674,11 @@ fn spawn_provider(
     command.env("PIDMESH_PROVIDER", &request.provider);
     command.env("PIDMESH_WORKSTREAM", &request.workstream);
     command.env("PIDMESH_DB", database);
+    // Two different things, and they were read out of one variable until #37. The mesh root is
+    // the repository every managed agent shares — it is what groups them into one mesh. The
+    // checkout is this agent's own worktree, which is what its footprint has to describe.
     command.env("PIDMESH_WORKSPACE", repository);
+    command.env("PIDMESH_CHECKOUT", worktree);
     let mut child = pair
         .slave
         .spawn_command(command)
