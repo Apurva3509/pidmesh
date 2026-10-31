@@ -135,6 +135,21 @@ pidmesh quickstart
 It prints the three commands that take a fresh checkout to a guarded merge — join, watch, gate —
 and what each one buys you.
 
+Step one is `pidmesh join --name planner --provider codex --pid $$`, and the `--pid $$` is load
+bearing. An agent is tied to a real process: a sweep skips any checkout whose process is gone, so
+whichever process `join` records has to be the one that keeps working there. Left to itself `join`
+records the process that ran it, which at a prompt is your shell and is right. Capture the agent id
+the obvious way —
+
+```bash
+A=$(pidmesh join --name alpha --json | jq -r .agent_id)
+```
+
+— and that process is the subshell, which exits as the substitution closes. `$$` is the shell you
+are typing in, and stays that shell inside a script or a `$(...)` capture, so it is correct
+wherever `join` is run from. `join` refuses a `--pid` that is not a running process, and says so on
+stderr when it had to guess one.
+
 Every command prints prose at a terminal and JSON everywhere else, so a person reads sentences
 while a pipe, a redirect or an agent still gets the object it parses. `--json` forces JSON. Colour
 is opt-out through `NO_COLOR`, and each report ends with the command that answers the question it

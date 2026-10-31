@@ -180,6 +180,7 @@ pub struct MeshStore {
 struct AgentRow {
     workspace_id: String,
     started_at: i64,
+    pid: u32,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -212,6 +213,15 @@ impl MeshStore {
                 restrict_directory(parent)?;
             }
         }
+        // SQLite decides at open whether a connection is writable and never revisits it, so a
+        // database file left read-only has to be normalised *before* the handle exists. Doing it
+        // afterwards produced two different answers from one file: the first command failed with
+        // "not writable" while the chmod it had just performed made the second one succeed, so
+        // `status` reported a broken mesh and `join` against the same path printed an agent id.
+        //
+        // Best effort on purpose. The authoritative attempt, with the error message a person
+        // needs, is restrict_permissions() below; this one only has to be early.
+        drop(normalize_mode(&path));
         let connection = Self::open_connection(&path)?;
         let store = Self {
             path: path.clone(),
@@ -220,9 +230,9 @@ impl MeshStore {
         // Before initialize(), because the first write creates the -wal and -shm sidecars and
         // they inherit the mode of the moment, not a later chmod of the main file.
         //
-        // Both steps are mapped through the same description as the open: a read-only database
-        // file gets this far and then fails here, and "attempt to write a readonly database"
-        // on its own names neither the file nor anything to do about it.
+        // Both steps are mapped through the same description as the open: a database that still
+        // cannot be written gets this far and then fails here, and "attempt to write a readonly
+        // database" on its own names neither the file nor anything to do about it.
         store
             .restrict_permissions()
             .and_then(|()| store.initialize())
@@ -1435,12 +1445,17 @@ impl MeshStore {
                 )?;
             }
 
+            // Who the footprint belongs to, and whether anything can still observe them. A
+            // footprint published for an agent whose process is gone is written, kept, and then
+            // skipped by every sweep, so the caller has to be able to tell that from success.
             Ok(json!({
                 "agent_id": agent_id,
                 "base_ref": scan.base_ref,
                 "base_commit": scan.base_commit,
                 "branch": scan.branch,
                 "paths": scan.entries.len(),
+                "pid": agent.pid,
+                "pid_alive": process_is_alive(agent.pid),
                 "collisions": collision_report(&contested, agent_id),
                 "collision_count": contested.len()
             }))
@@ -1858,12 +1873,13 @@ impl MeshStore {
     fn agent_row(connection: &Connection, agent_id: &str) -> Result<AgentRow> {
         connection
             .query_row(
-                "SELECT workspace_id, started_at FROM agents WHERE id = ?",
+                "SELECT workspace_id, started_at, pid FROM agents WHERE id = ?",
                 [agent_id],
                 |row| {
                     Ok(AgentRow {
                         workspace_id: row.get(0)?,
                         started_at: row.get(1)?,
+                        pid: row.get(2)?,
                     })
                 },
             )
@@ -1901,10 +1917,7 @@ impl MeshStore {
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
         // The write-ahead log and shared-memory file hold the same contents as the database and
         // are created by SQLite with the process umask, so they need the same restriction.
-        for suffix in ["-wal", "-shm"] {
-            let mut sidecar = self.path.clone().into_os_string();
-            sidecar.push(suffix);
-            let sidecar = PathBuf::from(sidecar);
+        for sidecar in sidecars_of(&self.path) {
             if sidecar.exists() {
                 fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))?;
             }
@@ -1916,6 +1929,37 @@ impl MeshStore {
     fn restrict_permissions(&self) -> Result<()> {
         Ok(())
     }
+}
+
+/// The write-ahead log and shared-memory files SQLite keeps beside a database.
+#[cfg(unix)]
+fn sidecars_of(path: &Path) -> impl Iterator<Item = PathBuf> {
+    ["-wal", "-shm"].into_iter().map(|suffix| {
+        let mut sidecar = path.to_path_buf().into_os_string();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    })
+}
+
+/// Put the mesh file and its sidecars into the mode pidmesh keeps them in, if they exist yet.
+///
+/// Run before the connection is opened as well as after, because a read-only mode has to be
+/// cleared while SQLite can still act on it. Files that are not there are skipped rather than
+/// reported: on a first run none of them exist, and that is the ordinary case.
+#[cfg(unix)]
+fn normalize_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    for file in std::iter::once(path.to_path_buf()).chain(sidecars_of(path)) {
+        if file.exists() {
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn normalize_mode(_: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn default_database_path() -> Result<PathBuf> {
@@ -2156,7 +2200,7 @@ fn unwatched_warning(unwatched: &[String]) -> Value {
         "detail": format!(
             "{} of this repository {} no agent registered with pidmesh, so nothing observes \
              what {} change and no collision involving {} can be reported. Run `pidmesh join \
-             --name <agent>` inside each one, or start it with `pidmesh run`.",
+             --name <agent> --pid $$` inside each one, or start it with `pidmesh run`.",
             if one {
                 "1 checkout".to_owned()
             } else {

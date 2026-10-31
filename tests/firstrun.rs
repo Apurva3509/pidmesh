@@ -463,3 +463,248 @@ fn a_worktree_nobody_is_watching_is_named_while_the_others_are_scanned() -> Resu
     );
     Ok(())
 }
+
+/// Capture the agent id the way the quickstart's output invites you to: in a subshell.
+///
+/// The shell that runs `join` here exits the moment the substitution closes, so the process
+/// `join` bound the agent to is dead by the time anything looks for it. This is the
+/// reproduction from issue #40, kept in the shape a person would actually type.
+fn join_through_a_subshell(directory: &Path, database: &Path, name: &str) -> Result<Output> {
+    let binary = env!("CARGO_BIN_EXE_pidmesh");
+    let script = format!(
+        r#"A=$("{binary}" join --name {name} --json | grep -o '"agent_id": "[^"]*"' | cut -d'"' -f4); printf '%s' "$A""#
+    );
+    Command::new("/bin/sh")
+        .current_dir(directory)
+        .env("PIDMESH_DB", database)
+        .env("NO_COLOR", "1")
+        .args(["-c", &script])
+        .output()
+        .context("failed to run the subshell reproduction")
+}
+
+#[test]
+fn join_refuses_a_pid_that_is_not_a_running_process() -> Result<()> {
+    // An agent bound to a process that is already gone is one nothing will ever observe:
+    // live_checkouts filters on a surviving pid, so the footprint is published and then
+    // skipped by every sweep. join used to answer this with a cheerful agent id.
+    let repository = repository()?;
+    let database = database_in(repository.path());
+    // Above every platform's pid ceiling, so it cannot name a live process and cannot be
+    // recycled into one while the test runs.
+    let output = run(
+        repository.path(),
+        &database,
+        &["join", "--name", "alpha", "--pid", "2147483646"],
+    )?;
+    assert!(
+        !output.status.success(),
+        "join registered a process that does not exist: {}",
+        stdout(&output)
+    );
+    let message = stderr(&output);
+    assert!(
+        message.contains("2147483646"),
+        "the refusal does not name the pid: {message}"
+    );
+    assert!(
+        message.contains("--pid"),
+        "the refusal does not say how to fix it: {message}"
+    );
+
+    // A refused join must also leave nothing behind, or the next sweep reports the very
+    // registration join said it would not make.
+    let report: Value =
+        serde_json::from_str(&stdout(&run(repository.path(), &database, &["status"])?))?;
+    assert_eq!(
+        report["agents"].as_array().map(Vec::len),
+        Some(0),
+        "a refused join still registered an agent: {report}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_explicitly_given_pid_is_taken_at_its_word() -> Result<()> {
+    // The counterpart that keeps the caution below worth reading: when the caller names the
+    // process, pidmesh has nothing to guess and must say nothing.
+    let repository = repository()?;
+    let database = database_in(repository.path());
+    let pid = std::process::id().to_string();
+    let output = run(
+        repository.path(),
+        &database,
+        &["join", "--name", "alpha", "--pid", &pid],
+    )?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: Value = serde_json::from_str(&stdout(&output))?;
+    assert_eq!(value["pid_source"], "given", "{value}");
+    assert!(
+        value["warnings"]
+            .as_array()
+            .context("join reports no warnings field")?
+            .is_empty(),
+        "an explicit pid was second-guessed: {value}"
+    );
+    assert!(
+        stderr(&output).is_empty(),
+        "an explicit pid printed a caution: {}",
+        stderr(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn joining_through_a_command_substitution_is_reported_while_it_is_happening() -> Result<()> {
+    // The failure this guards: both join and sync reported success, and the mistake only
+    // surfaced later as an empty sweep. join cannot detect it by liveness — the subshell is
+    // still running while join runs — so the honest answer is to say it had to guess, on
+    // stderr, which is the one stream command substitution does not swallow.
+    let repository = repository()?;
+    let database = database_in(repository.path());
+    let output = join_through_a_subshell(repository.path(), &database, "alpha")?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let agent = stdout(&output);
+    assert!(agent.starts_with("alpha-"), "no agent id captured: {agent}");
+
+    let caution = stderr(&output);
+    assert!(
+        caution.contains("--pid $$"),
+        "join never named the incantation that survives a subshell: {caution}"
+    );
+    assert!(
+        caution.contains("subshell"),
+        "join never said what it had guessed: {caution}"
+    );
+
+    // And the registration really is dead on arrival, which is what the caution is about.
+    let report: Value = serde_json::from_str(&stdout(&run(
+        repository.path(),
+        &database,
+        &["watch", "--once"],
+    )?))?;
+    assert_eq!(report["checkouts"], 0, "{report}");
+    assert_eq!(report["stale_agents"], 1, "{report}");
+    Ok(())
+}
+
+#[test]
+fn sync_does_not_report_plain_success_for_an_agent_with_no_live_process() -> Result<()> {
+    // Second half of the same reproduction. The footprint is real and collisions still read
+    // it, so sync publishes — but a watcher will never scan this checkout, and sync is the
+    // last command that can say so before the mistake goes quiet.
+    let repository = repository()?;
+    let database = database_in(repository.path());
+    let agent = stdout(&join_through_a_subshell(
+        repository.path(),
+        &database,
+        "alpha",
+    )?);
+    assert!(agent.starts_with("alpha-"), "no agent id captured: {agent}");
+
+    let output = run(repository.path(), &database, &["sync", "--agent", &agent])?;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output))?;
+    assert_eq!(
+        report["pid_alive"], false,
+        "sync does not report whether anything can observe this agent: {report}"
+    );
+    let warnings = report["warnings"]
+        .as_array()
+        .context("sync reports no warnings field")?;
+    assert!(
+        !warnings.is_empty(),
+        "sync reported plain success for an agent nothing will scan: {report}"
+    );
+    let caution = stderr(&output);
+    assert!(
+        caution.contains("watch"),
+        "the caution does not say what will not happen: {caution}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_mesh_file_does_not_answer_two_commands_differently() -> Result<()> {
+    // Observed during the first-run UX work and never chased: join returned an agent id
+    // while status against the same file failed. The cause was ordering, not permissions.
+    // MeshStore opened the connection before it normalised the file's mode, SQLite latched
+    // the handle read-only, the command failed — and the chmod it had just performed made
+    // the *next* command succeed. Same file, two answers, decided by which ran first.
+    use std::os::unix::fs::PermissionsExt;
+
+    let repository = repository()?;
+    let database = database_in(repository.path());
+    run(repository.path(), &database, &["init"])?;
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o444))?;
+
+    let first = run(repository.path(), &database, &["status"])?;
+    assert!(
+        first.status.success(),
+        "the first command against a read-only mesh failed: {}",
+        stderr(&first)
+    );
+    let second = run(
+        repository.path(),
+        &database,
+        &[
+            "join",
+            "--name",
+            "alpha",
+            "--pid",
+            &std::process::id().to_string(),
+        ],
+    )?;
+    assert!(
+        second.status.success(),
+        "the second command answered differently from the first: {}",
+        stderr(&second)
+    );
+    assert_eq!(
+        fs::metadata(&database)?.permissions().mode() & 0o777,
+        0o600,
+        "the mesh file was left readable by anyone"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mesh_that_cannot_be_made_writable_fails_the_same_way_every_time() -> Result<()> {
+    // The repair above must not swallow the real case: a database in a directory nobody can
+    // write cannot be fixed by a chmod, and every command has to say the same thing about it.
+    use std::os::unix::fs::PermissionsExt;
+
+    let repository = repository()?;
+    let enclosing = repository.path().join("mesh");
+    fs::create_dir(&enclosing)?;
+    let database = enclosing.join("mesh.db");
+    run(repository.path(), &database, &["init"])?;
+    fs::set_permissions(&enclosing, fs::Permissions::from_mode(0o555))?;
+    // A process that can write anyway is running as root, where these permissions mean
+    // nothing and the test would only assert something about the sandbox.
+    let unprivileged = fs::File::create(enclosing.join("probe")).is_err();
+
+    let outcomes: Vec<Output> = [&["status"][..], &["join", "--name", "alpha"][..]]
+        .iter()
+        .map(|arguments| run(repository.path(), &database, arguments))
+        .collect::<Result<_>>()?;
+    fs::set_permissions(&enclosing, fs::Permissions::from_mode(0o755))?;
+
+    if unprivileged {
+        for output in &outcomes {
+            assert!(
+                !output.status.success(),
+                "a mesh that cannot be written reported success: {}",
+                stdout(output)
+            );
+            assert!(
+                stderr(output).contains("not writable"),
+                "the failure does not name the problem: {}",
+                stderr(output)
+            );
+        }
+    }
+    Ok(())
+}

@@ -22,7 +22,7 @@ use pidmesh::ide::IdeManager;
 use pidmesh::render::{self, Shape};
 use pidmesh::store::{
     AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, checkout_directory, default_database_path,
-    diagnose, workspace_root,
+    diagnose, process_is_alive, workspace_root,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -475,17 +475,32 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
             provider,
             capabilities,
             workspace,
-        } => present(
-            Shape::Join,
-            &store.register_agent(
+        } => {
+            let given = pid;
+            let resolved = pid.unwrap_or_else(calling_pid);
+            // Nothing observes an agent whose process is gone: `live_checkouts` filters on a
+            // surviving pid, so the footprint would be published and then skipped by every
+            // sweep. Refusing costs nothing — the registration has no value — and it is the
+            // one moment the person can still fix the command they just typed.
+            if !process_is_alive(resolved) {
+                return Err(anyhow!(
+                    "pid {resolved} is not a running process, so no sweep would ever scan this \
+                     checkout. Pass --pid naming the process that keeps working here; `--pid $$` \
+                     is your shell, and stays your shell inside a script or a subshell."
+                ));
+            }
+            let mut registration = store.register_agent(
                 &name,
-                pid.unwrap_or_else(calling_pid),
+                resolved,
                 workspace.as_deref(),
                 &provider,
                 &capabilities,
                 None,
-            )?,
-        )?,
+            )?;
+            registration["pid_source"] = json!(if given.is_some() { "given" } else { "assumed" });
+            caution(&mut registration, assumed_pid_warning(given, resolved));
+            present(Shape::Join, &registration)?;
+        }
         Commands::Heartbeat { agent } => emit(&json!({
             "updated": store.heartbeat(&agent_id(agent.as_deref())?)?
         }))?,
@@ -585,10 +600,14 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
                 None => checkout_directory(None)?,
             };
             let scan = scan_worktree(&directory, base.as_deref())?;
-            present(
-                Shape::Sync,
-                &store.publish_footprint(&agent_id(agent.as_deref())?, &scan)?,
-            )?;
+            let mut published = store.publish_footprint(&agent_id(agent.as_deref())?, &scan)?;
+            // sync still publishes: the footprint is a real observation, `collisions` and
+            // `mergeable` read it whether or not the session survived, and refusing would
+            // delete a useful signal and break every `pidmesh sync && ...` chain. What it must
+            // not do is call that success without saying nothing will act on it.
+            let unobserved = unobserved_agent_warning(&published);
+            caution(&mut published, unobserved);
+            present(Shape::Sync, &published)?;
         }
         Commands::Collisions { agent } => {
             present(
@@ -791,10 +810,13 @@ fn quickstart_steps() -> Value {
             {
                 "step": 1,
                 "run_in": "every checkout, once",
-                "command": "pidmesh join --name planner --provider codex",
+                "command": "pidmesh join --name planner --provider codex --pid $$",
                 "why": "Registers the process and prints the agent id, along with the export \
                         line to paste. Set PIDMESH_AGENT_ID in that shell and every later \
-                        command knows who it speaks for."
+                        command knows who it speaks for. $$ is the shell you are typing in, and \
+                        stays that shell inside a script or a $(...) capture; without it join \
+                        binds the agent to whatever ran it, which in a subshell is gone by the \
+                        time anything looks."
             },
             {
                 "step": 2,
@@ -825,10 +847,14 @@ const QUICKSTART_PROSE: &str = "\
 PidMesh in three commands.
 
   1. Join — once per checkout
-       pidmesh join --name planner --provider codex
+       pidmesh join --name planner --provider codex --pid $$
 
      It prints the export line to paste. Set PIDMESH_AGENT_ID in that shell
      and every later command knows which agent it is speaking for.
+
+     $$ is the shell you are typing in, and stays that shell inside a script
+     or a $(...) capture. Leave it out and join binds the agent to whatever
+     ran it — in a subshell, a process that is gone before anything looks.
 
   2. Watch — once per repository
        pidmesh watch --once
@@ -1362,9 +1388,87 @@ const STALE_AFTER_SECONDS: u64 = 30;
 /// immediately: `watch` skips checkouts whose process is gone, and a fleet registered with a plain
 /// `pidmesh join` was reported as an empty, healthy workspace. The parent is the shell or agent
 /// that will actually keep working in the checkout.
+///
+/// It is still a guess, and one that is wrong in the case the quickstart's own output invites:
+/// inside `$(pidmesh join ...)` the parent is a subshell that exits with the substitution. That
+/// cannot be detected here — the subshell is alive for as long as this runs — so the guess is
+/// reported rather than trusted silently; see `assumed_pid_warning`.
 fn calling_pid() -> u32 {
     let parent = nix::unistd::getppid();
     u32::try_from(parent.as_raw()).unwrap_or_else(|_| std::process::id())
+}
+
+/// Record a caution on the report and put it where a captured stdout cannot hide it.
+///
+/// `warnings` is always present, empty or not, so an agent reading the JSON can rely on it
+/// instead of matching prose. The same text also goes to stderr, because the mistake this exists
+/// for is made inside `A=$(pidmesh join ...)`, which swallows stdout and leaves stderr on the
+/// terminal — a warning only in the JSON object would be read by nobody at the moment it matters.
+fn caution(report: &mut Value, warnings: Vec<Value>) {
+    for warning in &warnings {
+        if let Some(message) = warning["message"].as_str() {
+            warn_out(message);
+        }
+    }
+    report["warnings"] = Value::Array(warnings);
+}
+
+/// Print a caution on stderr, keeping the JSON-everywhere-but-a-terminal convention.
+fn warn_out(message: &str) {
+    use std::io::IsTerminal as _;
+    if FORCE_JSON.load(Ordering::Relaxed) || !std::io::stderr().is_terminal() {
+        eprintln!("{}", json!({"warning": message}));
+    } else {
+        eprintln!("warning: {message}");
+    }
+}
+
+/// What `join` says when it had to guess which process the agent is.
+///
+/// Without `--pid`, join binds the agent to its own parent. At a prompt that parent is the shell
+/// the person is typing in and the guess is right. Everywhere else — a pipeline, a wrapper
+/// script, and above all `A=$(pidmesh join ... | jq -r .agent_id)`, which is how join's own
+/// output invites you to capture the id — the parent is a subshell that exits the moment join
+/// returns, and the agent is registered dead on arrival.
+///
+/// Liveness cannot detect that: the subshell is still running while join runs, so the pid checks
+/// out and only a later sweep finds nothing to scan. What *is* observable is that join is not
+/// talking to a terminal, which is exactly the case where its parent may not be a shell that
+/// stays. So the caution is raised there and stays quiet at a prompt, where it would be noise.
+fn assumed_pid_warning(given: Option<u32>, resolved: u32) -> Vec<Value> {
+    if given.is_some() || render::is_interactive() {
+        return Vec::new();
+    }
+    vec![json!({
+        "code": "assumed_pid",
+        "pid": resolved,
+        "message": format!(
+            "no --pid was given, so this agent is bound to pid {resolved}, the process that ran \
+             pidmesh. If that was a subshell — `$(pidmesh join ...)` is the usual way to capture \
+             the agent id — it is already gone, and no sweep will ever scan this checkout. \
+             Re-join with --pid $$ to bind the agent to your shell instead."
+        )
+    })]
+}
+
+/// What `sync` says when the agent it published for has no process left.
+///
+/// Unlike join's guess this is a fact, so it is reported wherever sync is run from.
+fn unobserved_agent_warning(published: &Value) -> Vec<Value> {
+    if published["pid_alive"] != false {
+        return Vec::new();
+    }
+    let pid = published["pid"].as_u64().unwrap_or(0);
+    vec![json!({
+        "code": "no_live_process",
+        "pid": pid,
+        "message": format!(
+            "this footprint was published for an agent whose process (pid {pid}) is gone. \
+             `pidmesh watch` skips every checkout with no live process, so nothing will act on \
+             what was just recorded. Re-join from the shell that keeps working here, with \
+             --pid $$."
+        )
+    })]
 }
 
 fn agent_id(explicit: Option<&str>) -> Result<String> {
