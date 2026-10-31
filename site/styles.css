@@ -1945,6 +1945,16 @@ h2 em {
   font: inherit;
 }
 
+/* The sweep glosses each severity it printed, and those lines run wider than
+   this column at every width, so the pre is a sideways scroll container. A
+   scroll container has to be reachable from the keyboard, which means it also
+   has to show where the focus landed. Drawn inside the edge, because .terminal
+   clips to its radius and an offset ring would be cut off. */
+.terminal pre[tabindex]:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: -3px;
+}
+
 .prompt {
   color: var(--acid);
 }
@@ -2363,8 +2373,10 @@ h2 em {
   }
   /* Unlike the installer URL, this is aligned columnar output: wrapping it
      destroys the alignment that makes it readable. Hold the columns and
-     drop a point of type instead, which fits the widest line on a phone;
-     the pre is its own scroll container if a narrower one appears. */
+     drop a point of type instead, which fits every line the reader has to
+     line up — the glyphs, the paths, the severities and the symbol break.
+     The sweep's own gloss of each severity runs longer than any phone, so
+     the pre stays its own sideways scroll container for those four lines. */
   .terminal.convergence-terminal pre {
     font-size: 9px;
     overflow-wrap: normal;
