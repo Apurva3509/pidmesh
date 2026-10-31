@@ -9,6 +9,18 @@ repository = "https://github.com/Apurva3509/pidmesh"
 keywords = ["agents", "ai", "coordination", "mcp", "sqlite"]
 categories = ["command-line-utilities", "database"]
 
+# A deterministic stand-in for an agent provider (`claude`, `codex`), so the WebSocket terminal
+# in `src/ide.rs` can be tested without either one installed. It has to be a `[[bin]]` rather
+# than an example because only a bin gets a `CARGO_BIN_EXE_*` path that `cargo test` guarantees
+# is built: `cargo test --all-targets` compiles examples as test harnesses, which are not
+# runnable as the program itself. Its source lives under `tests/` so nothing but a test ever
+# reaches for it.
+[[bin]]
+name = "pidmesh-fake-provider"
+path = "tests/support/fake_provider.rs"
+doc = false
+test = false
+
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
