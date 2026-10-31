@@ -210,15 +210,22 @@ fn watch(value: &Value, palette: &Palette) -> String {
     let checkouts = value["checkouts"].as_u64().unwrap_or(0);
     let published = value["published"].as_u64().unwrap_or(0);
     let skipped = value["skipped"].as_array().map_or(0, Vec::len);
+    // "nothing changed" is the common answer for a watcher, and it should read like one rather
+    // than like a count of work performed.
+    let moved = if published == 0 {
+        "nothing changed".to_owned()
+    } else {
+        format!("{published} updated")
+    };
     let mut head = format!(
-        "{}{} scanned, {} published{}",
+        "{}{} scanned, {}{}",
         palette.dim,
         plural(
             usize::try_from(checkouts).unwrap_or(0),
             "checkout",
             "checkouts"
         ),
-        published,
+        moved,
         palette.reset
     );
     if skipped > 0 {
@@ -424,6 +431,25 @@ mod tests {
         );
         assert!(rendered.contains("No agents have joined"), "{rendered}");
         assert!(rendered.contains("pidmesh join"), "{rendered}");
+    }
+
+    #[test]
+    fn a_sweep_that_changed_nothing_says_so() {
+        let quiet = watch(
+            &json!({"checkouts": 48, "observed": 48, "published": 0, "skipped": [], "collisions": []}),
+            &plain(),
+        );
+        assert!(quiet.contains("nothing changed"), "{quiet}");
+        assert!(
+            !quiet.contains("48 updated"),
+            "submitting is not the same as writing: {quiet}"
+        );
+
+        let moved = watch(
+            &json!({"checkouts": 48, "observed": 48, "published": 3, "skipped": [], "collisions": []}),
+            &plain(),
+        );
+        assert!(moved.contains("3 updated"), "{moved}");
     }
 
     #[test]

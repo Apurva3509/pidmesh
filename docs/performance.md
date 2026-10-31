@@ -1,5 +1,25 @@
 # Convergence performance
 
+## Update: the first-sweep penalty no longer reproduces
+
+The measurement below recorded a first sweep costing 2.5–4x a steady one. Re-measured after the
+batching, git-resolution and idle-write work, at 48 checkouts of a 2,400-file repository:
+
+| sweep | |
+| --- | ---: |
+| first | 0.332 s |
+| second | 0.280 s |
+| third | 0.281 s |
+| fourth | 0.266 s |
+
+About 1.2x, which is cold cache rather than anything structural. The earlier figure was taken
+when a sweep wrote every footprint on every tick and resolved git through the macOS shim; both of
+those are gone.
+
+Re-measuring it did surface a reporting fault: a sweep counted the batch it submitted rather than
+what the store wrote, so a tick that changed nothing reported forty-eight checkouts published.
+`watch` now reports what actually moved.
+
 ## Update: the shim is now bypassed automatically
 
 The measurement below identified `/usr/bin/git` on macOS as the largest free lever. It is no
