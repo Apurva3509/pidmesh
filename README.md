@@ -471,6 +471,14 @@ never mistaken for a safe one. A sweep that can see nothing at all — no reposi
 registrations — says that rather than reporting a clean mesh, and `workspace_problem` carries the
 reason for anything parsing the JSON.
 
+There is a fourth way to see nothing, and it is the quietest: agents *are* registered, the sweep
+*did* run, and every single scan failed. `observation` says which case you are in — `complete`,
+`partial`, `blind`, or `idle` when there was nothing to scan. A blind sweep reports the collisions
+it last knew rather than an empty list, because those footprints are still recorded and still true
+as of `last_observed_at`; what it will not do is print the all-clear, since nothing confirmed it.
+`observed` counts sessions and `observed_checkouts` counts checkouts, which differ whenever two
+agents share one worktree.
+
 `pidmesh unsync` withdraws a footprint explicitly, for an agent that is shutting down and can no
 longer produce a scan. Garbage collection keeps a dead agent's footprint while its checkout still
 exists, because PidMesh preserves worktrees and that uncommitted work genuinely still contests the
