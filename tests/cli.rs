@@ -181,3 +181,35 @@ fn a_closed_pipe_is_not_a_crash() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn the_quickstart_hands_out_a_join_that_survives_a_subshell() -> Result<()> {
+    // Step one used to read `pidmesh join --name planner --provider codex`, and step one's
+    // own output invites you to capture the id it prints. Done the obvious way — in a
+    // command substitution — that binds the agent to a subshell that exits immediately, and
+    // nothing ever scans the checkout. `$$` is the invoking shell in every POSIX shell, even
+    // inside `$(...)`, so it is the one pid that is right wherever join is run from.
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("mesh.db");
+    let value: Value = serde_json::from_str(&stdout(&run(&database, &["quickstart"])?)?)?;
+    let join = value["steps"]
+        .as_array()
+        .context("the quickstart has no steps")?
+        .iter()
+        .find(|step| {
+            step["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("join"))
+        })
+        .context("the quickstart never mentions join")?;
+    let command = join["command"].as_str().unwrap_or_default();
+    assert!(
+        command.contains("--pid $$"),
+        "the quickstart still hands out a join that dies in a subshell: {command}"
+    );
+    assert!(
+        join["why"].as_str().is_some_and(|why| why.contains("$$")),
+        "nothing explains why the pid is there: {join}"
+    );
+    Ok(())
+}
