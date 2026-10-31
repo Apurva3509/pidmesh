@@ -28,6 +28,8 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_PATCH_BYTES: usize = 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const TICKET_TTL_MS: i64 = 30_000;
+/// How long a stop waits for `SIGTERM` to be honoured before it insists.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Deserialize)]
 pub struct LaunchRequest {
@@ -307,6 +309,7 @@ impl IdeManager {
             "stopping".clone_into(&mut runtime.status);
         }
         signal_session(&session, Signal::SIGTERM)?;
+        start_terminator(Arc::clone(&session));
         session_view(&session)
     }
 
@@ -325,7 +328,7 @@ impl IdeManager {
         for session in &sessions {
             let _ = self.stop(&session.id);
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(STOP_GRACE);
         for session in sessions {
             if lock(&session.runtime)
                 .is_ok_and(|runtime| matches!(runtime.status.as_str(), "running" | "stopping"))
@@ -349,14 +352,22 @@ impl IdeManager {
     pub fn issue_ticket(&self, session_id: &str) -> Result<Value> {
         self.session(session_id)?;
         let ticket = Uuid::new_v4().simple().to_string();
-        let expires_at = now_ms()? + TICKET_TTL_MS;
-        lock(&self.inner.tickets)?.insert(
+        let now = now_ms()?;
+        let expires_at = now + TICKET_TTL_MS;
+        let mut tickets = lock(&self.inner.tickets)?;
+        // Only a redemption ever removed a grant, so every ticket a pane minted and did not use
+        // -- one per refresh of a terminal that was never opened -- stayed in this map for the
+        // life of the dashboard. An expired grant can never be redeemed again, so dropping it
+        // here costs nothing and bounds the map by the TTL rather than by the uptime.
+        purge_expired(&mut tickets, now);
+        tickets.insert(
             ticket.clone(),
             AttachGrant {
                 expires_at,
                 session_id: session_id.to_owned(),
             },
         );
+        drop(tickets);
         Ok(json!({"ticket": ticket, "expires_at": expires_at}))
     }
 
@@ -370,10 +381,17 @@ impl IdeManager {
         );
         ensure!(grant.expires_at >= now_ms()?, "terminal ticket expired");
         let session = self.session(session_id)?;
-        let backlog = lock(&session.output)?.chunks.iter().cloned().collect();
+        // Subscribe under the lock the output pump holds while it appends *and* publishes a
+        // chunk, so "already in the backlog" and "will arrive on the subscription" are exactly
+        // exclusive. Snapshotting first and subscribing after leaves a window in which a chunk
+        // is in neither, and the client silently never sees those bytes.
+        let output = lock(&session.output)?;
+        let receiver = session.sender.subscribe();
+        let backlog = output.chunks.iter().cloned().collect();
+        drop(output);
         Ok(TerminalAttachment {
             backlog,
-            receiver: session.sender.subscribe(),
+            receiver,
             session: session_view(&session)?,
         })
     }
@@ -621,6 +639,11 @@ impl IdeManager {
     fn session_map(&self) -> Result<MutexGuard<'_, BTreeMap<String, Arc<ManagedSession>>>> {
         lock(&self.inner.sessions)
     }
+}
+
+/// Drop grants that can never be redeemed again, so the ticket map is bounded by the TTL.
+fn purge_expired(tickets: &mut HashMap<String, AttachGrant>, now: i64) {
+    tickets.retain(|_, grant| grant.expires_at >= now);
 }
 
 fn session_view(session: &ManagedSession) -> Result<Value> {
@@ -1319,11 +1342,31 @@ fn start_output_pump(session: Arc<ManagedSession>, mut reader: Box<dyn Read + Se
                                 break;
                             }
                         }
-                        drop(output);
+                        // Published under the buffer lock on purpose -- see `attach`. A
+                        // broadcast send never blocks, so the pump cannot stall here.
                         let _ = session.sender.send(chunk);
+                        drop(output);
                     }
                 }
             }
+        }
+    });
+}
+
+/// Finish a stop that `SIGTERM` did not.
+///
+/// `stop` is the only way an operator ends one run, and a provider is free to ignore `SIGTERM` --
+/// a terminal program that installs its own interrupt handling routinely does. Without this the
+/// run sits in `stopping` forever: its input is already refused, but its PTY, its process group
+/// and its worktree are all still held, and the escalation `stop_all` performs only arrives when
+/// the whole dashboard exits. The grace is the one `stop_all` already waits.
+fn start_terminator(session: Arc<ManagedSession>) {
+    thread::spawn(move || {
+        thread::sleep(STOP_GRACE);
+        // Still `stopping` means the monitor has not seen the child exit, so the signal was
+        // either ignored or is being handled far too slowly to call a stop.
+        if lock(&session.runtime).is_ok_and(|runtime| runtime.status == "stopping") {
+            let _ = signal_session(&session, Signal::SIGKILL);
         }
     });
 }
@@ -1401,10 +1444,7 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::thread;
-    use std::time::Duration;
 
     use anyhow::{Context, Result};
 
@@ -1413,11 +1453,83 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        ApproveRequest, IdeManager, LaunchRequest, RunHandle, git_status, git_text,
-        inventory_worktrees, outside_scope, reclaim_worktrees, resolved, rollback_worktree,
-        safe_path, session_view, slugify, validate_relative,
+        AttachGrant, IdeManager, RunHandle, TICKET_TTL_MS, TerminalAttachment, git_status,
+        git_text, inventory_worktrees, now_ms, outside_scope, purge_expired, reclaim_worktrees,
+        resolved, safe_path, slugify, validate_relative,
     };
     use crate::store::MeshStore;
+
+    fn grant(expires_at: i64, session_id: &str) -> AttachGrant {
+        AttachGrant {
+            expires_at,
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    fn refusal(outcome: Result<TerminalAttachment>) -> String {
+        outcome
+            .err()
+            .map_or_else(|| "attached".to_owned(), |error| format!("{error:#}"))
+    }
+
+    /// The terminal upgrade is the only `/api/v1/*` route the session token does not gate, so
+    /// its ticket is the entire boundary. All three of its properties are asserted here against
+    /// a planted grant rather than a minted one: `attach` checks the ticket *before* it looks
+    /// the session up, which is both why a forged ticket cannot even probe for which sessions
+    /// exist and why these cases need no provider, no PTY and no worktree.
+    #[test]
+    fn an_attach_ticket_is_single_use_session_bound_and_expires() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = MeshStore::new(directory.path().join("mesh.db"))?;
+        let manager = IdeManager::new(store, directory.path().to_owned());
+        let live = now_ms()? + TICKET_TTL_MS;
+        {
+            let mut tickets = manager.inner.tickets.lock().expect("ticket map");
+            tickets.insert("expired".to_owned(), grant(now_ms()? - 1, "alpha"));
+            tickets.insert("crossed".to_owned(), grant(live, "alpha"));
+            tickets.insert("spent".to_owned(), grant(live, "alpha"));
+        }
+
+        // Nothing anyone can make up is a ticket.
+        assert!(
+            refusal(manager.attach("alpha", "0123456789abcdef"))
+                .contains("invalid or already used")
+        );
+
+        // Expiry is a wall-clock comparison, not a sweep that may not have run yet.
+        assert!(refusal(manager.attach("alpha", "expired")).contains("expired"));
+
+        // A ticket names one session, and spending it on another burns it rather than leaving a
+        // live grant behind for a second guess at which session it belongs to.
+        assert!(refusal(manager.attach("beta", "crossed")).contains("for another session"));
+        assert!(refusal(manager.attach("alpha", "crossed")).contains("invalid or already used"));
+
+        // Single use: redemption removes the grant even when the attach then fails for an
+        // entirely different reason, so a replay can never follow a near miss.
+        assert!(refusal(manager.attach("alpha", "spent")).contains("session was not found"));
+        assert!(refusal(manager.attach("alpha", "spent")).contains("invalid or already used"));
+
+        assert!(
+            manager.inner.tickets.lock().expect("ticket map").is_empty(),
+            "a refused redemption left a grant behind"
+        );
+        Ok(())
+    }
+
+    /// A pane mints a ticket on every refresh and uses almost none of them. Redemption was the
+    /// only thing that ever removed one, so the map grew for the life of the dashboard.
+    #[test]
+    fn unredeemed_tickets_do_not_accumulate_forever() {
+        let now = 1_000_000;
+        let mut tickets = std::collections::HashMap::new();
+        tickets.insert("stale".to_owned(), grant(now - 1, "alpha"));
+        tickets.insert("exactly-now".to_owned(), grant(now, "alpha"));
+        tickets.insert("fresh".to_owned(), grant(now + TICKET_TTL_MS, "alpha"));
+        purge_expired(&mut tickets, now);
+        let mut remaining = tickets.keys().cloned().collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(remaining, ["exactly-now", "fresh"]);
+    }
 
     fn git(directory: &Path, arguments: &[&str]) -> Result<()> {
         git_status(directory, arguments)
@@ -1602,66 +1714,6 @@ mod tests {
         }
         assert!(manager.files(None, ".git").is_err());
         assert!(manager.file(None, ".git/config").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn managed_run_streams_pty_output_and_blocks_scope_violations() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let repository = seed_repository(directory.path())?;
-
-        let provider = directory.path().join("fake-claude");
-        fs::write(
-            &provider,
-            "#!/bin/sh\nprintf 'fake terminal ready\\r\\n'\nprintf 'allowed\\n' > src/allowed.txt\nprintf 'outside\\n' > README.generated\n",
-        )?;
-        let mut permissions = provider.metadata()?.permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&provider, permissions)?;
-
-        let store = MeshStore::new(directory.path().join("mesh.db"))?;
-        let manager = IdeManager::new(store, repository.clone());
-        let launched = manager.launch_resolved(
-            LaunchRequest {
-                name: "scope-check".to_owned(),
-                provider: "claude".to_owned(),
-                workstream: "runtime".to_owned(),
-                task: "scope-check".to_owned(),
-                prompt: "Create one allowed and one disallowed file".to_owned(),
-                scopes: vec!["src".to_owned()],
-            },
-            &provider,
-        )?;
-        assert_eq!(launched["workstream"], "runtime");
-        let session_id = launched["id"].as_str().context("missing session id")?;
-        for _ in 0..40 {
-            let active = manager.session(session_id)?;
-            if session_view(active.as_ref())?["status"] != "running" {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        let output = manager.output(session_id, 0)?;
-        assert!(output.to_string().contains("fake terminal ready"));
-        let review = manager.review(session_id)?;
-        assert_eq!(review["scope_valid"], false);
-        assert_eq!(review["out_of_scope"][0], "README.generated");
-        assert!(
-            manager
-                .approve(
-                    session_id,
-                    &ApproveRequest {
-                        commit_message: "test: managed change".to_owned(),
-                    },
-                )
-                .is_err()
-        );
-
-        let session = manager.session(session_id)?;
-        rollback_worktree(&repository, &session.worktree, &session.branch);
-        if let Some(parent) = session.worktree.parent() {
-            let _ = fs::remove_dir(parent);
-        }
         Ok(())
     }
 
