@@ -2391,9 +2391,26 @@ struct SymbolBreak {
 /// visible rather than implied.
 const MAX_SYMBOL_BREAKS: i64 = 200;
 
+/// Every symbol break in the workspace, for the reports that describe the whole fleet.
 fn workspace_symbol_breaks(
     connection: &Connection,
     workspace_id: &str,
+) -> Result<Vec<SymbolBreak>> {
+    symbol_breaks(connection, workspace_id, None)
+}
+
+/// Symbol breaks, optionally narrowed to the ones a single checkout is causing.
+///
+/// The cap has to be applied to the rows the caller will actually read. A merge gate asking
+/// "am I breaking anyone?" over the workspace-wide list got whichever 200 rows sorted first, so a
+/// peer withdrawing a few hundred names of its own — deleting a generated module is enough —
+/// pushed every other agent's break past the limit. Those agents were then told `mergeable:
+/// true` with an empty blocker list: not a truncated answer, a clean one, for a merge that
+/// breaks the build. Filtering before the limit keeps each agent's own breaks inside its window.
+fn symbol_breaks(
+    connection: &Connection,
+    workspace_id: &str,
+    removed_by: Option<&str>,
 ) -> Result<Vec<SymbolBreak>> {
     let mut statement = connection.prepare(
         "SELECT DISTINCT r.symbol, r.path, r.agent_id, u.agent_id, a.name
@@ -2408,19 +2425,23 @@ fn workspace_symbol_breaks(
            AND r.kind = 'removed_export'
            AND r.agent_id != u.agent_id
            AND COALESCE(ra.checkout_path, r.agent_id) != COALESCE(a.checkout_path, u.agent_id)
+           AND (?2 IS NULL OR r.agent_id = ?2)
          ORDER BY r.symbol, u.agent_id
-         LIMIT ?2",
+         LIMIT ?3",
     )?;
     let rows = statement
-        .query_map(params![workspace_id, MAX_SYMBOL_BREAKS], |row| {
-            Ok(SymbolBreak {
-                symbol: row.get(0)?,
-                removed_from: row.get(1)?,
-                removed_by: row.get(2)?,
-                used_by: row.get(3)?,
-                used_by_name: row.get(4)?,
-            })
-        })?
+        .query_map(
+            params![workspace_id, removed_by, MAX_SYMBOL_BREAKS],
+            |row| {
+                Ok(SymbolBreak {
+                    symbol: row.get(0)?,
+                    removed_from: row.get(1)?,
+                    removed_by: row.get(2)?,
+                    used_by: row.get(3)?,
+                    used_by_name: row.get(4)?,
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -2463,10 +2484,7 @@ fn symbol_blockers(
     agent_id: &str,
 ) -> Result<Vec<Value>> {
     let mut blockers = Vec::new();
-    for entry in workspace_symbol_breaks(connection, workspace_id)? {
-        if entry.removed_by != agent_id {
-            continue;
-        }
+    for entry in symbol_breaks(connection, workspace_id, Some(agent_id))? {
         let live: bool = connection
             .query_row(
                 "SELECT status = 'running' FROM agents WHERE id = ?",

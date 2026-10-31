@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use pidmesh::converge::{integration_head, scan_worktree};
+use pidmesh::converge::{Participant, classify, integration_head, scan_worktree};
 use pidmesh::store::MeshStore;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -2174,6 +2174,771 @@ fn consecutive_edits_are_a_conflict_because_git_says_so() -> Result<()> {
     assert_eq!(
         wide["severity"], "adjacent",
         "a one-line gap merges cleanly, so it must not block: {wide}"
+    );
+    Ok(())
+}
+
+/// What a real three-way merge does with two checkouts' work.
+///
+/// Every severity claim below is checked against this rather than against our own reasoning about
+/// what git ought to do. The merge is unwound afterwards so the checkout stays usable, and the
+/// callers assert both outcomes of this oracle at least once, so an oracle that had stopped
+/// working — a git that will not run, a branch name that does not resolve — cannot quietly report
+/// "conflict" for everything and manufacture findings.
+fn merge_conflicts(checkout: &Path, other_branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["merge", "--no-commit", "--no-ff", other_branch])
+        .output()?;
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // "Already up to date" and an unknown ref both exit zero or non-zero for reasons that have
+    // nothing to do with conflicts, and either would make the oracle lie.
+    anyhow::ensure!(
+        !combined.contains("Already up to date")
+            && !combined.contains("not something we can merge"),
+        "the merge oracle did not actually merge anything: {combined}"
+    );
+    let conflicted = !output.status.success();
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["merge", "--abort"])
+        .output();
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["reset", "--hard", "HEAD"])
+        .output();
+    Ok(conflicted)
+}
+
+/// A line of a file is not a header, however much it looks like one.
+///
+/// `git diff --unified=0` prefixes every body line with one marker byte, so a deleted `-- note`
+/// reaches the parser as `--- note` — byte for byte the shape of a `--- a/path` file header. SQL,
+/// Lua, Haskell and Ada comments all start that way, and so does every line of a committed
+/// `.patch` fixture. Reading one as a header detached the parser from the file and silently
+/// dropped every hunk after it, and a file whose overlapping region went unrecorded compares as
+/// having no overlap at all: `adjacent`, reported as safe to merge, against a merge that
+/// conflicts. The fix counts each hunk's body lines from its own header instead of guessing.
+#[test]
+fn a_deleted_line_shaped_like_a_diff_header_cannot_hide_a_hunk() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let body = (1..=40).fold(String::new(), |mut rows, line| {
+        let _ = match line {
+            5 => writeln!(rows, "-- the schema this file builds"),
+            _ => writeln!(rows, "select col_{line};"),
+        };
+        rows
+    });
+    std::fs::write(fleet.repository.join("schema.sql"), &body)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "schema"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Alpha rewrites the comment *and* line 30. The comment's hunk comes first in the diff, so
+    // a parser that mistakes it for a header never sees the hunk that actually matters.
+    std::fs::write(
+        alpha_tree.join("schema.sql"),
+        body.replace("-- the schema this file builds", "-- the schema, rewritten")
+            .replace("select col_30;", "select col_30_alpha;"),
+    )?;
+    // Bravo rewrites only line 30, so the two genuinely collide there.
+    std::fs::write(
+        bravo_tree.join("schema.sql"),
+        body.replace("select col_30;", "select col_30_bravo;"),
+    )?;
+    git(&alpha_tree, &["commit", "-am", "alpha"])?;
+    git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    // The oracle first: this is what the tool has to agree with.
+    assert!(
+        merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "both checkouts rewrote line 30, so a real merge must conflict"
+    );
+
+    let collisions = fleet.collisions(&alpha)?;
+    let schema = at(&collisions, "schema.sql").context("expected a collision")?;
+    assert_eq!(
+        schema["severity"], "divergent",
+        "a comment that looks like a diff header must not hide the hunk below it: {schema}"
+    );
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
+
+    // The same oracle must report the other outcome too, or it is proving nothing. Bravo moves
+    // its edit far away; now the two really are separable and git merges them.
+    std::fs::write(
+        bravo_tree.join("schema.sql"),
+        body.replace("select col_38;", "select col_38_bravo;"),
+    )?;
+    git(&bravo_tree, &["commit", "-am", "bravo moves"])?;
+    assert!(
+        !merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "well-separated edits merge cleanly, so the oracle must say so"
+    );
+    fleet.sync(&bravo, &bravo_tree)?;
+    let collisions = fleet.collisions(&alpha)?;
+    let schema = at(&collisions, "schema.sql").context("expected a collision")?;
+    assert_eq!(
+        schema["severity"], "adjacent",
+        "and a separable edit must not be over-reported either: {schema}"
+    );
+    Ok(())
+}
+
+/// Rewritten regions have to be measured in the bytes git merges, not in a rendering of them.
+///
+/// A `diff=<driver>` attribute with a `textconv` makes `git diff` describe a converted document,
+/// and `--no-ext-diff` does not turn that off. Pretty-printing a one-line config is the common
+/// case — people configure it for minified JSON and for notebooks — and it reports two rewrites
+/// of that single physical line as hunks several lines apart. Several lines apart is `adjacent`,
+/// which does not block a merge; the merge then conflicts every time, because in the file git
+/// actually merges both sides rewrote line one.
+#[test]
+fn a_textconv_driver_cannot_move_a_conflict_out_of_the_way() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("config.json"),
+        "{\"alpha\":1,\"beta\":2,\"gamma\":3,\"delta\":4,\"epsilon\":5,\"zeta\":6}\n",
+    )?;
+    std::fs::write(
+        fleet.repository.join(".gitattributes"),
+        "*.json diff=json\n",
+    )?;
+    git(
+        &fleet.repository,
+        &["config", "diff.json.textconv", "python3 -m json.tool"],
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "config"])?;
+
+    // Confirm the driver is actually in effect, or this test proves nothing about textconv.
+    let rendered = Command::new("git")
+        .arg("-C")
+        .arg(&fleet.repository)
+        .args(["show", "HEAD:config.json", "--textconv"])
+        .output()?;
+    anyhow::ensure!(
+        String::from_utf8_lossy(&rendered.stdout).lines().count() > 1,
+        "the textconv driver is not configured, so this test would pass for the wrong reason"
+    );
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Two different keys, both on the file's single physical line.
+    std::fs::write(
+        alpha_tree.join("config.json"),
+        "{\"alpha\":99,\"beta\":2,\"gamma\":3,\"delta\":4,\"epsilon\":5,\"zeta\":6}\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("config.json"),
+        "{\"alpha\":1,\"beta\":2,\"gamma\":3,\"delta\":4,\"epsilon\":5,\"zeta\":99}\n",
+    )?;
+    git(&alpha_tree, &["commit", "-am", "alpha"])?;
+    git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    assert!(
+        merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "both rewrote the file's only line, so a real merge must conflict"
+    );
+    let collisions = fleet.collisions(&alpha)?;
+    let config = at(&collisions, "config.json").context("expected a collision")?;
+    assert_eq!(
+        config["severity"], "divergent",
+        "regions must be measured in the merged bytes, not in a pretty-printed rendering: {config}"
+    );
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
+    Ok(())
+}
+
+/// The same header confusion in the other direction: an added line can read as `+++ ...`.
+///
+/// `(Some(path), None)` in the header parser means "a base side with no working side", which is a
+/// deletion. An added line whose text begins `++ ` produced exactly that pair for a file sitting
+/// right there on disk, so a live file was recorded as deleted — which reads as `delete_edit`
+/// against any peer editing it, and strips the digest that would otherwise have proved the two
+/// checkouts identical.
+#[test]
+fn an_added_line_shaped_like_a_diff_header_does_not_report_a_live_file_deleted() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+
+    // A changelog entry, a diff quoted in documentation, a `.patch` fixture: all produce lines
+    // that begin with two plus signs and a space.
+    std::fs::write(
+        alpha_tree.join("src/legacy.rs"),
+        "legacy\n++ added by the migration script\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+
+    let scan = scan_worktree(&alpha_tree, Some("main"))?;
+    let legacy = scan
+        .entries
+        .iter()
+        .find(|entry| entry.path == "src/legacy.rs")
+        .context("the file is still part of the footprint")?;
+    assert_eq!(
+        legacy.change_kind.as_str(),
+        "modified",
+        "the file is on disk, so it was modified rather than deleted"
+    );
+    assert!(
+        legacy.digest.is_some(),
+        "a file that exists has content to compare, and without a digest two identical \
+         checkouts cannot be told apart from two conflicting ones"
+    );
+    Ok(())
+}
+
+/// A merge gate must not run out of room to mention the break it is gating on.
+///
+/// Symbol breaks were read through one workspace-wide query capped at 200 rows, and the merge
+/// gate then filtered those rows down to the asking agent's own. A peer withdrawing a few hundred
+/// names of its own — deleting a generated module is enough — fills the window before anyone
+/// else's break is reached. The agent that really is breaking a live peer is then handed
+/// `mergeable: true` and an empty blocker list: not a truncated answer that says it stopped
+/// looking, a clean one. `mergeable && git merge` merges it.
+#[test]
+fn a_flood_of_peer_symbol_breaks_cannot_clear_an_agents_own() -> Result<()> {
+    let fleet = Fleet::new()?;
+
+    // One file full of exports a peer will withdraw wholesale, and one lone export beside it.
+    let bulk = (1..=250).fold(String::new(), |mut rows, index| {
+        let _ = writeln!(rows, "pub fn bulk_{index:03}() {{}}");
+        rows
+    });
+    std::fs::write(fleet.repository.join("src/bulk.rs"), &bulk)?;
+    std::fs::write(
+        fleet.repository.join("src/target.rs"),
+        "pub fn zzz_lone_export() {}\n",
+    )?;
+    // A consumer that calls all of them, so withdrawing any one is a real break.
+    let mut consumer = String::from("pub fn consume() {\n");
+    for index in 1..=250 {
+        let _ = writeln!(consumer, "    bulk_{index:03}();");
+    }
+    consumer.push_str("    zzz_lone_export();\n}\n");
+    std::fs::write(fleet.repository.join("src/consumer.rs"), &consumer)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    let (charlie, charlie_tree) = fleet.agent("charlie")?;
+
+    // Alpha withdraws exactly one export. Its name sorts last, which is the whole point.
+    std::fs::write(alpha_tree.join("src/target.rs"), "pub fn kept() {}\n")?;
+    // Bravo withdraws two hundred and fifty, in a different file, contesting nothing.
+    std::fs::write(bravo_tree.join("src/bulk.rs"), "pub fn nothing() {}\n")?;
+    // Charlie still calls every one of them.
+    std::fs::write(
+        charlie_tree.join("src/consumer.rs"),
+        format!("{consumer}// charlie is still working here\n"),
+    )?;
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    fleet.sync(&charlie, &charlie_tree)?;
+
+    // The premise: there really are more breaks in this workspace than the report will carry.
+    let convergence = fleet.store.collisions(&alpha)?;
+    assert!(
+        convergence["symbol_break_count"].as_i64().unwrap_or(0) >= 200,
+        "this test only means something if the cap is actually reached: {convergence}"
+    );
+
+    // Alpha is genuinely withdrawing a name a live peer still calls, and must be told so.
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert!(
+        blocker_codes(&report).contains(&"removed_export_in_use".to_owned()),
+        "alpha's own break must survive a peer's flood: {report}"
+    );
+    assert_eq!(report["mergeable"], false, "{report}");
+
+    // And bravo, whose breaks did fill the window, is still blocked on its own account.
+    let bravo_report = readiness(&fleet, &bravo, &bravo_tree)?;
+    assert!(
+        blocker_codes(&bravo_report).contains(&"removed_export_in_use".to_owned()),
+        "{bravo_report}"
+    );
+
+    // Charlie withdraws nothing, so it must stay mergeable — the gate is still discriminating,
+    // not just blocking everyone.
+    let charlie_report = readiness(&fleet, &charlie, &charlie_tree)?;
+    assert!(
+        !blocker_codes(&charlie_report).contains(&"removed_export_in_use".to_owned()),
+        "a checkout that withdraws nothing must not be blocked: {charlie_report}"
+    );
+    Ok(())
+}
+
+/// A sentence cannot put back an export that code took away.
+///
+/// Both halves of "was this name withdrawn?" run the same declaration matcher, but only the
+/// removed half was restricted to code. The matcher recognises a bare `def `, `class `, `func `
+/// and `type ` — ordinary English — which is exactly why the removed half is restricted. An
+/// added line anywhere in the checkout that happened to parse as a declaration therefore
+/// cancelled a real withdrawal, and quoting the old signature in a migration note is the normal
+/// way to document a removal. The cancellation has to be as trustworthy as the thing it cancels.
+#[test]
+fn documenting_a_removal_does_not_cancel_it() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/parser.py"),
+        "def parse_header(raw):\n    return raw\n",
+    )?;
+    std::fs::write(
+        fleet.repository.join("src/report.py"),
+        "def build(raw):\n    return parse_header(raw)\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "parser"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Alpha withdraws the function and writes the migration note that quotes its old signature.
+    std::fs::write(
+        alpha_tree.join("src/parser.py"),
+        "def parse_headers(raw):\n    return [raw]\n",
+    )?;
+    std::fs::create_dir_all(alpha_tree.join("docs"))?;
+    std::fs::write(
+        alpha_tree.join("docs/migration.md"),
+        "# Migration\n\nThe old entry point\n\ndef parse_header(raw)\n\nis gone; call \
+         `parse_headers` instead.\n",
+    )?;
+    // Bravo is still calling it.
+    std::fs::write(
+        bravo_tree.join("src/report.py"),
+        "def build(raw):\n    return parse_header(raw).strip()\n",
+    )?;
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert!(
+        blocker_codes(&report).contains(&"removed_export_in_use".to_owned()),
+        "a prose line that parses as a declaration must not cancel a real withdrawal: {report}"
+    );
+    Ok(())
+}
+
+/// A change git describes as binary still has to reach the mesh.
+///
+/// `git diff` answers a change to such a path with a `diff --git` header and `Binary files ...
+/// differ` — no `---`/`+++` pair naming it, no hunks. Once the work is committed `git status` is
+/// silent about it as well, so the path landed in no footprint at all: two checkouts both
+/// rewriting the same image, the same fixture, or the same lockfile carrying `-diff` produced no
+/// collision, no blocker and `mergeable: true`, while `git merge` conflicts on it every time.
+/// That is the whole product claim failing quietly, so the scan now recovers those paths by name.
+#[test]
+fn a_committed_binary_change_is_still_a_collision() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("logo.png"),
+        b"\x89PNG\r\n\x1a\n\x00base pixels\x00",
+    )?;
+    // The other common shape of the same problem: ordinary text a repository marks `-diff`.
+    std::fs::write(fleet.repository.join(".gitattributes"), "*.lock -diff\n")?;
+    std::fs::write(fleet.repository.join("deps.lock"), "dep a = 1\ndep b = 2\n")?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "assets"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    std::fs::write(
+        alpha_tree.join("logo.png"),
+        b"\x89PNG\r\n\x1a\n\x00alpha pixels\x00",
+    )?;
+    std::fs::write(alpha_tree.join("deps.lock"), "dep a = 9\ndep b = 2\n")?;
+    std::fs::write(
+        bravo_tree.join("logo.png"),
+        b"\x89PNG\r\n\x1a\n\x00bravo pixels\x00",
+    )?;
+    std::fs::write(bravo_tree.join("deps.lock"), "dep a = 1\ndep b = 9\n")?;
+    // Committing is what hides the change: it leaves the diff, and `status` never saw it.
+    git(&alpha_tree, &["commit", "-am", "alpha"])?;
+    git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+    assert!(
+        merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "git cannot merge two rewrites of a binary path, so the oracle must say conflict"
+    );
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    let collisions = fleet.collisions(&alpha)?;
+    for path in ["logo.png", "deps.lock"] {
+        let collision = at(&collisions, path)
+            .with_context(|| format!("{path} must be reported as contested"))?;
+        assert_eq!(
+            collision["severity"], "divergent",
+            "a path git will not merge line by line cannot be adjacent: {collision}"
+        );
+    }
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
+    Ok(())
+}
+
+/// Being shown as text does not make a file mergeable as text.
+///
+/// A bare `diff` attribute tells git to render a binary path as lines. The merge driver is not
+/// listening: it still takes the file whole and conflicts on any two-sided change. So hunk
+/// coordinates exist for such a path and describe nothing a merge will respect — two edits a
+/// dozen lines apart read as `adjacent`, and the merge conflicts every time. Regions are
+/// withheld from content that carries a NUL, which is the same test git uses.
+#[test]
+fn a_binary_file_rendered_as_text_is_not_merged_as_text() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let base: Vec<u8> = (1..=12).fold(Vec::new(), |mut bytes, row| {
+        bytes.extend_from_slice(format!("\0row_{row:02}\n").as_bytes());
+        bytes
+    });
+    std::fs::write(fleet.repository.join("frames.dat"), &base)?;
+    std::fs::write(fleet.repository.join(".gitattributes"), "*.dat diff\n")?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "frames"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Far apart in the rendering: row 1 against row 12.
+    let mut mine = base.clone();
+    mine[..9].copy_from_slice(b"\0row_01a\n");
+    std::fs::write(alpha_tree.join("frames.dat"), &mine)?;
+    let mut theirs = base.clone();
+    let tail = theirs.len() - 9;
+    theirs[tail..].copy_from_slice(b"\0row_12b\n");
+    std::fs::write(bravo_tree.join("frames.dat"), &theirs)?;
+    git(&alpha_tree, &["commit", "-am", "alpha"])?;
+    git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+    // The premise: git really is rendering this as text, or the test proves nothing.
+    let shown = Command::new("git")
+        .arg("-C")
+        .arg(&alpha_tree)
+        .args(["diff", "--unified=0", "main", "--", "frames.dat"])
+        .output()?;
+    anyhow::ensure!(
+        String::from_utf8_lossy(&shown.stdout).contains("@@"),
+        "the `diff` attribute is not in effect, so this would pass for the wrong reason"
+    );
+
+    assert!(
+        merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "a binary merge is all or nothing, so the oracle must say conflict"
+    );
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    let collisions = fleet.collisions(&alpha)?;
+    let frames = at(&collisions, "frames.dat").context("expected a collision")?;
+    assert_eq!(
+        frames["severity"], "divergent",
+        "hunk coordinates on a binary path describe nothing a merge respects: {frames}"
+    );
+    Ok(())
+}
+
+/// Known defect, left unfixed deliberately: `-merge` is not consulted.
+///
+/// `.gitattributes` can mark a path unmergeable with `-merge` — the normal idiom for a lockfile
+/// or a generated bundle — while leaving it perfectly diffable. git then produces ordinary line
+/// hunks for it and still refuses to merge it a line at a time: any two-sided change conflicts,
+/// however far apart the edits are. Two agents editing opposite ends of such a file are
+/// therefore reported `adjacent` and told the merge is clean, and it is not.
+///
+/// Unfixed because the only correct source for this is the `merge` attribute itself, which means
+/// a `git check-attr` call per scan. This module treats the number of git invocations as its
+/// dominant cost and says so, and the binary half of the same question is already covered for
+/// free by sniffing for NUL, so what remains is a deliberate cost decision rather than an
+/// oversight. Dropping regions for any path whose `merge` attribute is unset or names a driver
+/// would close it.
+#[test]
+#[ignore = "known defect: the merge attribute is not consulted; needs a git check-attr per scan"]
+fn a_path_marked_unmergeable_is_not_adjacent() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let body = (1..=20).fold(String::new(), |mut rows, row| {
+        let _ = writeln!(rows, "dep_{row} = \"1.0\"");
+        rows
+    });
+    std::fs::write(fleet.repository.join("deps.lock"), &body)?;
+    std::fs::write(fleet.repository.join(".gitattributes"), "*.lock -merge\n")?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "deps"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("deps.lock"),
+        body.replace("dep_2 = \"1.0\"", "dep_2 = \"2.0\""),
+    )?;
+    std::fs::write(
+        bravo_tree.join("deps.lock"),
+        body.replace("dep_18 = \"1.0\"", "dep_18 = \"2.0\""),
+    )?;
+    git(&alpha_tree, &["commit", "-am", "alpha"])?;
+    git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+    assert!(
+        merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "`-merge` makes any two-sided change a conflict"
+    );
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    let collisions = fleet.collisions(&alpha)?;
+    let deps = at(&collisions, "deps.lock").context("expected a collision")?;
+    assert_eq!(
+        deps["severity"], "divergent",
+        "a path the repository declared unmergeable cannot be adjacent: {deps}"
+    );
+    Ok(())
+}
+
+/// A checkout that stopped reading has to say so, not read as having found nothing.
+///
+/// The reference harvester gives up on a file past its size ceiling, which leaves the checkout's
+/// name set incomplete. An incomplete set can rule a break *in* but never *out*, so the scan is
+/// supposed to mark itself truncated and match every withdrawn export. This asserts that the
+/// safeguard is really wired through to the merge gate rather than merely recorded: the failure
+/// it prevents — one oversized generated file quietly turning a real break into a clean merge —
+/// is the exact shape of bug this whole mechanism exists to stop.
+#[test]
+fn a_checkout_that_stopped_reading_still_blocks_a_withdrawal() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn widget_total() -> u32 { 0 }\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Alpha withdraws the export.
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn widget_sum() -> u32 { 0 }\n",
+    )?;
+    // Bravo's only changed source file is past the harvester's ceiling, and — this is the point —
+    // it does not mention `widget_total` anywhere. Nothing was read, so nothing can be ruled out.
+    let generated = "pub fn generated_filler() {}\n".repeat(90_000);
+    assert!(
+        generated.len() as u64 > 2 * 1024 * 1024,
+        "the file must exceed MAX_SCANNED_BYTES for this to prove anything"
+    );
+    std::fs::write(bravo_tree.join("src/generated.rs"), &generated)?;
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    let scan = scan_worktree(&bravo_tree, Some("main"))?;
+    assert!(
+        scan.symbols.truncated,
+        "the oversized file must mark the scan incomplete"
+    );
+    assert!(
+        !scan.symbols.references.iter().any(|n| n == "widget_total"),
+        "bravo genuinely never read the name, so only the truncation flag can save this"
+    );
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert!(
+        blocker_codes(&report).contains(&"removed_export_in_use".to_owned()),
+        "a checkout that stopped reading must be assumed to reference everything: {report}"
+    );
+    Ok(())
+}
+
+/// Deterministic pseudo-randomness, so a failure here is a failure anyone can reproduce.
+struct Seeded(u64);
+
+impl Seeded {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+
+    fn below(&mut self, bound: usize) -> usize {
+        let bound = u64::try_from(bound.max(1)).unwrap_or(u64::MAX);
+        usize::try_from(self.next() % bound).unwrap_or(0)
+    }
+
+    /// A line index, weighted towards the edges of the file where off-by-ones live.
+    fn line(&mut self, len: usize) -> usize {
+        match self.below(6) {
+            0 => 0,
+            1 => 1.min(len.saturating_sub(1)),
+            2 => len.saturating_sub(1),
+            3 => len.saturating_sub(2),
+            _ => self.below(len),
+        }
+    }
+}
+
+/// Rewrite, insert, or delete — the three things a diff can report.
+fn mutate(base: &[String], rng: &mut Seeded, tag: &str) -> Vec<String> {
+    let mut lines = base.to_vec();
+    let mut edits: Vec<(usize, usize, usize)> = (0..=rng.below(3))
+        .map(|_| (rng.line(base.len()), rng.below(3), 1 + rng.below(3)))
+        .collect();
+    // Apply back to front, so an earlier edit cannot move a later index.
+    edits.sort_unstable_by_key(|(at, _, _)| std::cmp::Reverse(*at));
+    for (at, kind, span) in edits {
+        match kind {
+            0 if at < lines.len() => lines[at] = format!("line_{at}_{tag}"),
+            1 => {
+                let at = at.min(lines.len());
+                for step in 0..span {
+                    lines.insert(at, format!("new_{at}_{step}_{tag}"));
+                }
+            }
+            _ => {
+                let end = (at + span).min(lines.len());
+                if at < end {
+                    lines.drain(at..end);
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// Severity, checked against real merges over a spread of generated edit pairs.
+///
+/// The named cases in this file each pin one shape of edit. This covers the space between them:
+/// rewrites, insertions and deletions of random width, placed with a heavy bias toward the first
+/// and last lines of the file, run against a real `git merge` every time. It is the check that
+/// caught the adjacency rule being off by one line, and it is kept because the interesting
+/// failures in this module have all been cases nobody thought to name.
+///
+/// Only one direction is an error. `divergent` over a merge that would have been clean is a
+/// false alarm and is counted but tolerated; `identical` or `adjacent` over a merge that
+/// conflicts is the product telling someone their work is safe to overwrite, and fails the test.
+#[test]
+fn generated_edit_pairs_agree_with_real_merges() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let repository = directory.path().join("repository");
+    std::fs::create_dir(&repository)?;
+    git(&repository, &["init", "-b", "main"])?;
+    git(
+        &repository,
+        &["config", "user.email", "pidmesh@example.com"],
+    )?;
+    git(&repository, &["config", "user.name", "PidMesh Test"])?;
+    std::fs::write(repository.join("f.txt"), "seed\n")?;
+    git(&repository, &["add", "-A"])?;
+    git(&repository, &["commit", "-m", "seed"])?;
+    let alpha_tree = directory.path().join("wt-alpha");
+    let bravo_tree = directory.path().join("wt-bravo");
+    for (tree, branch) in [(&alpha_tree, "alpha"), (&bravo_tree, "bravo")] {
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                tree.to_str().context("worktree path")?,
+            ],
+        )?;
+    }
+
+    let mut rng = Seeded(0x5eed_1234_abcd_0001);
+    let mut checked = 0_usize;
+    let mut false_alarms = 0_usize;
+    for case in 0..40 {
+        let len = 8 + rng.below(20);
+        let base_lines: Vec<String> = (0..len).map(|line| format!("line_{line}")).collect();
+        // Half the cases leave the final newline off, which is its own hunk shape.
+        let terminator = if case % 2 == 0 { "\n" } else { "" };
+        let render = |lines: &[String]| format!("{}{terminator}", lines.join("\n"));
+        let base = render(&base_lines);
+        let mine = render(&mutate(&base_lines, &mut rng, "alpha"));
+        let theirs = render(&mutate(&base_lines, &mut rng, "bravo"));
+        if mine == base || theirs == base || mine == theirs {
+            continue;
+        }
+
+        std::fs::write(repository.join("f.txt"), &base)?;
+        git(&repository, &["commit", "-am", "base"])?;
+        for (tree, branch, body) in [
+            (&alpha_tree, "alpha", &mine),
+            (&bravo_tree, "bravo", &theirs),
+        ] {
+            git(tree, &["checkout", "-B", branch, "main"])?;
+            std::fs::write(tree.join("f.txt"), body)?;
+            git(tree, &["commit", "-am", "work"])?;
+        }
+
+        let observed = |tree: &Path, id: &str| -> Result<Participant> {
+            let scan = scan_worktree(tree, Some("main"))?;
+            let entry = scan
+                .entries
+                .iter()
+                .find(|entry| entry.path == "f.txt")
+                .context("the edited path must be part of the footprint")?;
+            Ok(Participant {
+                agent_id: id.to_owned(),
+                agent_name: id.to_owned(),
+                status: "running".to_owned(),
+                change_kind: entry.change_kind.as_str().to_owned(),
+                digest: entry.digest.clone(),
+                base_commit: Some(scan.base_commit.clone()),
+                branch: scan.branch.clone(),
+                ranges: entry.ranges.clone(),
+            })
+        };
+        let mine_observed = observed(&alpha_tree, "alpha")?;
+        let theirs_observed = observed(&bravo_tree, "bravo")?;
+        let severity = classify(&[mine_observed.clone(), theirs_observed.clone()]);
+        let conflicts = merge_conflicts(&alpha_tree, "bravo")?;
+        checked += 1;
+
+        let called_safe = severity == "identical" || severity == "adjacent";
+        assert!(
+            !(called_safe && conflicts),
+            "case {case}: reported {severity} for a merge that conflicts — \
+             ranges {:?} against {:?}\nbase:\n{base}\nmine:\n{mine}\ntheirs:\n{theirs}",
+            mine_observed.ranges,
+            theirs_observed.ranges
+        );
+        if !called_safe && !conflicts {
+            false_alarms += 1;
+        }
+    }
+    // Guard the harness itself: a setup that silently stopped producing contested pairs would
+    // pass this test without ever having compared anything.
+    assert!(
+        checked >= 25,
+        "only {checked} cases actually produced a comparison"
+    );
+    assert!(
+        false_alarms < checked,
+        "every single case was reported as conflicting, which means the classifier is not \
+         discriminating and this sweep is proving nothing"
     );
     Ok(())
 }
