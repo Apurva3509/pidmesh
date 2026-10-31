@@ -88,7 +88,8 @@ The convergence guard makes collision detection *observational*:
 - per-agent worktree footprints derived from git, covering committed and uncommitted work;
 - content hashing, so duplicated effort is distinguishable from divergent edits;
 - cross-checkout collision detection that requires no reservation and no agent cooperation;
-- merge-outcome severity (`identical`, `divergent`, `delete_edit`) rather than lock ownership;
+- merge-outcome severity (`identical`, `adjacent`, `divergent`, `delete_edit`) rather than lock
+  ownership, where `adjacent` means the two edits are far enough apart that git will merge them;
 - base-commit divergence reporting, which catches the stale worktree whose diff merges cleanly and
   still breaks behaviour;
 - transition-only `collision.detected` and `collision.cleared` events, so a fleet parked on
@@ -104,9 +105,16 @@ every checkout is recorded at registration, one supervisor observes the whole fl
 has to participate at all. That is the difference that makes the guard hold for agents launched by
 Superset, Intent, Orca, or a bare terminal, none of which will call a PidMesh protocol unprompted.
 
-Footprints describe paths. Two agents editing different files can still break each other by changing
-a shared interface, and detecting that requires reading symbols rather than path names. That remains
-future work.
+Footprints describe paths, and two agents editing different files can still break each other by
+changing a shared interface. That is now detected rather than deferred: the guard harvests the
+names a checkout withdraws and the names its peers still reference, and reports a `symbol_break`
+when one agent removes an export another is calling. It is the conflict that shares no file, and
+`git merge` reports it as clean.
+
+Harvesting is textual and therefore deliberately conservative: it is checked against what `rustc`
+actually rejects rather than against the tool's own expectations, and it only considers files the
+diff touched, so an unchanged caller elsewhere in the tree is not evidence. It is a reporting
+signal, not a compiler.
 
 ## Workspace information architecture
 
