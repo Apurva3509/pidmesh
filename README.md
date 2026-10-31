@@ -94,17 +94,95 @@ cargo run --release --example benchmark
 
 ## Install
 
-From source:
+A prebuilt binary is the fast way in: nothing to install first, and seconds
+rather than minutes. Building from source needs a Rust toolchain and compiles
+SQLite on the way, and works on platforms no release targets. Both give you
+the same two binaries, `pidmesh` and `pidmesh-mcp`, and neither contacts
+anything but GitHub.
+
+### A prebuilt binary
+
+Download the installer, read it, run it:
+
+```bash
+curl -fsSL -o pidmesh-install.sh https://raw.githubusercontent.com/Apurva3509/pidmesh/main/install.sh
+less pidmesh-install.sh
+sh pidmesh-install.sh
+```
+
+It works out your platform, fetches the matching archive from the latest
+release, checks its SHA-256 *before* unpacking it, and puts both binaries in
+`~/.local/bin`. A checksum that does not match, a platform with no published
+binary, or a download that fails stops the script and leaves nothing behind.
+`--dir` installs elsewhere, `--version` pins a release, `--help` lists both.
+
+There is no `curl … | sh` line here on purpose. A pipe runs the script before
+you can read it, which gives away the one thing verification is for. The
+second line above is why the first one writes to a file.
+
+Published archives today cover macOS on Apple Silicon and Intel, and Linux on
+x86-64. The release workflow also builds `aarch64-unknown-linux-gnu`, but no
+release has carried it yet, so on ARM Linux build from source. The installer
+says so rather than guessing a URL.
+
+### By hand, verifying the checksum
+
+Pick the archive for your platform — `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, `x86_64-unknown-linux-gnu` — and fetch it:
+
+```bash
+TAG=v1.4.0
+FILE=pidmesh-$TAG-aarch64-apple-darwin.tar.gz
+
+curl -fsSLO "https://github.com/Apurva3509/pidmesh/releases/download/$TAG/$FILE"
+```
+
+Releases cut from now on publish a `.sha256` next to each archive, in the one
+format that both tools accept, so verifying is a single command:
+
+```bash
+curl -fsSLO "https://github.com/Apurva3509/pidmesh/releases/download/$TAG/$FILE.sha256"
+
+shasum -a 256 -c "$FILE.sha256"   # macOS
+sha256sum -c "$FILE.sha256"       # Linux
+```
+
+`v1.4.0` and earlier predate those files. For them, compare against the digest
+GitHub recorded for the stored asset, which is the same number from a
+different host:
+
+```bash
+gh release view "$TAG" --repo Apurva3509/pidmesh \
+  --json assets -q ".assets[] | select(.name==\"$FILE\") | .digest"
+shasum -a 256 "$FILE"
+```
+
+Either way, unpack only once the digests match:
+
+```bash
+tar -xzf "$FILE"
+mkdir -p ~/.local/bin && install -m 755 pidmesh pidmesh-mcp ~/.local/bin/
+```
+
+Neither checksum defends against a compromised repository — both come from
+GitHub. What they catch is a truncated, corrupted or tampered-with download,
+which is the failure you are actually likely to meet.
+
+### From source
+
+Needs a Rust toolchain, and compiles SQLite from C through `rusqlite`'s
+`bundled` feature, so budget a minute or two rather than seconds. A clean
+build of the current tree took 69 s on an M-series Mac with a warm crate
+registry:
 
 ```bash
 cargo install --git https://github.com/Apurva3509/pidmesh --locked
 ```
 
-Release archives contain both `pidmesh` and `pidmesh-mcp`:
-
-```bash
-gh release download --repo Apurva3509/pidmesh --pattern 'pidmesh-*'
-```
+This is the path that always works, including on platforms no release
+targets. [docs/installation.md](docs/installation.md) covers the rest:
+per-platform archive names, what to do when a checksum fails, uninstalling,
+and what cutting a release involves.
 
 ### Shell completions
 
