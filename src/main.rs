@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use pidmesh::converge::{WorktreeScan, integration_head, scan_worktree};
+use pidmesh::ide::IdeManager;
 use pidmesh::render::{self, Shape};
 use pidmesh::store::{
     AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, default_database_path, diagnose, workspace_root,
@@ -168,6 +169,14 @@ enum Commands {
         release: bool,
         #[arg(long, default_value_t = 900)]
         lease_seconds: u64,
+    },
+    /// List managed worktrees, showing which hold work and which can be reclaimed.
+    Worktrees {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Remove every worktree that is provably spent. Work is never discarded.
+        #[arg(long)]
+        reclaim: bool,
     },
     /// Check that this workspace is actually one shared mesh.
     Doctor {
@@ -453,6 +462,18 @@ fn run() -> Result<u8> {
                 }
             }
         }
+        Commands::Worktrees { workspace, reclaim } => {
+            let root = PathBuf::from(workspace_root(workspace.as_deref())?);
+            let ide = IdeManager::new(store.clone(), root);
+            // Reporting is the default and has no side effects. Removal is opt-in and still
+            // proves each worktree is spent before touching it, because preserving an agent's
+            // uncommitted work matters more than reclaiming disk.
+            emit(&if reclaim {
+                ide.reclaim()?
+            } else {
+                ide.worktrees()?
+            })?;
+        }
         Commands::Doctor { workspace } => {
             let report = diagnose(&database, workspace.as_deref())?;
             let healthy = report["healthy"] == true;
@@ -497,7 +518,15 @@ fn run() -> Result<u8> {
             limit,
         )?)?,
         Commands::Gc { stale_seconds } => {
-            emit(&store.collect_stale(Duration::from_secs(stale_seconds))?)?;
+            let mut collected = store.collect_stale(Duration::from_secs(stale_seconds))?;
+            // gc is routine, so it reports managed worktrees without ever reclaiming them:
+            // preserving uncommitted agent work is a product invariant, not a default to
+            // trade away for disk. `pidmesh worktrees --reclaim` is the explicit opt-in.
+            let root = PathBuf::from(workspace_root(None)?);
+            if let Ok(worktrees) = IdeManager::new(store.clone(), root).worktrees() {
+                collected["worktrees"] = worktrees;
+            }
+            emit(&collected)?;
         }
         Commands::Run {
             name,
@@ -917,7 +946,7 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     scanned.sort_by_key(|(index, _)| *index);
 
     let mut published = 0usize;
-    let mut skipped = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
     let mut witness = None;
     let mut batch: Vec<(String, WorktreeScan)> = Vec::new();
     for (index, result) in scanned {
@@ -943,7 +972,13 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     }
     // One transaction for the whole sweep: publishing agent by agent recomputes the collision
     // set twice per agent, which is most of a tick once a fleet gets large.
-    store.publish_footprints(&batch)?;
+    // A watcher runs for hours. A publish that fails — a locked database, a vanished agent — is
+    // one bad tick, not a reason to stop observing the fleet, so it is reported like a failed
+    // scan rather than propagated out of the loop.
+    if let Err(error) = store.publish_footprints(&batch) {
+        skipped.push(json!({"publish": "failed", "error": format!("{error:#}")}));
+        published = 0;
+    }
 
     // Nothing else reaps dead sessions, and a crashed agent holds its claims, its reservations
     // and its share of every contested path until something does — which blocks its peers from

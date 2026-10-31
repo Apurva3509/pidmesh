@@ -217,6 +217,9 @@ impl MeshStore {
             path,
             connection: Arc::new(Mutex::new(connection)),
         };
+        // Before initialize(), because the first write creates the -wal and -shm sidecars and
+        // they inherit the mode of the moment, not a later chmod of the main file.
+        store.restrict_permissions()?;
         store.initialize()?;
         store.restrict_permissions()?;
         Ok(store)
@@ -857,6 +860,17 @@ impl MeshStore {
 
             let mut blockers = Vec::new();
 
+            // No footprint means nothing has been observed about this checkout, which is not the
+            // same as having observed that it is clear. A script doing `mergeable && git merge`
+            // would otherwise merge blind.
+            if base_commit.is_none() {
+                blockers.push(json!({
+                    "code": "never_synced",
+                    "detail": "this checkout has not been observed yet; run pidmesh sync or let a \
+                               watcher sweep before merging"
+                }));
+            }
+
             // A worktree cut from a commit the integration branch has moved past may still merge
             // cleanly and be wrong, because it was written against code that no longer exists.
             if let Some(base) = base_commit.as_deref()
@@ -950,6 +964,138 @@ impl MeshStore {
                 "holds_integration_lease": holder.as_deref() == Some(agent_id),
                 "blockers": blockers
             }))
+        })
+    }
+
+    /// Drop footprints whose checkout no longer exists.
+    ///
+    /// A footprint outlives its session on purpose, because a preserved worktree still contests
+    /// the path. Once the checkout is gone that contention cannot be real, and the collision it
+    /// described would otherwise be permanent.
+    fn sweep_orphan_footprints(transaction: &Transaction<'_>) -> Result<usize> {
+        let mut orphan_statement = transaction.prepare(
+            "SELECT DISTINCT a.id, a.workspace_id, a.checkout_path
+             FROM footprints f JOIN agents a ON a.id = f.agent_id
+             WHERE a.status != 'running'",
+        )?;
+        let orphans = orphan_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(orphan_statement);
+
+        let mut abandoned_footprints = 0;
+        let mut touched: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (agent_id, workspace_id, checkout) in orphans {
+            if checkout.is_none_or(|path| !Path::new(&path).is_dir()) {
+                touched.entry(workspace_id).or_default().push(agent_id);
+            }
+        }
+        for (workspace_id, agent_ids) in touched {
+            // Removing a footprint can end a collision, and anything parked on `wait` has to
+            // learn that the same way an explicit withdrawal announces it.
+            let before = collision_signatures(transaction, &workspace_id)?;
+            for agent_id in &agent_ids {
+                abandoned_footprints +=
+                    transaction.execute("DELETE FROM footprints WHERE agent_id = ?", [agent_id])?;
+                transaction.execute(
+                    "DELETE FROM symbol_footprints WHERE agent_id = ?",
+                    [agent_id],
+                )?;
+            }
+            let after = collision_signatures(transaction, &workspace_id)?;
+            for path in before.keys() {
+                if !after.contains_key(path) {
+                    Self::event(
+                        transaction,
+                        &workspace_id,
+                        None,
+                        "collision.cleared",
+                        Some(path),
+                        &json!({"reason": "checkout removed"}),
+                    )?;
+                }
+            }
+        }
+
+        // The event ledger is append-only and nothing else prunes it. Consumers checkpoint on
+        // a sequence and long-poll, so they only ever read the recent tail; keeping an
+        // unbounded history serves nobody and is the last thing on this machine that grows
+        // forever. The newest EVENT_RETENTION per workspace is far more than any live
+        // consumer can fall behind by.
+        Ok(abandoned_footprints)
+    }
+
+    /// Hold every workspace's event ledger to the retention ceiling.
+    ///
+    /// Each workspace's cutoff is resolved first and then deleted below. Expressing the ceiling
+    /// as a correlated subquery re-ranks the whole ledger once per candidate row, which is
+    /// quadratic and took minutes on exactly the ledgers worth trimming.
+    fn trim_event_ledgers(transaction: &Transaction<'_>) -> Result<usize> {
+        let mut workspaces = transaction.prepare("SELECT DISTINCT workspace_id FROM events")?;
+        let ledgers = workspaces
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(workspaces);
+        let mut trimmed = 0;
+        for ledger in ledgers {
+            let cutoff: Option<i64> = transaction
+                .query_row(
+                    "SELECT sequence FROM events WHERE workspace_id = ?
+                     ORDER BY sequence DESC LIMIT 1 OFFSET ?",
+                    params![ledger, EVENT_RETENTION - 1],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(cutoff) = cutoff {
+                trimmed += transaction.execute(
+                    "DELETE FROM events WHERE workspace_id = ? AND sequence < ?",
+                    params![ledger, cutoff],
+                )?;
+            }
+        }
+        Ok(trimmed)
+    }
+
+    /// Append filler events to this agent's workspace.
+    ///
+    /// Exposed for tests only: the retention ceiling is deliberately far above what a normal test
+    /// produces, and the pruning path is the half worth covering.
+    #[doc(hidden)]
+    pub fn seed_events_for_test(&self, agent_id: &str, count: usize) -> Result<()> {
+        self.write(|transaction| {
+            let agent = Self::agent_row(transaction, agent_id)?;
+            for _ in 0..count {
+                Self::event(
+                    transaction,
+                    &agent.workspace_id,
+                    None,
+                    "test.filler",
+                    None,
+                    &json!({}),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Push an agent's heartbeat into the past.
+    ///
+    /// Exposed for tests only: abandonment is time-based, and waiting an hour in a test suite is
+    /// not an option.
+    #[doc(hidden)]
+    pub fn backdate_heartbeat_for_test(&self, agent_id: &str, millis: i64) -> Result<()> {
+        self.write(|transaction| {
+            transaction.execute(
+                "UPDATE agents SET heartbeat_at = heartbeat_at - ? WHERE id = ?",
+                params![millis, agent_id],
+            )?;
+            Ok(())
         })
     }
 
@@ -1502,7 +1648,7 @@ impl MeshStore {
         let cutoff = now_ms()?.saturating_sub(i64::try_from(stale_after.as_millis())?);
         self.write(|transaction| {
             let mut statement = transaction.prepare(
-                "SELECT id, pid, workspace_id FROM agents
+                "SELECT id, pid, workspace_id, heartbeat_at FROM agents
                  WHERE status = 'running' AND heartbeat_at < ?",
             )?;
             let candidates = statement
@@ -1511,14 +1657,23 @@ impl MeshStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, u32>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
             let now = now_ms()?;
+            // A pid only says some process exists, not that it is still this agent: the operating
+            // system recycles pids, and an unrelated process inheriting one keeps a dead session
+            // looking alive forever, holding its claims and blocking its peers from merging.
+            // Silence past the abandonment ceiling is treated as death on its own evidence.
+            let abandoned = now.saturating_sub(ABANDONED_AFTER_MS);
             let dead: Vec<_> = candidates
                 .into_iter()
-                .filter(|(_, pid, _)| !process_is_alive(*pid))
+                .filter(|(_, pid, _, heartbeat_at)| {
+                    !process_is_alive(*pid) || *heartbeat_at < abandoned
+                })
+                .map(|(agent_id, _, workspace_id, _)| (agent_id, 0u32, workspace_id))
                 .collect();
             for (agent_id, _, workspace_id) in &dead {
                 transaction.execute(
@@ -1545,55 +1700,9 @@ impl MeshStore {
             // pass just marked dead. An agent whose worktree is removed after it died would
             // otherwise never be revisited, because the liveness query above selects only
             // 'running' sessions, and its phantom collision would be permanent.
-            let mut orphan_statement = transaction.prepare(
-                "SELECT DISTINCT a.id, a.workspace_id, a.checkout_path
-                 FROM footprints f JOIN agents a ON a.id = f.agent_id
-                 WHERE a.status != 'running'",
-            )?;
-            let orphans = orphan_statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(orphan_statement);
+            let abandoned_footprints = Self::sweep_orphan_footprints(transaction)?;
 
-            let mut abandoned_footprints = 0;
-            let mut touched: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for (agent_id, workspace_id, checkout) in orphans {
-                if checkout.is_none_or(|path| !Path::new(&path).is_dir()) {
-                    touched.entry(workspace_id).or_default().push(agent_id);
-                }
-            }
-            for (workspace_id, agent_ids) in touched {
-                // Removing a footprint can end a collision, and anything parked on `wait` has to
-                // learn that the same way an explicit withdrawal announces it.
-                let before = collision_signatures(transaction, &workspace_id)?;
-                for agent_id in &agent_ids {
-                    abandoned_footprints += transaction
-                        .execute("DELETE FROM footprints WHERE agent_id = ?", [agent_id])?;
-                    transaction.execute(
-                        "DELETE FROM symbol_footprints WHERE agent_id = ?",
-                        [agent_id],
-                    )?;
-                }
-                let after = collision_signatures(transaction, &workspace_id)?;
-                for path in before.keys() {
-                    if !after.contains_key(path) {
-                        Self::event(
-                            transaction,
-                            &workspace_id,
-                            None,
-                            "collision.cleared",
-                            Some(path),
-                            &json!({"reason": "checkout removed"}),
-                        )?;
-                    }
-                }
-            }
+            let trimmed = Self::trim_event_ledgers(transaction)?;
 
             let expired =
                 transaction.execute("DELETE FROM claims WHERE lease_expires_at <= ?", [now])?;
@@ -1605,7 +1714,8 @@ impl MeshStore {
                 "dead_agents": dead.len(),
                 "expired_claims": expired,
                 "expired_resources": expired_resources,
-                "abandoned_footprints": abandoned_footprints
+                "abandoned_footprints": abandoned_footprints,
+                "trimmed_events": trimmed
             }))
         })
     }
@@ -1735,6 +1845,16 @@ impl MeshStore {
     fn restrict_permissions(&self) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+        // The write-ahead log and shared-memory file hold the same contents as the database and
+        // are created by SQLite with the process umask, so they need the same restriction.
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = self.path.clone().into_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.exists() {
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))?;
+            }
+        }
         Ok(())
     }
 
@@ -2123,6 +2243,15 @@ pub struct LiveCheckouts {
 }
 
 /// A live agent session and the checkout it is working in.
+/// How long a session may be silent before it is treated as dead whatever its pid says.
+///
+/// Liveness is normally confirmed by pid, but pids are recycled. This is the ceiling past which
+/// silence alone is sufficient evidence, set far above any plausible heartbeat gap.
+const ABANDONED_AFTER_MS: i64 = 60 * 60 * 1000;
+
+/// Events kept per workspace.
+const EVENT_RETENTION: i64 = 20_000;
+
 /// Task key reserved for the workspace-wide integration lease.
 ///
 /// Merges are serialized through the ordinary claim table rather than a new mechanism: it already
@@ -2212,6 +2341,13 @@ struct SymbolBreak {
 ///
 /// This is the conflict path-level comparison cannot see: two agents edit different files, one
 /// removes or renames an export, and the merge is textually clean but behaviourally broken.
+/// Largest number of symbol breaks reported at once.
+///
+/// A large fleet can produce tens of thousands, which is megabytes of JSON nobody reads and a
+/// report that hides its own first line. The count is reported separately so truncation is
+/// visible rather than implied.
+const MAX_SYMBOL_BREAKS: i64 = 200;
+
 fn workspace_symbol_breaks(
     connection: &Connection,
     workspace_id: &str,
@@ -2229,10 +2365,11 @@ fn workspace_symbol_breaks(
            AND r.kind = 'removed_export'
            AND r.agent_id != u.agent_id
            AND COALESCE(ra.checkout_path, r.agent_id) != COALESCE(a.checkout_path, u.agent_id)
-         ORDER BY r.symbol, u.agent_id",
+         ORDER BY r.symbol, u.agent_id
+         LIMIT ?2",
     )?;
     let rows = statement
-        .query_map(params![workspace_id], |row| {
+        .query_map(params![workspace_id, MAX_SYMBOL_BREAKS], |row| {
             Ok(SymbolBreak {
                 symbol: row.get(0)?,
                 removed_from: row.get(1)?,

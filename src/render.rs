@@ -280,6 +280,9 @@ fn blocker_line(blocker: &Value, palette: &Palette) -> String {
     let code = blocker["code"].as_str().unwrap_or("?");
     let detail = match code {
         "stale_base" => "the integration branch moved since this worktree was cut — rebase".into(),
+        "never_synced" => {
+            "this checkout has not been observed yet — run `pidmesh sync` first".into()
+        }
         "integration_held" => format!(
             "{} is merging right now — wait for the lease",
             blocker["held_by"].as_str().unwrap_or("another agent")

@@ -739,13 +739,27 @@ async fn terminal_socket(
     }
 }
 
+/// Compare two secrets without leaking their matching prefix through timing.
+///
+/// The token is 128 bits over loopback, so this is defence in depth rather than a live threat.
+/// It costs one pass over a short string and removes the question entirely.
+fn secrets_match(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
 fn authorize(state: &DashboardState, headers: &HeaderMap) -> Result<(), ApiError> {
     let expected = format!("Bearer {}", state.token);
-    if headers
+    let presented = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        != Some(expected.as_str())
-    {
+        .unwrap_or_default();
+    if !secrets_match(presented, &expected) {
         return Err(ApiError::Unauthorized);
     }
     if headers
@@ -859,4 +873,15 @@ async fn shutdown_signal(ide: IdeManager) {
         () = terminate => {},
     }
     let _ = task::spawn_blocking(move || ide.stop_all()).await;
+}
+
+#[cfg(test)]
+mod auth_tests {
+    #[test]
+    fn secret_comparison_rejects_a_matching_prefix() {
+        assert!(super::secrets_match("Bearer abc", "Bearer abc"));
+        assert!(!super::secrets_match("Bearer abd", "Bearer abc"));
+        assert!(!super::secrets_match("Bearer ab", "Bearer abc"));
+        assert!(!super::secrets_match("", "Bearer abc"));
+    }
 }

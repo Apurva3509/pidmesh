@@ -1826,3 +1826,180 @@ fn the_dashboard_snapshot_carries_workspace_convergence() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression: prose must not manufacture blockers.
+///
+/// `class`, `type`, `def` and `func` are ordinary English words, and export detection matched
+/// them in any file. Trimming a changelog whose lines began with them, against a peer whose only
+/// change was a comment mentioning them, produced real blockers over work that was fine. A
+/// blocker that fires on prose teaches people to ignore blockers.
+#[test]
+fn prose_does_not_manufacture_blockers() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("CHANGELOG.md"),
+        "class Registry was added\ntype Widget was renamed\ndef process was removed\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "notes"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    // alpha trims the changelog; bravo only writes a comment naming those words.
+    std::fs::write(alpha_tree.join("CHANGELOG.md"), "nothing to report\n")?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "// Registry, Widget and process are described in the changelog.\nfn shared() {}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(
+        report["mergeable"], true,
+        "a changelog edit is not an API change: {report}"
+    );
+    Ok(())
+}
+
+/// Regression: an unobserved checkout is not a clear one.
+///
+/// With no footprint there is no base commit, so no staleness could be detected and `mergeable`
+/// returned true with exit code 0 — a script doing `mergeable && git merge` would merge blind.
+#[test]
+fn a_checkout_that_was_never_synced_cannot_merge() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    // Deliberately no sync.
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
+    assert!(blocker_codes(&report).contains(&"never_synced".to_owned()));
+
+    // Observing it clears the blocker.
+    fleet.sync(&alpha, &alpha_tree)?;
+    let observed = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(observed["mergeable"], true, "{observed}");
+    Ok(())
+}
+
+/// The event ledger is the last thing on a long-lived machine that grew without bound.
+///
+/// Consumers checkpoint on a sequence and long-poll, so they only ever read the recent tail.
+/// Keeping an unbounded history serves nobody, and nothing else prunes it.
+#[test]
+fn garbage_collection_bounds_the_event_ledger() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+
+    // Drive real changes so the ledger genuinely grows; idle sweeps are deliberately silent.
+    for round in 0..60 {
+        std::fs::write(
+            alpha_tree.join("src/shared.rs"),
+            format!("fn shared() {{ /* {round} */ }}\n"),
+        )?;
+        fleet.sync(&alpha, &alpha_tree)?;
+    }
+    let before = fleet.store.events(&alpha, 0, 100_000)?;
+    let before = before.as_array().context("events")?.len();
+    assert!(before > 0, "the ledger must actually have grown");
+
+    let swept = fleet.store.collect_stale(Duration::from_secs(3600))?;
+    assert!(swept["trimmed_events"].is_number(), "{swept}");
+
+    // Under the retention ceiling nothing is discarded: pruning must never cost a live consumer
+    // the tail it is about to read.
+    let after = fleet.store.events(&alpha, 0, 100_000)?;
+    assert_eq!(
+        after.as_array().context("events")?.len(),
+        before,
+        "a small ledger is left alone: {swept}"
+    );
+
+    // Past the ceiling it prunes, keeps the newest, and does so without re-ranking the ledger
+    // per row — the first version of this was quadratic and took minutes.
+    fleet.store.seed_events_for_test(&alpha, 25_000)?;
+    let started = std::time::Instant::now();
+    let swept = fleet.store.collect_stale(Duration::from_secs(3600))?;
+    let elapsed = started.elapsed();
+    assert!(
+        swept["trimmed_events"].as_u64().unwrap_or(0) > 0,
+        "an over-sized ledger is trimmed: {swept}"
+    );
+    let kept = fleet.store.events(&alpha, 0, 100_000)?;
+    let kept = kept.as_array().context("events")?.len();
+    assert!(kept <= 20_000, "the ceiling is respected, kept {kept}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "pruning must not be quadratic, took {elapsed:?}"
+    );
+    Ok(())
+}
+
+/// Regression: a recycled pid must not keep a dead session alive forever.
+///
+/// Liveness was confirmed by pid alone, and the operating system reuses them. An unrelated
+/// process inheriting a dead agent's pid kept that agent `running` indefinitely, holding its
+/// claims and blocking every peer that shared a path with it.
+#[test]
+fn a_long_silent_session_dies_even_if_its_pid_was_reused() -> Result<()> {
+    let fleet = Fleet::new()?;
+    // pid 1 always exists, which is exactly the situation a recycled pid creates.
+    let registration =
+        fleet
+            .store
+            .register_agent("ghost", 1, Some(&fleet.repository), "test", &[], None)?;
+    let ghost = registration["agent_id"]
+        .as_str()
+        .context("agent id")?
+        .to_owned();
+
+    // A recent heartbeat with a live pid is left alone.
+    let fresh = fleet.store.collect_stale(Duration::from_secs(0))?;
+    assert_eq!(fresh["dead_agents"], 0, "a live session is not reaped");
+
+    // Age the heartbeat past the abandonment ceiling.
+    fleet.store.backdate_heartbeat_for_test(&ghost, 7_200_000)?;
+    let reaped = fleet.store.collect_stale(Duration::from_secs(0))?;
+    assert_eq!(reaped["dead_agents"], 1, "{reaped}");
+    Ok(())
+}
+
+/// Regression: a local variable sharing a name with a withdrawn export is not a dependency.
+///
+/// Reference matching is textual, so any file holding the word counted as using it. Two unrelated
+/// pieces of code that happened to pick the same name blocked each other's merge.
+#[test]
+fn a_local_binding_is_not_a_dependency_on_someone_elses_export() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn compute_total() -> u32 {\n    7\n}\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn compute_subtotal() -> u32 {\n    7\n}\n",
+    )?;
+    // bravo binds its own `compute_total`; it never calls anyone else's.
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn local() -> u32 {\n    let compute_total = 3;\n    compute_total\n}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(
+        report["mergeable"], true,
+        "two unrelated uses of one name are not a conflict: {report}"
+    );
+    Ok(())
+}
