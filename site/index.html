@@ -19,8 +19,8 @@
     <meta property="og:type" content="website" />
     <title>PidMesh — The local IDE for agent teams.</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="styles.css?v=20260831-v140" />
-    <script src="script.js?v=20260831-v140" defer></script>
+    <link rel="stylesheet" href="styles.css?v=20261031" />
+    <script src="script.js?v=20261031" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
@@ -71,7 +71,7 @@
           <ul class="hero-facts">
             <li><strong>11.7×</strong><span>faster writes</span></li>
             <li><strong>0</strong><span>cloud accounts</span></li>
-            <li><strong>11</strong><span>native MCP tools</span></li>
+            <li><strong>17</strong><span>native MCP tools</span></li>
           </ul>
         </div>
 
@@ -417,8 +417,10 @@
             One command.<br /><em>Five coordinated agents.</em>
           </h2>
           <p>
-            Install both the CLI and native MCP server from source. Then launch
-            a supervised swarm—or connect agents one by one.
+            Download the installer, read it, run it. It checks a SHA-256 before
+            unpacking and leaves the CLI and the native MCP server in
+            <code>~/.local/bin</code>. Building from source works on every
+            platform and spends 69 seconds compiling SQLite to get there.
           </p>
           <div class="install-links">
             <a
@@ -453,6 +455,16 @@
               type="button"
               role="tab"
               aria-selected="false"
+              aria-controls="panel-source"
+              id="tab-source"
+              data-tab="source"
+            >
+              From source
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected="false"
               aria-controls="panel-swarm"
               id="tab-swarm"
               data-tab="swarm"
@@ -474,12 +486,28 @@
             id="panel-install"
             role="tabpanel"
             aria-labelledby="tab-install"
-          ><code id="install-command"><span class="prompt">$</span> cargo install --git \
-  https://github.com/Apurva3509/pidmesh \
-  --locked
+          ><code id="install-command"><span class="prompt">$</span> curl -fsSL -o pidmesh-install.sh \
+  https://raw.githubusercontent.com/Apurva3509/pidmesh/main/install.sh
+<span class="prompt">$</span> less pidmesh-install.sh
+<span class="prompt">$</span> sh pidmesh-install.sh<samp>
 
-<span class="success">✓</span> Installed pidmesh v1.4.0
-<span class="success">✓</span> Installed pidmesh-mcp v1.4.0</code></pre>
+<span class="success">✓</span> Verified SHA-256 against the published checksum
+<span class="success">✓</span> Installed ~/.local/bin/pidmesh
+<span class="success">✓</span> Installed ~/.local/bin/pidmesh-mcp
+
+Next: pidmesh quickstart</samp></code></pre>
+          <pre
+            id="panel-source"
+            role="tabpanel"
+            aria-labelledby="tab-source"
+            hidden
+          ><code><span class="prompt">$</span> cargo install --git \
+  https://github.com/Apurva3509/pidmesh \
+  --locked<samp>
+
+<span class="comment"># needs a Rust toolchain, and compiles</span>
+<span class="comment"># SQLite from C on the way: about 69s</span>
+<span class="success">✓</span> Installed pidmesh, pidmesh-mcp in ~/.cargo/bin</samp></code></pre>
           <pre
             id="panel-swarm"
             role="tabpanel"
@@ -488,18 +516,20 @@
           ><code><span class="prompt">$</span> pidmesh swarm --workers 5 \
   --name-prefix researcher \
   --provider codex -- \
-  codex exec "Claim one open task"
+  codex exec "Claim one open task"<samp>
 
-<span class="success">●</span> 5 agents joined mesh.local</code></pre>
+<span class="comment"># five worker processes, one supervisor</span>
+<span class="comment"># each child gets PIDMESH_AGENT_ID</span>
+<span class="comment"># Ctrl-C shuts the fleet down cleanly</span></samp></code></pre>
           <pre
             id="panel-mcp"
             role="tabpanel"
             aria-labelledby="tab-mcp"
             hidden
           ><code><span class="prompt">$</span> claude mcp add --scope user \
-  pidmesh -- pidmesh-mcp
+  pidmesh -- pidmesh-mcp<samp>
 
-<span class="success">✓</span> Added stdio MCP server pidmesh</code></pre>
+<span class="success">✓</span> Added stdio MCP server pidmesh</samp></code></pre>
         </div>
       </section>
 

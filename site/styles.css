@@ -1747,14 +1747,21 @@ h2 em {
 
 .terminal-tabs {
   display: flex;
+  overflow-x: auto;
   gap: 25px;
   padding: 0 24px;
   border-bottom: 1px solid #30302c;
+  scrollbar-width: none;
+}
+
+.terminal-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .terminal-tabs button {
   position: relative;
   height: 45px;
+  flex: 0 0 auto;
   padding: 0;
   border: 0;
   background: transparent;
@@ -1788,11 +1795,19 @@ h2 em {
   line-height: 1.8;
 }
 
+.terminal samp {
+  color: #8f8d87;
+  font: inherit;
+}
+
 .prompt {
   color: var(--acid);
 }
 .success {
   color: #3cda79;
+}
+.comment {
+  color: #6b6964;
 }
 
 .final-cta {
@@ -2347,6 +2362,11 @@ h2 em {
   .terminal pre {
     padding: 25px 18px;
     font-size: 10px;
+    /* The installer URL is one long unbreakable token. Wrap it here rather
+       than hiding half of it behind a sideways scroll on a phone. Copying
+       reads the text content, so the real line breaks are unaffected. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .final-cta {
     min-height: 600px;
