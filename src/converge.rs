@@ -548,7 +548,13 @@ fn referenced_symbols(checkout: &Path, paths: &[String]) -> (Vec<String>, bool) 
             continue;
         }
         let absolute = checkout.join(path);
-        if fs::symlink_metadata(&absolute).is_ok_and(|meta| meta.len() > MAX_SCANNED_BYTES) {
+        // `symlink_metadata` describes the link, whose length is the target *string*, so a size
+        // test alone lets a symlink through and the read below then follows it. `digest_of` tests
+        // `is_file()` first for exactly this reason; two readers of the same path must not
+        // disagree about what they are willing to open.
+        if fs::symlink_metadata(&absolute)
+            .is_ok_and(|meta| !meta.is_file() || meta.len() > MAX_SCANNED_BYTES)
+        {
             // Too large to hold in memory every tick. Treated like any other unknown: it
             // contributes no references, and the truncation flag keeps the verdict conservative.
             truncated = true;

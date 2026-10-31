@@ -1226,13 +1226,19 @@ impl MeshStore {
                 params![workspace_id, agent_id, symbol, path],
             )?;
         }
-        for symbol in &scan.symbols.references {
-            transaction.execute(
-                "INSERT OR IGNORE INTO symbol_footprints(
-                    workspace_id, agent_id, kind, symbol, path
-                 ) VALUES (?, ?, 'reference', ?, NULL)",
-                params![workspace_id, agent_id, symbol],
-            )?;
+        // A truncated set is already matched by its sentinel below, so storing the partial list
+        // adds rows that can never change an answer. At fleet scale that mattered: one oversized
+        // generated file per worktree truncated every checkout, and keeping the partial lists
+        // turned a 31 MB database into 367 MB and a 34 ms collision read into 1.1 s.
+        if !scan.symbols.truncated {
+            for symbol in &scan.symbols.references {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO symbol_footprints(
+                        workspace_id, agent_id, kind, symbol, path
+                     ) VALUES (?, ?, 'reference', ?, NULL)",
+                    params![workspace_id, agent_id, symbol],
+                )?;
+            }
         }
         if scan.symbols.truncated {
             // The reference set is incomplete, so it can rule a break in but never out. One
