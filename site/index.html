@@ -38,6 +38,7 @@
       </button>
       <nav class="site-nav" id="site-nav" aria-label="Main navigation">
         <a href="#why">Why PidMesh</a>
+        <a href="#convergence">Convergence</a>
         <a href="#playground">Live demo</a>
         <a href="#benchmarks">Benchmarks</a>
         <a href="https://github.com/Apurva3509/pidmesh#install">Docs</a>
@@ -232,12 +233,123 @@
       </section>
 
       <section
+        class="section convergence-section"
+        id="convergence"
+        aria-labelledby="convergence-title"
+      >
+        <div class="section-heading reveal">
+          <div class="section-kicker"><span>03</span> Observed convergence</div>
+          <h2 id="convergence-title">
+            Nobody reserved it.<br /><em>It collided anyway.</em>
+          </h2>
+          <p>
+            A reservation describes what an agent <em>intends</em> to touch, and
+            only holds when every agent remembers to make one. The convergence
+            guard instead reads what each checkout actually changed—committed
+            and uncommitted—straight from git. Nothing to declare, nobody to
+            cooperate, and nothing for an agent launched by some other harness
+            to opt into.
+          </p>
+        </div>
+
+        <div class="convergence-layout">
+          <div class="terminal convergence-terminal reveal">
+            <div class="terminal-head">
+              <span><i></i><i></i><i></i></span><b>pidmesh — zsh</b>
+            </div>
+            <pre><code><span class="prompt">$</span> pidmesh watch --once<samp>
+2 checkouts scanned, 2 updated
+4 contested paths
+  <span class="sev-bad">x</span> src/legacy.rs               <span class="sev-bad">delete_edit</span>  alpha, bravo
+  <span class="sev-bad">x</span> src/store.rs                <span class="sev-bad">divergent</span>    alpha, bravo
+  <span class="sev-warn">~</span> src/main.rs                 <span class="sev-warn">adjacent</span>     alpha, bravo
+  <span class="sev-dim">·</span> NOTES.md                    <span class="sev-dim">identical</span>    alpha, bravo</samp>
+
+<span class="prompt">$</span> pidmesh mergeable<samp>
+Cannot merge yet — 3 blockers
+  <span class="sev-bad">x</span> src/legacy.rs overlaps bravo (<span class="sev-bad">delete_edit</span>)
+  <span class="sev-bad">x</span> src/store.rs overlaps bravo (<span class="sev-bad">divergent</span>)
+  <span class="sev-bad">x</span> removes compute_total() which bravo still calls</samp></code></pre>
+          </div>
+
+          <div class="severity-copy reveal">
+            <h3>Four words for what a merge would really do.</h3>
+            <dl class="severity-list">
+              <div>
+                <dt data-severity="identical">identical</dt>
+                <dd>
+                  Every checkout reached the same content. Duplicated effort;
+                  either one merges safely, so it never blocks.
+                </dd>
+              </div>
+              <div>
+                <dt data-severity="adjacent">adjacent</dt>
+                <dd>
+                  The same file, separable regions. Git three-way merges this
+                  cleanly, which is what keeps a shared module index from
+                  blocking the whole fleet.
+                </dd>
+              </div>
+              <div>
+                <dt data-severity="divergent">divergent</dt>
+                <dd>
+                  The same file, overlapping regions. This is the one that
+                  silently overwrites somebody's work.
+                </dd>
+              </div>
+              <div>
+                <dt data-severity="delete_edit">delete_edit</dt>
+                <dd>
+                  One agent removed a path another is still editing. Git merges
+                  that quietly in several common orderings, and the edit is
+                  lost.
+                </dd>
+              </div>
+            </dl>
+            <p class="severity-note">
+              Then the conflict that shares no file: one agent withdraws an
+              exported name another still calls. Git merges both without
+              complaint and the result does not build. Detection is textual and
+              deliberately conservative—it says nothing when unsure.
+            </p>
+            <p class="severity-note">
+              The guard reports; it never touches anyone's branches.
+              <code>mergeable</code> exits non-zero, so
+              <code>pidmesh mergeable &amp;&amp; git merge …</code> is a safe
+              thing to write—and merging anyway stays your decision.
+            </p>
+          </div>
+        </div>
+
+        <div class="convergence-proof reveal">
+          <p class="eyebrow"><span></span> Checked against git</p>
+          <div>
+            <p class="proof-lede">
+              Three coding agents, three independent tasks, three linked
+              worktrees, none of them told about the others. PidMesh named three
+              files as contested. <em>git merge then conflicted on exactly those
+              three—no more, no fewer.</em> The agent it cleared merged clean
+              and compiled.
+            </p>
+            <p class="proof-note">
+              <span>One recorded run on this repository, not a benchmark.</span>
+              <a
+                class="text-link"
+                href="https://github.com/Apurva3509/pidmesh/blob/main/docs/performance.md"
+                >Read the record <span aria-hidden="true">↗</span></a
+              >
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section
         class="section playground-section"
         id="playground"
         aria-labelledby="playground-title"
       >
         <div class="section-heading light reveal">
-          <div class="section-kicker"><span>03</span> Live playground</div>
+          <div class="section-kicker"><span>04</span> Live playground</div>
           <h2 id="playground-title">
             Run the mesh.<br /><em>Make it move.</em>
           </h2>
@@ -318,7 +430,7 @@
         aria-labelledby="benchmark-title"
       >
         <div class="section-kicker reveal">
-          <span>04</span> Native speed, measured
+          <span>05</span> Native speed, measured
         </div>
         <div class="benchmark-layout">
           <div class="benchmark-copy reveal">
@@ -374,7 +486,7 @@
         aria-labelledby="architecture-title"
       >
         <div class="section-heading reveal">
-          <div class="section-kicker"><span>05</span> Architecture</div>
+          <div class="section-kicker"><span>06</span> Architecture</div>
           <h2 id="architecture-title">
             No platform to operate.<br /><em>Just one private database.</em>
           </h2>
@@ -411,7 +523,7 @@
       >
         <div class="install-copy reveal">
           <div class="section-kicker">
-            <span>06</span> Start in sixty seconds
+            <span>07</span> Start in sixty seconds
           </div>
           <h2 id="install-title">
             One command.<br /><em>Five coordinated agents.</em>
