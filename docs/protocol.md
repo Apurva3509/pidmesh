@@ -29,6 +29,21 @@ remaining processes to exit and releases their claims and resource reservations.
 The PID check avoids declaring a quiet but live local process dead. Leases still expire independently,
 so abandoned work can be recovered even before garbage collection runs.
 
+A registration records the checkout it was made from, as `checkout_path`, separately from the mesh
+root. The two are different questions: the root is the project every agent shares, while the
+checkout is the worktree this agent is editing. A spawner that starts an agent somewhere other than
+the directory it will work in names the checkout outright; otherwise it is the process directory
+whenever that directory belongs to the same repository. Conflating them publishes a footprint for a
+directory nobody is editing, which reports no collision at all.
+
+A session is only observable while its process is alive, so a registration says where its PID came
+from. `pid_source` is `given` when the caller named one and `assumed` when it was taken from the
+parent, and a registration whose PID is not a running process is refused rather than recorded. An
+assumed PID is the common mistake: a shell that captures the agent id through command substitution
+exits as soon as the call returns, so the registration is dead on arrival. Where that is possible
+the answer carries a caution in `warnings`, and a later publish reports `pid_alive` so a footprint
+is never mistaken for one the mesh can still watch.
+
 ## Memory
 
 Memories are append-only records with a kind, optional key, importance, author, and timestamp. FTS5
@@ -132,6 +147,36 @@ agents launched by an arbitrary harness. A sweep scans each distinct checkout on
 how many sessions occupy it, skips checkouts that have been removed, and ignores sessions whose
 process is gone.
 
+## Sweeps
+
+An agent publishes its own footprint when it calls the protocol. A sweep publishes for a fleet that
+never will: every checkout recorded at registration is scanned by one supervisor, which is what lets
+the guard hold for agents launched from a bare terminal or another vendor's harness.
+
+Because a sweep answers for checkouts it does not control, it reports how much of its answer it
+actually observed. `observation` is `complete` when every checkout scanned, `partial` when some did
+not, `blind` when none did, and `idle` when there was nothing registered to scan. A sweep that
+observed nothing does not report an empty workspace: collisions are computed from stored footprints
+rather than from the scan, so the mesh can still say what it last knew, and `last_observed_at` dates
+that answer. What it must not do is present a recalled answer as a current one, so the clean result
+is withheld entirely when nothing was observed.
+
+`observed` counts sessions and `observed_checkouts` counts checkouts; two agents sharing one
+worktree are two of the first and one of the second. A checkout that could not be scanned is named
+in `skipped` with its reason, and a scan result that cannot be accounted for at all is recorded
+there too rather than silently dropped.
+
+A sweep that finds no checkouts at all asks why before answering. An empty mesh and a directory
+git will never read produce the same silence otherwise, so `workspace_problem` carries the
+diagnosis — no git on the path, not a repository, or a repository with no commits. The probe costs
+one `git rev-parse` and runs only on the empty path, so a busy fleet never pays for it.
+
+A sweep also compares what git knows against what the mesh watches. `git_worktrees` counts the
+checkouts git reports, and `unwatched_worktrees` names those with no agent registered — the gap
+between the two being the most useful thing the guard can tell an operator who has not joined
+anything yet. A probe that cannot ask git is recorded in `skipped` rather than reported as an
+absence of worktrees.
+
 ## Symbol footprints
 
 Paths answer who is touching what. They cannot answer whether two agents working on different
@@ -159,6 +204,13 @@ A withdrawn name that another checkout references is a symbol break. It is attri
 checkout doing the removing rather than the one doing the calling, because that is the side whose
 merge introduces the failure, and it is matched across checkouts rather than agents so two
 sessions in one worktree never break each other.
+
+A report of breaks is capped. The cap bounds the rows returned, not the question asked: the query
+reads one row past it, so `symbol_breaks_truncated` distinguishes a report that stopped early from
+one that found everything. `symbol_break_count` counts the rows returned, which is why it cannot be
+read as a total once that flag is set. Reporting surfaces carry every break in the workspace; the merge gate
+narrows to the asking agent, and it narrows inside the query rather than after the cap, so a peer
+with many breaks of its own cannot push a real blocker out of the window.
 
 ## Merge ordering
 
