@@ -186,6 +186,343 @@ A trivial invocation costs 16.4 ms through the shim against 4.8 ms direct, and a
 per checkout per tick, which is where the difference comes from.
 
 
+## Update: re-measured after the convergence correctness work
+
+Everything from "In short" down was measured before the convergence correctness work landed, and
+most of that work sits in the hot path. The headline numbers below that line turned out to be
+stale in the *optimistic* direction as well as the pessimistic one, so they were taken again on
+the same machine against the same scenarios.
+
+What changed since, and where it lands:
+
+| landed | hot-path cost |
+| --- | --- |
+| diff parser counts hunk body lengths (#38) | in-process, per diff line |
+| `--no-textconv` on the unified diff (#38) | none; it removes work git was doing |
+| `diff --name-status -z` recovery pass (#38) | one extra git process, **conditionally** |
+| NUL sniff on file content (#38) | none; it reads a buffer that was already read |
+| `git worktree list` cross-check (#39) | one git process per sweep |
+| checkout resolution split from workspace (#41) | none in the sweep |
+
+### Machine and toolchain for these figures
+
+Apple M1, 8 cores, 8 GiB RAM, macOS 26.6.2 (25G83), APFS on the internal SSD.
+`rustc 1.99.1 (58cf8f9c3)` / `cargo 1.99.1`, release profile (`lto = "thin"`,
+`codegen-units = 1`). git 2.50.1 (Apple Git-155), resolved by `git_program()` to
+`/Library/Developer/CommandLineTools/usr/bin/git` rather than the `/usr/bin/git` shim.
+
+Read the absolute milliseconds with care. This laptop was running other coding agents and
+compiling Rust throughout, and the one-minute load average over the run ranged from about 7 to
+about 23 on eight cores. Every figure here is a median of five repetitions after a discarded
+warm-up, and where a sample disagrees with its neighbours by more than noise should allow it is
+called out rather than averaged in. One confound was self-inflicted and is worth repeating for
+anyone re-running this: Spotlight indexes the generated fixtures, and `mds`/`corespotlightd`
+took over 200 % of CPU during the first attempt at the scaling matrix. That run was discarded.
+Dropping a `.metadata_never_index` file in the scratch directory removes it, and every figure
+below was taken with one in place.
+
+The ratios are the portable part; the milliseconds are this machine on this one run.
+
+### The sweep got faster, not slower
+
+The old table was measured through the macOS git shim, before `git_program()` resolved past it.
+Re-measured, same scenarios, same fixture shapes:
+
+| Scenario | files | checkouts | changed | Scan (ms) | SQLite (ms) | **Sweep (ms)** | was |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline, small fleet | 2000 | 8 | 10 | 127 | 12 | **146** | 258 (1.8x faster) |
+| baseline, medium fleet | 2000 | 32 | 10 | 254 | 15 | **282** | 926 (3.3x faster) |
+| baseline, large fleet | 2000 | 128 | 10 | 1881 | 25 | **1999** | 4970 (2.5x faster) |
+| dirtier worktrees | 2000 | 32 | 100 | 632 | 49 | **693** | 1280 (1.8x faster) |
+| very dirty worktrees | 2000 | 32 | 1000 | 4071 | 460 | **4561** | 5022 (1.1x faster) |
+| small repository | 500 | 32 | 10 | 194 | 14 | **221** | 870 (3.9x faster) |
+| large repository | 8000 | 32 | 10 | 1335 | 15 | **1378** | 2255 (1.6x faster) |
+
+Every scenario is faster and none is slower, between 1.1x and 3.9x. That is almost entirely the
+shim bypass rather than anything new: the old column was measured against `/usr/bin/git` at a
+~16 ms spawn, and a sweep issues four per checkout per tick.
+
+**No regression from the correctness work is visible at the sweep level.** The scenario that
+improved least — 1 000 changed files per checkout, 1.10x — is the one where git is the smallest
+share of a scan (73.5 %) and which therefore had the least to gain from a cheaper git, not one
+where new work shows up. The in-process half of that scenario, which is where the rewritten diff
+parser would appear if it cost anything, went from 78 ms to 69 ms per serial scan. The parser
+that counts hunk body lengths is doing strictly more bookkeeping than the one that did not, and
+it is still not measurable against the diff it is reading.
+
+The ceiling moves accordingly. Dividing each steady sweep by its checkout count: 15.6 ms per
+checkout at 128 checkouts on a 2 000-file repository, which puts the 5-second interval at
+roughly **320 agents** rather than the 120 recorded below. The pessimistic end moves too — about
+116 agents on an 8 000-file repository, about 35 if every worktree holds a thousand changed
+files. The shape of the advice is unchanged; the numbers under it roughly tripled.
+
+### What the recent correctness work actually costs
+
+**The recovery pass does not run on every scan, and the documentation claiming so is right.**
+Counted directly, by pointing `PIDMESH_GIT` at a wrapper that logs every invocation and then
+execs the real git. One steady-state sweep over 8 checkouts of a 2 000-file repository issues
+**35 git processes**: four per checkout, plus three for the sweep as a whole.
+
+| per checkout, every tick | per sweep |
+| --- | --- |
+| `rev-parse --abbrev-ref HEAD` | `rev-parse --verify --quiet main` (base resolved once) |
+| `merge-base main HEAD` | `rev-parse --show-toplevel --git-common-dir …` (workspace context) |
+| `diff --unified=0 … --no-textconv` | `worktree list --porcelain` (the coverage cross-check) |
+| `status --porcelain=v1 -z -u all` | |
+
+`diff --name-status -z` appears **zero** times. Driving one checkout through each change shape
+and counting again:
+
+| the checkout has | recovery pass runs | git calls |
+| --- | ---: | ---: |
+| nothing changed | no | 5 |
+| a text edit | no | 5 |
+| an untracked file | no | 5 |
+| a changed binary file | **yes** | 6 |
+| a file carrying `-diff` in `.gitattributes` | **yes** | 6 |
+| a mode-only change | **yes** | 6 |
+
+(Five rather than four because a standalone `pidmesh sync` resolves its own base; a sweep
+resolves it once for the whole fleet.) The trigger is exact: it fires when the unified diff
+announced more paths than it named, which is precisely the set of paths that diff could not
+describe. A fleet whose worktrees hold binary assets or a `-diff` lockfile pays it on every
+checkout on every tick — 25 % more git processes than the text-only case — so it is not free,
+but it is not unconditional either.
+
+**The NUL sniff costs nothing measurable, structurally.** `fingerprint_of` replaced `digest_of`,
+and `digest_of` already did `fs::read` of the whole file to hash it. The sniff is
+`content.iter().take(8_000).any(…)` over a buffer that was in memory anyway: no extra open, no
+extra read, and bounded at 8 KB however large the file. On a file at the 64 MiB hashing ceiling
+the SHA-1 over 64 MiB is the cost and the sniff is lost in it.
+
+**The `git worktree list` cross-check is one process per sweep, not per checkout** — but it is
+not free and it is not constant, because `worktree_paths` canonicalises every path git returns:
+
+| checkouts | coverage phase | share of sweep |
+| ---: | ---: | ---: |
+| 8 | 7.2 ms | 5.3 % |
+| 32 | 13.1 ms | 2.7 % |
+| 128 | 94.4 ms | 3.3 % |
+
+It is a linear cost with a small constant, and at every fleet size it is a smaller share of the
+sweep than the one git process it spends most of its time being.
+
+### What one extra git invocation per scan costs
+
+A `.gitattributes` `merge` check was deferred on the grounds that git invocation count is the
+dominant cost. Half of that is right and the half that is wrong is the half the decision turns on.
+
+Priced directly first, on a quiet machine, against a 2 000-file worktree, 120 reps each:
+
+| | |
+| --- | ---: |
+| `/usr/bin/true` (fork+exec floor) | 1.64 ms |
+| `git rev-parse HEAD` (git spawn floor) | 4.32 ms |
+| `git check-attr merge -- <1 path>` | 4.55 ms |
+| `git check-attr merge -- <10 paths>` | 4.53 ms |
+| `git check-attr merge -- <100 paths>` | 4.58 ms |
+
+The call's own work is **+0.23 ms** over a bare `git rev-parse`, and it does not grow with the
+number of paths handed to it — a hundred paths cost the same as one. One extra invocation is
+therefore ~4.5 ms of process start-up and nothing else, which is the number to reason with.
+
+Then measured for real, by adding exactly that call to `scan_worktree` in a throwaway build and
+running the phases suite twice, same fixtures, back to back:
+
+| checkouts | sweep, 4 calls/scan | sweep, 5 calls/scan | delta | |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 135 ms | 157 ms | +22 ms | +16.2 % |
+| 32 | 491 ms | 509 ms | +18 ms | **+3.7 %** |
+| 128 | 2 836 ms | 2 932 ms | +96 ms | **+3.4 %** |
+
+**A sweep is parallel, and that is what the deferral missed.** Scanning runs on
+`available_parallelism()` workers, so one extra call per scan costs roughly one extra spawn per
+*wave* of checkouts, not per checkout: about `ceil(checkouts / workers) x 4.5 ms`. Sixteen waves
+at 128 checkouts predicts +72 ms and +96 ms was measured, which is the right shape.
+
+So: git invocations really are ~90 % of a scan, but one more of them is **3–4 % of a sweep** at
+any realistic fleet size, not the 25 % that "one more of four" suggests. Against the re-measured
+ceiling that moves ~320 agents to ~309. If the `.gitattributes` `merge` check closes a real
+false-safe, 3–4 % is what it costs, and performance is not a reason on its own to decline it.
+
+One caveat, stated rather than hidden: the 8-checkout row is +16.2 %, much worse than the other
+two, because eight checkouts on eight workers means every extra spawn lands at once with no
+wave to amortise across. Small fleets pay proportionally more for an extra call than large ones.
+
+The serial single-checkout probe agrees for 8 and 32 checkouts (+5.9 ms and +5.5 ms on a ~38 ms
+scan). Its 128-checkout sample is discarded: that probe reported a 18.75 ms git spawn floor
+against 4.55 ms in the other arm, so the whole sample is uniformly inflated by load and says
+nothing about the extra call.
+
+### Where the time goes now
+
+With the replay fixed (see below), one checkout scanned serially, 2 000 files, 50 changed:
+
+| | 8 checkouts | 32 | 128 |
+| --- | ---: | ---: | ---: |
+| serial scan per checkout | 39.2 ms | 37.2 ms | 38.5 ms |
+| of which git subprocesses | 35.3 ms | 33.6 ms | 34.8 ms |
+| of which in-process | 3.9 ms | 3.6 ms | 3.6 ms |
+| **git share** | **90.0 %** | **90.4 %** | **90.6 %** |
+| git spawn floor | 5.1 ms | 4.3 ms | 4.6 ms |
+| git ÷ SQLite over the whole sweep | 5.2x | 10.6x | 14.0x |
+
+Four git processes per checkout at a ~4.5 ms floor is ~18 ms of the ~35 ms git cost, so about
+half of a scan is still process start-up and the other half is git doing work. The earlier claim
+that "roughly 80–95 ms of the 96–120 ms git cost is process start-up" described the shim.
+
+### Three faults in the benchmark itself
+
+The numbers above differ from the ones below partly because the benchmark was measuring the
+wrong thing. All three are fixed in `examples/converge_bench.rs`.
+
+**It replayed the shim.** `git_share` spawned `Command::new("git")`, which finds `/usr/bin/git`
+through `PATH`, while `scan_worktree` resolves past it via `converge::git_program()`. The replay
+was timing a process 3.5x more expensive than the one under test, which is why it reported git
+shares of **329 %, 340 % and 368 %** of the scans they were supposedly part of — a number that
+cannot be true and was printed anyway. It also means the "16–19 ms spawn floor, consistently, in
+every scenario of both suites" recorded below is the shim's floor. The floor this tool actually
+pays is **4.3–5.1 ms**.
+
+**It replayed a call the scan no longer makes.** The replay issued
+`rev-parse --verify --quiet main` per checkout. With an explicit base — which is how the watcher
+calls `scan_worktree`, having resolved the branch once for the sweep — `resolve_base_ref` returns
+without asking git anything. Every checkout was charged for a process it never started, and
+`git_calls_per_scan` was hard-coded to 5. It is 4, plus the conditional recovery pass.
+
+**It left out a phase the sweep performs.** `watch_pass` ends every tick with the
+`git worktree list` coverage cross-check; the replay did not, so the benchmark was cheaper than
+the thing it models. It is now a reported phase of its own rather than folded into `sqlite_ms`,
+which names the phases containing no git.
+
+### A quadratic in the diff parser, found and fixed
+
+`read_diff` ends by discarding withdrawn names that come straight back, which is what keeps a
+rewritten signature from reading as a removed export:
+
+```rust
+removed.retain(|(symbol, _)| !added.contains(symbol));
+```
+
+`added` was a `Vec<String>`, so `contains` is a linear scan and the whole statement is
+`O(removed x added)`. Both sides grow with the number of changed export lines in one diff, so
+the cost is quadratic in exactly one input: how many exported declarations a single commit
+rewrites. Measured per `pidmesh sync`, one checkout re-emitting a generated bindings file with
+every exported name changed:
+
+| exported names rewritten | `Vec` | `BTreeSet` | |
+| ---: | ---: | ---: | ---: |
+| 8 000 | 165 ms | 47 ms | 3.5x |
+| 16 000 | 381 ms | 66 ms | 5.8x |
+| 32 000 | 1 505 ms | 91 ms | 16.5x |
+| 64 000 | 7 124 ms | 122 ms | **58.6x** |
+
+Four times the input for sixteen times the work, which is the signature. Building a set once
+before the retain makes it linear; the set is a one-line change and the membership test it
+replaces is identical, so nothing about the verdict moves.
+
+This is worth more than its own row because of where it lands. The pathology this note already
+warns about — one large generated file per worktree — is the same file: generated bindings are a
+list of exported declarations, regenerating them rewrites all of them, and neither size guard
+reaches this path. `MAX_SCANNED_BYTES` bounds the identifier harvest and `MAX_HASHED_BYTES`
+bounds the digest, but a diff is parsed whole however large it is. A fleet of 32 agents each
+regenerating a 32 000-export bindings file was paying 1.5 s per checkout per tick inside a phase
+the benchmark attributes to "in-process work" and reports as single-digit milliseconds.
+
+### Nothing else is superlinear
+
+Three axes scaled deliberately past the point where a quadratic would show.
+
+**Fleet size** is linear-with-a-penalty, as before. Between 8 and 128 checkouts the marginal cost
+of one more checkout is flat to slightly rising, which is eight workers saturating rather than
+any term in the work itself.
+
+**Contested paths** had never been varied: `Fixture::dirty` spreads each checkout's edits across
+its own band and leaves only `HUB_FILES` — two — overlapping, so the entire scaling matrix
+exercised the collision query with two contested paths however large the fleet got. That is the
+one input the collision report is actually shaped by, so a new `contested` suite holds the fleet
+at 16 and scales the shared set instead.
+
+| contested paths | collisions | publish (ms) | `collisions` (ms) | report µs/path | sweep (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 25 | 25 | 7.6 | 1.9 | 78 | 189 |
+| 50 | 50 | 12.7 | 3.7 | 74 | 256 |
+| 100 | 100 | 23.1 | 7.2 | 72 | 380 |
+| 200 | 200 | 46.8 | 14.3 | 72 | 622 |
+| 400 | 400 | 96.9 | 29.0 | 72 | 1060 |
+| 800 | 800 | 201.0 | 64.2 | 80 | 1946 |
+
+Thirty-two times the contested set costs 34x the report and 26x the publish. Per contested path
+the report is flat at 72–80 µs and the publish at 232–305 µs across the whole range, and each
+doubling multiplies both by about 2.0 — 1.89, 1.95, 2.00, 2.03, 2.21 for the report. A quadratic
+would show 4.0. The `ROW_NUMBER()` window and the `path IN (SELECT … GROUP BY path HAVING
+COUNT(*) > 1)` self-reference both hold up: SQLite materialises the `ranked` CTE once rather than
+re-deriving it per path. The last doubling is slightly over 2.0 and the per-path cost ticks from
+72 to 80 µs; at 800 contested paths across 16 checkouts that is 12 800 participant rows, and it
+reads as cache rather than a term in the query.
+
+So the collision query is linear in the product of contested paths and participants, which is
+the size of its own output. That is the right shape, and it is now measured rather than assumed.
+
+**Ledger size** behaves exactly as documented, which is its own kind of result — the database
+section below needed no revision at all. 32 checkouts, 50 changed files each, 60 ticks per phase:
+
+| | re-measured | recorded below |
+| --- | ---: | ---: |
+| growth over 60 idle ticks | **0.00 KB/tick** | 0 bytes |
+| growth over 60 churning ticks | 74.8 KB/tick | ~75 KB/tick |
+| events appended with nothing sweeping | 61 986 | 61 986 |
+| events after one `collect_stale` | 20 000 | 20 000 |
+| cost of that catch-up trim | 108 ms | 121 ms |
+| cost of trimming an at-ceiling ledger | 1.7 ms/tick | 2.1 ms/tick |
+| database before / after the trim | 30.3 MB / 35.0 MB | 30.3 MB / 35.0 MB |
+
+Idle sweeps still write zero bytes, the 20 000-row cap still holds exactly, and trimming still
+makes the file larger rather than smaller. Nothing in the event ledger is superlinear in the
+number of events: the catch-up trim of 62 000 rows costs 108 ms once, and the steady-state trim
+of an at-ceiling ledger costs 1.7 ms per tick regardless.
+
+### Pathological inputs, re-measured
+
+| Case | scan now | recorded below |
+| --- | ---: | ---: |
+| One untracked 32 MiB file | 65 ms | 133 ms |
+| One untracked 80 MiB file | 19 ms | 92 ms |
+| 20 000 tiny untracked files | 1 648 ms (+148 ms publish, 16.2 MB) | 1 796 ms (+173 ms, 16 MB) |
+| 50 files at directory depth 172 | 38 ms | 117 ms |
+| One 1.9 MiB source file, 114 000 identifiers | 48 ms | 118 ms |
+| 3 000-commit history, branch cut at the root | 108 ms (`merge-base` 90 ms) | 215 ms (`merge-base` 128 ms) |
+
+The 80 MiB file is still cheaper than the 32 MiB one, for the same reason as before: it is over
+the hashing ceiling, so it is refused rather than read. The size guards still work and the
+conservative direction is still the fast one.
+
+### The case that used to blow up does not any more
+
+The section below records a truncated reference set taking a 128-checkout sweep from 8.6 s to
+12.3 s and a 31 MB database to **367 MB**. Re-measured on the same fixture shape:
+
+| 128 checkouts, 400 shared exports, one withdrawing 200 | normal references | reference set truncated |
+| --- | ---: | ---: |
+| Scan | 4 914 ms | 4 975 ms |
+| Publish | 333 ms | **5.9 ms** |
+| `collisions` report | 12.7 ms | **1.6 ms** |
+| Whole sweep | 5 348 ms | **5 076 ms** |
+| Database | 30.8 MB | **3.8 MB** |
+
+The truncated column is now *cheaper* than the normal one across the board, and the 367 MB is
+3.8 MB. `publish_footprints` stopped storing the partial reference list when the set is
+truncated, because a truncated checkout is matched by its `reference_truncated` sentinel anyway
+and the partial rows could never change an answer — one row instead of 5 000 per checkout. That
+landed in #25; this note had not caught up with it.
+
+The verdict is unchanged and so is the advice: a truncated reference set still makes a checkout
+match every withdrawn export, which is still a loss of precision, and generated files still do
+not belong in agent worktrees. But it is a correctness-of-reporting problem now, not a
+367 MB one, and "the thing that breaks it" in the summary below is no longer the thing that
+breaks it. The largest remaining cost at that shape is the scan, like everywhere else.
+
+
 This note measures the convergence layer — the `pidmesh watch` sweep and the `pidmesh collisions`
 report it produces — and says where it stops keeping up. It is deliberately unflattering: the
 interesting number is the one where the thing breaks, not the one where it looks good.
@@ -195,6 +532,13 @@ Everything below is a median of repeated runs on one machine. The benchmark that
 in the repository, so the numbers can be re-measured rather than believed.
 
 ## In short
+
+> Superseded in part. Every sweep figure from here to the end of the note was measured through
+> the macOS git shim and before the convergence correctness work; see "Update: re-measured after
+> the convergence correctness work" above for the current numbers. The per-checkout cost is
+> ~16 ms rather than 42 ms, the ceiling is ~320 agents rather than 120, the spawn floor is
+> ~4.5 ms rather than 16–19 ms, and the 367 MB truncation blow-up no longer reproduces. The
+> structure of the argument below still holds; its constants do not.
 
 On an 8-core M1 laptop, a `pidmesh watch` sweep costs about **42 ms per agent checkout**, which puts
 the default 5-second interval out of reach at roughly **120 agents** on a 2 000-file repository —
@@ -230,7 +574,7 @@ cargo build --release --example converge_bench
 ./target/release/examples/converge_bench --scratch /tmp/pm-bench --suite all --reps 5
 ```
 
-Suites are `scale`, `phases`, `growth`, `pathological`, or a comma-separated subset; `--ticks` sets
+Suites are `scale`, `contested`, `phases`, `growth`, `pathological`, or a comma-separated subset; `--ticks` sets
 the sweeps per phase in the growth suite, and `--keep` leaves the fixtures on disk. Each sweep
 figure is the median of five repetitions after a discarded warm-up sweep; each pathological case is
 the median of three. Fixtures are rebuilt from scratch for every scenario and deleted afterwards.
@@ -572,6 +916,8 @@ Worth doing, in rough order of payoff:
 * `pidmesh mergeable` is not benchmarked. It recomputes the workspace collision set and then does
   pairwise `classify` work per contested path, which is the one shape in the convergence layer that
   looks quadratic and has no measurement behind it. That is a gap, not a clean bill of health.
+  The `contested` suite now scales contested paths directly and finds the *collision* side linear
+  to 800 paths, which narrows the gap without closing it: `mergeable` itself is still unmeasured.
 * Everything here is one machine, one filesystem, one git build. The ratios should travel; the
   milliseconds will not.
 * The fleet in these measurements does nothing but hold dirty files. Real agents compile and run
@@ -598,6 +944,20 @@ measured after an expensive one reads as zero whatever it used.
 copied in place      lstat size 300.4 MiB   peak RSS of `pidmesh sync`:   0.2 MiB
 symlinked            lstat size 133 bytes   peak RSS of `pidmesh sync`: 534.7 MiB
 ```
+
+### Update: this no longer reproduces
+
+The guard gained an `is_file()` test in #25, which is the same test `digest_of` was already
+applying, so the two readers of a path now agree about what they are willing to open. A symlink
+fails it, contributes no references, and sets the truncation flag — the conservative direction.
+Re-run exactly as described above, expensive case first:
+
+```
+copied in place      lstat size 300.00 MiB  peak RSS of `pidmesh sync`:   9.3 MiB
+symlinked            lstat size 127 bytes   peak RSS of `pidmesh sync`:   9.3 MiB
+```
+
+Identical, and neither reads the file. The 9.3 MiB is the process itself.
 
 Both exit zero. The control shows the ceiling working as intended; the symlink shows it skipped
 entirely. In a `watch` sweep this is paid every tick, and the scan phase runs eight checkouts in
