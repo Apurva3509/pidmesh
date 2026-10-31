@@ -1,0 +1,61 @@
+# cargo-deny configuration for pidmesh.
+#
+# Checked in CI by .github/workflows/ci.yml (`supply-chain` job) on every push,
+# every pull request, and on a weekly schedule. The schedule matters: new
+# advisories are published against dependencies we have not changed, so a check
+# that only runs on code changes will go stale between releases.
+#
+# Run it locally with:  cargo deny check
+
+[graph]
+# Only evaluate the platforms we actually ship binaries for (see the release
+# matrix in .github/workflows/release.yml). Without this, cargo-deny walks the
+# dependency graph for every target in the universe and reports on crates that
+# are never compiled into a pidmesh binary -- for example the UEFI backend of
+# `getrandom`, which drags in `r-efi`.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+# No `ignore` entries, deliberately. pidmesh is a tool people install and run
+# on their own machines; an advisory here should be fixed by updating the
+# dependency, not muted. If something genuinely does not apply, add it with a
+# comment explaining why and a link to the reasoning.
+ignore = []
+
+[licenses]
+# Every license below was observed in the current dependency graph; this is not
+# a speculative allow-list. Re-derive it with `cargo deny list` after a
+# significant dependency change rather than appending to it blindly.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# `cargo deny check bans` currently reports duplicate major versions of
+# `thiserror`, `nix`, `bitflags`, `hashbrown` and friends. These come from
+# transitive dependencies we do not control (portable-pty still pulls
+# thiserror 1.x), so duplicates are a warning rather than a hard failure --
+# otherwise CI breaks on upstream's release schedule rather than on ours.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Only crates.io. A git or path dependency sneaking into a release build is
+# exactly the kind of thing this check exists to catch.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

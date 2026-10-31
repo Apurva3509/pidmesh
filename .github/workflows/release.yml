@@ -5,16 +5,49 @@ on:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  verify-version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Publishing a tag whose number disagrees with the manifest ships
+      # binaries that report the wrong version forever. Cheaper to fail here
+      # than to yank a release.
+      - name: Compare release tag with package version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          manifest="$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml | head -n1)"
+          if [ -z "$manifest" ]; then
+            echo "::error file=Cargo.toml::could not read version from [package]"
+            exit 1
+          fi
+          if [ "$manifest" != "${TAG#v}" ]; then
+            echo "::error::release tag '$TAG' does not match Cargo.toml version '$manifest'"
+            exit 1
+          fi
+          echo "Tag $TAG matches Cargo.toml version $manifest"
+
   binaries:
+    needs: verify-version
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # ARM Linux (Graviton, Ampere, ARM dev boxes) builds on a native
+          # arm64 runner rather than via cross-compilation: rusqlite's
+          # `bundled` feature compiles SQLite from C, so a cross build would
+          # need a working aarch64 C toolchain and linker. Native sidesteps
+          # that entirely. These runners are free for public repositories.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -29,11 +62,48 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --bins --locked --target ${{ matrix.target }}
-      - name: Package binaries
+      # Every leg of this matrix is a native build, so the artefact can be run
+      # before it is published. This catches a binary that does not start at
+      # all, and a build made from the wrong commit.
+      - name: Smoke-test the built binaries
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          archive="pidmesh-${{ github.event.release.tag_name }}-${{ matrix.target }}.tar.gz"
+          dir="target/${{ matrix.target }}/release"
+          test -x "$dir/pidmesh"
+          test -x "$dir/pidmesh-mcp"
+          reported="$("$dir/pidmesh" --version)"
+          echo "$reported"
+          case "$reported" in
+            *"${TAG#v}"*) ;;
+            *)
+              echo "::error::binary reports '$reported', expected version ${TAG#v}"
+              exit 1
+              ;;
+          esac
+      - name: Package binaries
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          archive="pidmesh-${TAG}-${{ matrix.target }}.tar.gz"
+          # LICENSE travels with the binaries: MIT asks that the notice
+          # accompany distributions, and a downloaded tarball is one.
           tar -czf "$archive" \
-            -C "target/${{ matrix.target }}/release" pidmesh pidmesh-mcp
-          gh release upload "${{ github.event.release.tag_name }}" "$archive"
+            -C "target/${{ matrix.target }}/release" pidmesh pidmesh-mcp \
+            -C "$GITHUB_WORKSPACE" LICENSE README.md
+          # Checksums let people verify a download without trusting the
+          # transport. sha256sum is GNU-only; macOS runners have shasum.
+          # Both emit the same "<digest>  <name>" format that `sha256sum -c`
+          # and `shasum -a 256 -c` accept.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+          cat "$archive.sha256"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256"

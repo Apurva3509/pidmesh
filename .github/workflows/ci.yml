@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Advisories are published against dependencies we have not touched, so the
+    # supply-chain job has to run on a clock rather than only on code changes.
+    # Without this, a crate we depend on can be vulnerable for weeks of quiet.
+    - cron: "17 6 * * 1"
 
 permissions:
   contents: read
@@ -35,3 +40,55 @@ jobs:
       - run: cargo test --all-targets --locked
       - run: cargo build --release --bins --locked
       - run: target/release/pidmesh --version
+
+  msrv:
+    name: Build on declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The toolchain version is read from Cargo.toml rather than written here.
+      # Pinning it in both places creates a second source of truth that drifts,
+      # and the drift is silent: CI keeps passing against the wrong compiler.
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::no rust-version key found in [package]"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+      # --all-targets so tests, examples and both binaries are compiled: a
+      # newer-than-MSRV construct in a test is still a broken MSRV claim.
+      - run: cargo build --locked --all-targets
+
+  package:
+    name: Verify the crate is publishable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+      # Catches a manifest that cannot be published -- missing or malformed
+      # crates.io metadata, files excluded from the package that the build
+      # needs, a dirty version -- on the PR instead of on release day.
+      - run: cargo publish --dry-run --locked
+
+  supply-chain:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Configuration lives in deny.toml at the repository root.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
