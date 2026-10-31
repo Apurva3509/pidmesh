@@ -249,9 +249,8 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         .ok()
         .filter(|name| name != "HEAD" && !name.is_empty());
     let base_ref = resolve_base_ref(checkout, base_ref)?;
-    let base_commit = git_text(checkout, &["merge-base", &base_ref, "HEAD"]).map_err(|_| {
-        anyhow!("no merge base between HEAD and {base_ref}; a checkout with no commits cannot be scanned")
-    })?;
+    let base_commit = git_text(checkout, &["merge-base", &base_ref, "HEAD"])
+        .map_err(|_| base_failure(checkout, &base_ref))?;
 
     let summary = read_diff(checkout, &base_commit)?;
     let mut regions = summary.regions;
@@ -322,6 +321,28 @@ pub fn integration_head(checkout: &Path, base_ref: Option<&str>) -> Result<(Stri
     Ok((base_ref, head))
 }
 
+/// Explain why a base could not be used, paying for a probe only once it has already failed.
+fn base_failure(checkout: &Path, base_ref: &str) -> anyhow::Error {
+    // An unborn HEAD makes every ref lookup fail, so check it first or the answer blames the
+    // branch name for a checkout that simply has no history yet.
+    if git_text(checkout, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err() {
+        return anyhow!("this checkout has no commits yet, so there is nothing to compare");
+    }
+    if git_text(checkout, &["rev-parse", "--verify", "--quiet", base_ref]).is_err() {
+        anyhow!("base ref not found in checkout: {base_ref}")
+    } else {
+        anyhow!("no merge base between HEAD and {base_ref}; they share no history")
+    }
+}
+
+/// Resolve the integration branch once, so a sweep does not re-probe it in every checkout.
+///
+/// Linked worktrees share one ref store, so whichever branch exists for one of them exists for
+/// all of them.
+pub fn resolve_base(checkout: &Path, requested: Option<&str>) -> Result<String> {
+    resolve_base_ref(checkout, requested)
+}
+
 /// Pick the integration branch to measure against.
 fn resolve_base_ref(checkout: &Path, requested: Option<&str>) -> Result<String> {
     if let Some(requested) = requested {
@@ -331,10 +352,10 @@ fn resolve_base_ref(checkout: &Path, requested: Option<&str>) -> Result<String> 
             !requested.starts_with('-'),
             "base ref must not start with a dash: {requested}"
         );
-        ensure!(
-            git_text(checkout, &["rev-parse", "--verify", "--quiet", requested]).is_ok(),
-            "base ref not found in checkout: {requested}"
-        );
+        // Deliberately not verified here. `merge-base` below rejects an unknown ref anyway, and
+        // a sweep spends almost all of its time starting git processes rather than running them:
+        // one avoidable invocation per checkout per tick is the single largest saving available.
+        // The error path pays for the nicer message instead of the happy path.
         return Ok(requested.to_owned());
     }
     for candidate in DEFAULT_BASE_REFS {
