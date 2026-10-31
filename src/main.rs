@@ -15,7 +15,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use pidmesh::converge::{WorktreeScan, integration_head, scan_worktree};
+use pidmesh::converge::{WorktreeScan, integration_head, resolve_base, scan_worktree};
 use pidmesh::ide::IdeManager;
 use pidmesh::render::{self, Shape};
 use pidmesh::store::{
@@ -1182,6 +1182,15 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     // Publishing stays serial: it is one short transaction each and the store holds one
     // connection, so contending for it would only add lock traffic.
     let checkouts: Vec<(&PathBuf, &Vec<AgentCheckout>)> = grouped.iter().collect();
+
+    // Resolve the integration branch once for the sweep. Linked worktrees share a ref store, so
+    // probing it in every checkout costs an extra git start-up per checkout per tick and always
+    // reaches the same answer.
+    let resolved_base = checkouts
+        .first()
+        .and_then(|(path, _)| resolve_base(path, base).ok());
+    let base = resolved_base.as_deref().or(base);
+
     let cursor = AtomicUsize::new(0);
     let scans: Mutex<Vec<(usize, Result<WorktreeScan>)>> = Mutex::new(Vec::new());
     let workers = thread::available_parallelism()
