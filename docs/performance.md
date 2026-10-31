@@ -1,5 +1,47 @@
 # Convergence performance
 
+## Validation with live agents
+
+Every other check here constructs the conflict it then detects. This one did not: three coding
+agents were given independent tasks against a clone of this repository, each in its own linked
+worktree, none told about the others, with a watcher sweeping every five seconds throughout.
+
+- one added a `--limit` option to the `collisions` subcommand
+- one renamed `MeshStore::collisions`
+- one capped how many rows the collisions view prints
+
+The sweep log, unedited:
+
+```
+21:49:39  src/store.rs   divergent    alpha,bravo
+21:49:44  src/main.rs    adjacent     alpha,bravo
+21:49:49  src/main.rs    divergent    alpha,bravo
+21:49:54  src/mcp.rs     divergent    alpha,bravo
+```
+
+The second and third lines are the severity model working on its own: `src/main.rs` was genuinely
+separable at 21:49:44 and stopped being separable five seconds later, as one agent's edits grew
+into the other's region. Nothing constructed that transition.
+
+Checked against what actually happens, after all three agents finished:
+
+| the mesh said | `git merge` did |
+| --- | --- |
+| `src/main.rs` divergent | conflict |
+| `src/mcp.rs` divergent | conflict |
+| `src/store.rs` divergent | conflict |
+| the third agent is clear | merged cleanly, compiled |
+
+Three predicted, three conflicts, the same three files. The rename also raised two symbol breaks,
+attributed to the agent doing the removing rather than the two still calling the old name, which
+is why the third agent stayed mergeable while appearing in them.
+
+One caution for anyone repeating this. The first run of this comparison produced a *clean* merge
+and looked like a false alarm. It was not: the work had been committed mid-flight while an agent
+was still editing, and that agent then reverted its own commit, so the branches compared were not
+the trees the watcher had scanned. Let the agents finish before capturing their state, or the
+measurement describes something that never existed.
+
 ## Differential validation against the compiler
 
 A symbol break claims something stronger than a merge conflict: that the merge will be *clean* and
