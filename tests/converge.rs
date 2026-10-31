@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -1170,5 +1171,158 @@ fn the_integration_lease_admits_one_merge_at_a_time() -> Result<()> {
         .store
         .release(&bravo, pidmesh::store::INTEGRATION_TASK_KEY)?;
     assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
+    Ok(())
+}
+
+/// The case that decides whether this signal is usable at fleet scale.
+///
+/// A shared router or module index is edited by every agent. Flagging it `divergent` every time
+/// trains an operator to ignore collisions. Git merges edits to separable regions of one file
+/// cleanly, so the mesh must say so.
+#[test]
+fn separate_regions_of_a_shared_file_do_not_conflict() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let routes = (1..=60).fold(String::new(), |mut routes, line| {
+        let _ = writeln!(routes, "route_{line}();");
+        routes
+    });
+    std::fs::write(fleet.repository.join("src/routes.rs"), &routes)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "routes"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Each agent registers its own route, far apart in the same file.
+    let top: String = routes.replace("route_3();", "route_3_owned_by_alpha();");
+    let bottom: String = routes.replace("route_55();", "route_55_owned_by_bravo();");
+    std::fs::write(alpha_tree.join("src/routes.rs"), &top)?;
+    std::fs::write(bravo_tree.join("src/routes.rs"), &bottom)?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let collisions = fleet.collisions(&alpha)?;
+    let routes_collision = at(&collisions, "src/routes.rs").context("expected a collision")?;
+    assert_eq!(
+        routes_collision["severity"], "adjacent",
+        "separable edits must not read as overwriting: {routes_collision}"
+    );
+
+    // And an adjacent collision must not block the merge either.
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], true, "{report}");
+    Ok(())
+}
+
+#[test]
+fn edits_to_the_same_region_of_a_shared_file_still_conflict() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let routes = (1..=60).fold(String::new(), |mut routes, line| {
+        let _ = writeln!(routes, "route_{line}();");
+        routes
+    });
+    std::fs::write(fleet.repository.join("src/routes.rs"), &routes)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "routes"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Both rewrite the same line.
+    std::fs::write(
+        alpha_tree.join("src/routes.rs"),
+        routes.replace("route_30();", "route_30_alpha();"),
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/routes.rs"),
+        routes.replace("route_30();", "route_30_bravo();"),
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let collisions = fleet.collisions(&alpha)?;
+    let routes_collision = at(&collisions, "src/routes.rs").context("expected a collision")?;
+    assert_eq!(routes_collision["severity"], "divergent");
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    assert_eq!(report["mergeable"], false, "{report}");
+    Ok(())
+}
+
+/// Severity is a property of a pair, not of a path.
+///
+/// Four agents can share one file while only two of them overlap. Blocking the other two because
+/// the path as a whole is contested would serialize a fleet that has no actual conflict — which
+/// is exactly what an end-to-end run of eight agents exposed.
+#[test]
+fn one_overlapping_pair_does_not_block_everyone_on_a_shared_file() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let routes = (1..=80).fold(String::new(), |mut routes, line| {
+        let _ = writeln!(routes, "route_{line}();");
+        routes
+    });
+    std::fs::write(fleet.repository.join("src/routes.rs"), &routes)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "routes"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    let (charlie, charlie_tree) = fleet.agent("charlie")?;
+    let (delta, delta_tree) = fleet.agent("delta")?;
+
+    // alpha and bravo edit far-apart regions; charlie and delta fight over one line.
+    std::fs::write(
+        alpha_tree.join("src/routes.rs"),
+        routes.replace("route_5();", "route_5_alpha();"),
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/routes.rs"),
+        routes.replace("route_70();", "route_70_bravo();"),
+    )?;
+    std::fs::write(
+        charlie_tree.join("src/routes.rs"),
+        routes.replace("route_40();", "route_40_charlie();"),
+    )?;
+    std::fs::write(
+        delta_tree.join("src/routes.rs"),
+        routes.replace("route_40();", "route_40_delta();"),
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    fleet.sync(&charlie, &charlie_tree)?;
+    fleet.sync(&delta, &delta_tree)?;
+
+    // The path as a whole is contested by four agents and is divergent overall.
+    let collisions = fleet.collisions(&alpha)?;
+    let routes_collision = at(&collisions, "src/routes.rs").context("expected a collision")?;
+    assert_eq!(
+        routes_collision["participants"].as_array().map(Vec::len),
+        Some(4)
+    );
+
+    // But only the pair that actually overlaps is blocked.
+    assert_eq!(
+        readiness(&fleet, &alpha, &alpha_tree)?["mergeable"],
+        true,
+        "alpha overlaps nobody"
+    );
+    assert_eq!(
+        readiness(&fleet, &bravo, &bravo_tree)?["mergeable"],
+        true,
+        "bravo overlaps nobody"
+    );
+
+    let blocked = readiness(&fleet, &charlie, &charlie_tree)?;
+    assert_eq!(blocked["mergeable"], false, "{blocked}");
+    let peers = blocked["blockers"][0]["peers"]
+        .as_array()
+        .context("peers")?;
+    assert_eq!(
+        peers.len(),
+        1,
+        "only the overlapping peer is named: {blocked}"
+    );
+    assert_eq!(peers[0]["agent_name"], "delta");
+    assert_eq!(peers[0]["severity"], "divergent");
     Ok(())
 }
