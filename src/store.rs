@@ -1099,6 +1099,43 @@ impl MeshStore {
         })
     }
 
+    /// Return space freed by deletions to the filesystem, when there is enough to be worth it.
+    ///
+    /// Trimming rows marks pages free; it does not shrink the file, so a long-lived mesh is a
+    /// high-water mark. Measured: trimming 100,000 events left a 72 MB database with 83% of its
+    /// pages free. `VACUUM` rewrites the database, so it is deliberately not run by a watcher on
+    /// every tick — it belongs to `gc`, which is occasional and explicit.
+    pub fn compact(&self) -> Result<Value> {
+        let (free, total) = self.read(|connection| {
+            Ok((
+                connection.query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?,
+                connection.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?,
+            ))
+        })?;
+        // Rewriting the whole file to reclaim a few pages costs more than it returns.
+        let worthwhile = total > 0 && free * 4 > total && free > 256;
+        if !worthwhile {
+            return Ok(json!({
+                "compacted": false,
+                "free_pages": free,
+                "total_pages": total
+            }));
+        }
+        self.read(|connection| {
+            connection.execute_batch("VACUUM")?;
+            Ok(())
+        })?;
+        let reclaimed = self.read(|connection| {
+            Ok(connection.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?)
+        })?;
+        self.restrict_permissions()?;
+        Ok(json!({
+            "compacted": true,
+            "pages_before": total,
+            "pages_after": reclaimed
+        }))
+    }
+
     /// Live agents in this workspace that have a recorded checkout.
     ///
     /// A supervisor uses this to observe a fleet that never calls `sync` itself: every checkout is

@@ -2089,3 +2089,36 @@ fn a_git_that_cannot_run_is_reported_as_such() -> Result<()> {
     );
     Ok(())
 }
+
+/// Trimming rows frees pages; it does not shrink the file.
+///
+/// A long-lived mesh was therefore a high-water mark: trimming 100,000 events left a 72 MB
+/// database with 83% of its pages free. Reclaiming rewrites the database, so it belongs to `gc`
+/// rather than to a watcher's tick.
+#[test]
+fn garbage_collection_returns_space_to_the_filesystem() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, _alpha_tree) = fleet.agent("alpha")?;
+
+    // Comfortably past the retention ceiling, so trimming leaves a large free list.
+    fleet.store.seed_events_for_test(&alpha, 60_000)?;
+    fleet.store.collect_stale(Duration::from_secs(3600))?;
+
+    let before = fleet.store.compact()?;
+    assert_eq!(before["compacted"], true, "{before}");
+    let pages_before = before["pages_before"].as_i64().context("pages_before")?;
+    let pages_after = before["pages_after"].as_i64().context("pages_after")?;
+    assert!(
+        pages_after < pages_before,
+        "the file must actually shrink: {before}"
+    );
+
+    // Running it again must decline rather than rewrite the database for nothing.
+    let again = fleet.store.compact()?;
+    assert_eq!(again["compacted"], false, "{again}");
+
+    // And the mesh must still be intact and answerable afterwards.
+    let events = fleet.store.events(&alpha, 0, 10)?;
+    assert!(events.is_array(), "the ledger still reads after a rewrite");
+    Ok(())
+}

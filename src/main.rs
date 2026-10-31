@@ -695,6 +695,9 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
             if let Ok(worktrees) = IdeManager::new(store.clone(), root).worktrees() {
                 collected["worktrees"] = worktrees;
             }
+            // Reclaiming space rewrites the database, so it belongs here rather than in a
+            // watcher's tick: gc is occasional and explicit.
+            collected["compaction"] = store.compact()?;
             emit(&collected)?;
         }
         Commands::Run {

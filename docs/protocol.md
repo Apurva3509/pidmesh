@@ -180,6 +180,15 @@ The integration lease is an ordinary claim under a reserved task key rather than
 It therefore inherits exactly-one-owner semantics, lease expiry so a crashed holder cannot wedge
 the queue permanently, and release through the existing agent lifecycle.
 
+## Reclaiming space
+
+Deleting rows marks pages free inside the database; it does not return them to the filesystem, so
+a mesh that has trimmed a large ledger stays at its high-water mark. Reclaiming rewrites the whole
+database, which is far too expensive for a watcher to do on a tick, so it belongs to garbage
+collection: occasional, explicit, and skipped entirely unless enough of the file is free to be
+worth the rewrite. Owner-only permissions are reapplied afterwards, because a rewrite creates a
+new file.
+
 ## Event stream
 
 Every coordination mutation appends an event with a monotonically increasing sequence. Consumers can
