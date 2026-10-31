@@ -1,5 +1,29 @@
 # Convergence performance
 
+## Differential validation against git
+
+Severity is a claim about what a merge will do, so it can be checked against one. Eighty generated
+two-agent scenarios, each rewriting a random band of lines in a shared file: ask the mesh for a
+verdict, then actually perform the merge and see.
+
+The first run disagreed three times in forty, always in the dangerous direction — reported
+`adjacent`, meaning safe to merge, and then conflicted. Every case had the two bands on
+consecutive lines.
+
+The cause was that severity asked whether the rewritten regions *overlap*, which is not the
+question a three-way merge asks. It needs unchanged material between two changed regions to keep
+them apart. Measured directly against git:
+
+| unchanged lines between the edits | result |
+| ---: | --- |
+| 0 | conflict |
+| 1 or more | merges cleanly |
+
+With one line of separation required, eighty trials agree with git exactly: no verdict of safe
+that conflicts, and no verdict of conflict that merges. The asymmetry matters more than the
+symmetry — a false alarm costs a rebase nobody needed, while a false clean sends an agent into a
+conflict the tool promised was not there.
+
 ## Validation on a real repository
 
 Every figure elsewhere in this note comes from generated repositories: uniform files, trivial
