@@ -2003,3 +2003,50 @@ fn a_local_binding_is_not_a_dependency_on_someone_elses_export() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression: a symlink must not walk around the file-size ceiling.
+///
+/// `symlink_metadata` describes the link, whose length is the target *string*, so a size test
+/// alone let any symlink through and the read then followed it. A benchmark reached 534 MiB of
+/// resident memory through a linked generated file — paid on every tick, for every checkout
+/// scanned in parallel. `digest_of` tests `is_file()` first; the two readers of the same path
+/// must not disagree about what they are willing to open.
+#[test]
+fn a_symlink_cannot_bypass_the_scan_ceiling() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (_alpha, alpha_tree) = fleet.agent("alpha")?;
+
+    // Comfortably past MAX_SCANNED_BYTES, reachable only through a link.
+    let target = alpha_tree.join("..").join("generated.rs");
+    std::fs::write(&target, "pub fn generated() {}\n".repeat(200_000))?;
+    assert!(
+        std::fs::metadata(&target)?.len() > 2 * 1024 * 1024,
+        "the target must exceed the ceiling for this to prove anything"
+    );
+    std::os::unix::fs::symlink(&target, alpha_tree.join("src/linked.rs"))?;
+
+    let scan = scan_worktree(&alpha_tree, Some("main"))?;
+    let linked = scan
+        .entries
+        .iter()
+        .find(|entry| entry.path == "src/linked.rs")
+        .context("the link is still reported as a change")?;
+    assert!(
+        linked.digest.is_none(),
+        "a symlink has no comparable content of its own"
+    );
+    assert!(
+        scan.symbols.truncated,
+        "skipping it must mark the scan incomplete rather than pass silently"
+    );
+    // The link's target declares `generated`; reading through it would have harvested that name.
+    assert!(
+        !scan
+            .symbols
+            .references
+            .iter()
+            .any(|name| name == "generated"),
+        "the target's contents must never have been read"
+    );
+    Ok(())
+}

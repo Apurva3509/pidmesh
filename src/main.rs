@@ -11,7 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use pidmesh::converge::{WorktreeScan, integration_head, scan_worktree};
@@ -23,120 +24,202 @@ use pidmesh::store::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+/// Local process-aware memory and coordination for concurrent AI agents.
+///
+/// PidMesh gives every agent process working in one repository a shared SQLite mesh: an identity
+/// tied to a real PID, durable memory, an inbox, task leases, resource reservations, and a
+/// convergence guard that observes what each git checkout actually changed and refuses a merge
+/// that would overwrite a live peer or withdraw a name it still calls.
+///
+/// Nothing leaves the machine. There is no daemon, no account and no network call.
+///
+/// Commands print prose at a terminal and JSON everywhere else, so a person reads sentences while
+/// a pipe, a redirect or an agent still gets the object it parses. Use --json to force JSON.
+///
+/// Start with: quickstart, join, watch, mergeable.
+// clap prints these doc comments verbatim in --help, so they are prose for a reader rather than
+// rustdoc; backticking the command names the lint wants would put the backticks on screen.
+#[allow(clippy::doc_markdown)]
 #[derive(Parser)]
-#[command(name = "pidmesh", version, about)]
+#[command(
+    name = "pidmesh",
+    version,
+    after_help = "Run 'pidmesh quickstart' for the three commands that take a fresh checkout all \
+                  the way to a guarded merge."
+)]
 struct Cli {
     /// Emit JSON even when stdout is a terminal.
     #[arg(long, global = true)]
     json: bool,
 
+    /// Mesh database to open; defaults to pidmesh.db under your home directory.
     #[arg(long, global = true, env = "PIDMESH_DB")]
     db: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
 
+// Same reason as Cli: this help text is read on a terminal, not rendered as rustdoc.
+#[allow(clippy::doc_markdown)]
 #[derive(Subcommand)]
 enum Commands {
+    /// Print the three commands that take a fresh checkout to a guarded merge.
+    Quickstart,
+    /// Create the mesh database and report which workspace it is bound to.
     Init {
+        /// Repository to bind the mesh to; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Register this process as an agent and print the identity every other command needs.
     Join {
+        /// Readable name for this agent, such as planner or implementer.
         #[arg(long)]
         name: String,
+        /// Process to treat as the agent; defaults to the shell that invoked this command.
         #[arg(long)]
         pid: Option<u32>,
+        /// Harness driving this agent, such as codex, claude or cursor.
         #[arg(long, default_value = "unknown")]
         provider: String,
+        /// A capability this agent offers; repeat the flag to declare several.
         #[arg(long = "capability")]
         capabilities: Vec<String>,
+        /// Repository this agent works in; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Prove this agent is still alive so a sweep does not reap what it holds.
     Heartbeat {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Mark this agent stopped and release its claims and reservations.
     Leave {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Write a durable note into the memory every agent in the mesh can search.
     Remember {
+        /// What to remember.
         text: String,
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// What kind of note this is, such as note, decision or handoff.
         #[arg(long, default_value = "note")]
         kind: String,
+        /// Stable key, so writing the same key again supersedes the earlier note.
         #[arg(long)]
         key: Option<String>,
+        /// Weight between 0 and 1 used to rank this note during a recall.
         #[arg(long, default_value_t = 0.5)]
         importance: f64,
     },
+    /// Search the shared memory, ranked by relevance and importance.
     Recall {
+        /// Full-text query to rank memories against.
         query: String,
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// Most memories to return.
         #[arg(long, default_value_t = 10)]
         limit: u32,
     },
+    /// Deliver a message to one agent, or broadcast it to the whole mesh.
     Send {
+        /// Message body.
         text: String,
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// Agent to deliver to; the default broadcasts to every agent.
         #[arg(long = "to", default_value = "*")]
         recipient: String,
+        /// Thread identifier, so a reply can be matched back to its request.
         #[arg(long)]
         correlation_id: Option<String>,
     },
+    /// Read the messages addressed to this agent, and optionally acknowledge them.
     Inbox {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// Include messages this agent already acknowledged.
         #[arg(long)]
         all: bool,
+        /// Acknowledge everything this call returns.
         #[arg(long)]
         ack: bool,
+        /// Most messages to return.
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+    /// Take an exclusive lease on a task so no peer starts the same work.
     Claim {
+        /// Task key to claim; any stable string the fleet agrees on.
         task: String,
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// How long the claim survives without a heartbeat.
         #[arg(long, default_value_t = 300)]
         lease_seconds: u64,
+        /// Note stored with the claim so peers can see what is being done.
         #[arg(long)]
         detail: Option<String>,
     },
+    /// Give up a task lease before it expires.
     Release {
+        /// Task key to release.
         task: String,
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Declare the paths, ports and services this agent intends to touch.
     Reserve {
+        /// Resources to reserve, each prefixed path:, port: or service:.
         #[arg(required = true)]
         resources: Vec<String>,
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// Task these reservations belong to.
         #[arg(long)]
         task: Option<String>,
+        /// Note stored with the reservations so peers can see why they are held.
         #[arg(long)]
         detail: Option<String>,
+        /// How long the reservations survive without a heartbeat.
         #[arg(long, default_value_t = 300)]
         lease_seconds: u64,
     },
+    /// List the paths, ports and services every live agent currently owns.
     Resources {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Release reserved paths, ports or services.
     Unreserve {
+        /// Resources to release, each prefixed path:, port: or service:.
         #[arg(required = true)]
         resources: Vec<String>,
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
     },
     /// Observe this checkout and publish what it actually changed.
+    ///
+    /// Pure observation: it reads git, never writes to the checkout, and counts committed,
+    /// uncommitted and untracked work alike. A footprint is authoritative per agent, so a
+    /// checkout that merges and cleans up drops out of every collision on its next scan.
     Sync {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
         /// Integration branch to measure against; defaults to main, then master.
@@ -147,31 +230,46 @@ enum Commands {
         checkout: Option<PathBuf>,
     },
     /// Report paths contested by more than one agent's observed footprint.
+    ///
+    /// Each contested path is classified by what a merge would really do to it, and withdrawn
+    /// exported names that another live checkout still calls are reported alongside.
     Collisions {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
     },
     /// Decide whether this agent can merge without breaking another checkout.
+    ///
+    /// Exits 1 and names every blocker when it cannot, so 'pidmesh mergeable && git merge ...'
+    /// is a safe thing to write.
     Mergeable {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// Integration branch to measure against; defaults to main, then master.
         #[arg(long)]
         base: Option<String>,
+        /// Checkout to judge; defaults to the current directory.
         #[arg(long)]
         checkout: Option<PathBuf>,
     },
     /// Take or release the workspace-wide integration lease that serializes merges.
+    ///
+    /// Exits 1 when another agent already holds it and is merging right now.
     Integrate {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
         /// Release the lease instead of taking it.
         #[arg(long)]
         release: bool,
+        /// How long the lease survives without a heartbeat.
         #[arg(long, default_value_t = 900)]
         lease_seconds: u64,
     },
     /// List managed worktrees, showing which hold work and which can be reclaimed.
     Worktrees {
+        /// Repository to inspect; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Remove every worktree that is provably spent. Work is never discarded.
@@ -179,96 +277,149 @@ enum Commands {
         reclaim: bool,
     },
     /// Check that this workspace is actually one shared mesh.
+    ///
+    /// Exits 1 when two workspace roots belong to one repository, which silently gives every
+    /// checkout its own mesh while every other command still reports success.
     Doctor {
+        /// Repository to check; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
     /// Withdraw this agent's footprint from the mesh.
     Unsync {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
     },
     /// Observe every live checkout in this workspace on an interval.
+    ///
+    /// Needs no cooperation from anyone: registration already recorded every checkout, so one
+    /// watcher covers agents that will never call sync themselves. It also reaps dead sessions.
     Watch {
+        /// Repository to sweep; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Integration branch to measure against; defaults to main, then master.
         #[arg(long)]
         base: Option<String>,
+        /// Seconds to wait between sweeps.
         #[arg(long, default_value_t = 5.0)]
         interval_seconds: f64,
         /// Run a single pass and exit.
         #[arg(long)]
         once: bool,
     },
+    /// Show who is alive in the mesh, what they hold, and what they are working on.
     Status {
+        /// Restrict the report to one agent.
         #[arg(long)]
         agent: Option<String>,
+        /// Repository to report on; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Read this agent's event ledger forward from a cursor.
     Events {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// Return only events after this ledger cursor.
         #[arg(long, default_value_t = 0)]
         after: i64,
+        /// Most events to return.
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    /// Block until this agent's next event arrives, instead of polling for it.
     Wait {
+        /// Agent to act as; defaults to the identity in the environment.
         #[arg(long)]
         agent: Option<String>,
+        /// Wait only for events after this ledger cursor.
         #[arg(long, default_value_t = 0)]
         after: i64,
+        /// Give up after this many seconds and return whatever arrived.
         #[arg(long, default_value_t = 30.0)]
         timeout_seconds: f64,
+        /// Most events to return.
         #[arg(long, default_value_t = 100)]
         limit: u32,
     },
+    /// Reap sessions whose process is gone and release everything they held.
     Gc {
+        /// How long a session may be silent before its process is checked.
         #[arg(long, default_value_t = 30)]
         stale_seconds: u64,
     },
+    /// Run a command as a supervised agent, heartbeating for it until it exits.
     Run {
+        /// Readable name for the agent this command runs as.
         #[arg(long)]
         name: String,
+        /// Harness driving this agent, such as codex, claude or cursor.
         #[arg(long, default_value = "unknown")]
         provider: String,
+        /// Repository this agent works in; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Seconds between heartbeats while the child runs.
         #[arg(long, default_value_t = 5.0)]
         heartbeat_seconds: f64,
+        /// Command to supervise, after a double dash. Its exit code becomes this one.
         #[arg(last = true, required = true)]
         child_command: Vec<OsString>,
     },
+    /// Run many copies of a command as independently addressable agent processes.
     Swarm {
+        /// Name each worker with this prefix and its index.
         #[arg(long, default_value = "worker")]
         name_prefix: String,
+        /// Harness driving these agents, such as codex, claude or cursor.
         #[arg(long, default_value = "unknown")]
         provider: String,
+        /// Repository these agents work in; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// How many worker processes to start, between 1 and 64.
         #[arg(long, default_value_t = 5)]
         workers: u16,
+        /// Seconds between heartbeats while the workers run.
         #[arg(long, default_value_t = 5.0)]
         heartbeat_seconds: f64,
+        /// Seconds a worker gets to exit on its own before it is killed.
         #[arg(long, default_value_t = 2.0)]
         shutdown_grace_seconds: f64,
+        /// Stop the remaining workers as soon as one of them fails.
         #[arg(long)]
         fail_fast: bool,
+        /// Command to run in every worker, after a double dash.
         #[arg(last = true, required = true)]
         child_command: Vec<OsString>,
     },
+    /// Serve the private browser IDE for this workspace on localhost.
     #[command(alias = "ui")]
     Dashboard {
+        /// Repository to serve; defaults to the current directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Port to bind on localhost; 0 picks a free one.
         #[arg(long, default_value_t = 4399)]
         port: u16,
+    },
+    /// Print a shell completion script on stdout.
+    ///
+    /// Install it once and every subcommand, flag and alias here completes by name. See the
+    /// README for the one line each shell needs.
+    Completions {
+        /// Shell to generate the script for.
+        shell: Shell,
     },
 }
 
 static FORCE_JSON: AtomicBool = AtomicBool::new(false);
+
+/// Set when stdout went away mid-write, so the exit status says so without a panic.
+static PIPE_CLOSED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> ExitCode {
     match run() {
@@ -283,16 +434,34 @@ fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn run() -> Result<u8> {
     let cli = Cli::parse();
     FORCE_JSON.store(cli.json, Ordering::Relaxed);
-    let database = match cli.db {
+    // These two are answered out of the binary itself. Opening the store first would create a
+    // database as a side effect of printing a completion script into a shell startup file, and
+    // nobody reading the quickstart has a mesh to open yet.
+    match cli.command {
+        Commands::Completions { shell } => {
+            completions(shell)?;
+            Ok(0)
+        }
+        Commands::Quickstart => {
+            quickstart()?;
+            Ok(0)
+        }
+        command => dispatch(cli.db, command),
+    }
+}
+
+/// Everything that needs the mesh: open the database once, then act.
+#[allow(clippy::too_many_lines)]
+fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
+    let database = match db {
         Some(path) => path,
         None => default_database_path()?,
     };
     let store = MeshStore::new(&database)?;
-    match cli.command {
+    match command {
         Commands::Init { workspace } => emit(&json!({
             "database": database,
             "workspace": workspace_root(workspace.as_deref())?
@@ -575,8 +744,101 @@ fn run() -> Result<u8> {
             runtime.block_on(pidmesh::dashboard::serve(store, workspace, port))?;
             return Ok(0);
         }
+        // Both are answered in run() before the store is ever opened. They are repeated here so
+        // the match stays total without a panic, and so either path behaves identically.
+        Commands::Completions { shell } => completions(shell)?,
+        Commands::Quickstart => quickstart()?,
     }
     Ok(0)
+}
+
+/// Write a completion script for `shell` to stdout.
+///
+/// This is the one command that does not answer to the JSON contract, because what lands on
+/// stdout is sourced by a shell: wrapping it in an object would make it unusable. Completions are
+/// generated from the live `Cli` definition, so a subcommand or flag added above completes without
+/// anyone remembering to update a checked-in script.
+fn completions(shell: Shell) -> Result<()> {
+    // Generated into memory first: writing straight to stdout puts the panic on a closed pipe
+    // inside the generator, where it cannot be handled.
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "pidmesh", &mut script);
+    write_out(String::from_utf8(script)?.trim_end())
+}
+
+/// The three commands that take a fresh checkout to a guarded merge.
+///
+/// Twenty-eight subcommands do not tell a newcomer which three actually matter, and a fleet only
+/// converges once every checkout is registered, something is observing them, and merges are gated.
+/// Kept in step with `QUICKSTART_PROSE` by hand: one is read by a person, the other parsed.
+fn quickstart_steps() -> Value {
+    json!({
+        "steps": [
+            {
+                "step": 1,
+                "run_in": "every checkout, once",
+                "command": "pidmesh join --name planner --provider codex",
+                "why": "Registers the process and prints the agent id. Export it as \
+                        PIDMESH_AGENT_ID in that shell and every later command knows who it \
+                        speaks for."
+            },
+            {
+                "step": 2,
+                "run_in": "the repository, once",
+                "command": "pidmesh watch",
+                "why": "Sweeps every live checkout from git alone, so agents that never call \
+                        pidmesh themselves are still covered. It also reaps crashed sessions."
+            },
+            {
+                "step": 3,
+                "run_in": "before every merge",
+                "command": "pidmesh mergeable && git merge my-branch",
+                "why": "Exits non-zero and names the blocker when merging would overwrite a \
+                        live peer or withdraw a name another checkout still calls."
+            }
+        ],
+        "then": [
+            {"command": "pidmesh status", "answers": "who is alive and what they hold"},
+            {"command": "pidmesh collisions", "answers": "which paths are contested right now"},
+            {"command": "pidmesh doctor", "answers": "whether this really is one shared mesh"}
+        ]
+    })
+}
+
+/// The same three steps, written for a person rather than a parser.
+const QUICKSTART_PROSE: &str = "\
+PidMesh in three commands.
+
+  1. Join — once per checkout
+       pidmesh join --name planner --provider codex
+
+     Export the id it prints as PIDMESH_AGENT_ID in that shell. Every later
+     command then knows which agent it is speaking for.
+
+  2. Watch — once per repository
+       pidmesh watch
+
+     One sweep observes every live checkout from git alone, so agents that
+     never call pidmesh themselves are still covered, and crashed sessions
+     stop holding what their peers are waiting on.
+
+  3. Gate — before every merge
+       pidmesh mergeable && git merge my-branch
+
+     mergeable exits non-zero and names the blocker when merging would
+     overwrite a live peer or withdraw a name another checkout still calls.
+
+Then, whenever you want to know more:
+  pidmesh status        who is alive and what they hold
+  pidmesh collisions    which paths are contested right now
+  pidmesh doctor        whether this really is one shared mesh";
+
+/// Print the quickstart: prose at a terminal, the same steps as JSON everywhere else.
+fn quickstart() -> Result<()> {
+    if FORCE_JSON.load(Ordering::Relaxed) || !render::is_interactive() {
+        return emit(&quickstart_steps());
+    }
+    write_out(QUICKSTART_PROSE)
 }
 
 struct SwarmWorker {
@@ -1036,8 +1298,31 @@ fn bail_duration<T>() -> Result<T> {
 }
 
 fn emit(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
+    write_out(&serde_json::to_string_pretty(value)?)
+}
+
+/// Write a line to stdout, treating a closed pipe as an ordinary end rather than a failure.
+///
+/// Rust ignores `SIGPIPE`, so a write to a reader that has gone away surfaces as an error and the
+/// print macros turn it into a panic with a backtrace. `pidmesh collisions | head` is a completely
+/// reasonable thing to type, and every other tool in the pipeline exits quietly when it happens.
+/// Restoring the default disposition would need `unsafe`, which this crate denies, so the error is
+/// handled where it arrives instead.
+fn write_out(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            PIPE_CLOSED.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Print for whoever is reading: prose at a terminal, JSON everywhere else.
@@ -1049,10 +1334,7 @@ fn present(shape: Shape, value: &Value) -> Result<()> {
         return emit(value);
     }
     match render::render(shape, value) {
-        Some(text) => {
-            println!("{text}");
-            Ok(())
-        }
+        Some(text) => write_out(&text),
         None => emit(value),
     }
 }

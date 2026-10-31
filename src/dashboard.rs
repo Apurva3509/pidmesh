@@ -532,6 +532,11 @@ async fn claim(
     Json(request): Json<ClaimRequest>,
 ) -> Result<Json<Value>, ApiError> {
     validate_label("task", &request.task)?;
+    // The sibling reservation route bounds the same field; leaving this one unchecked let a
+    // body-limit-sized string through to the store on a route that otherwise validates.
+    if let Some(detail) = request.detail.as_deref() {
+        validate_text("detail", detail)?;
+    }
     let lease_seconds = request.lease_seconds.unwrap_or(300);
     if !(1..=86_400).contains(&lease_seconds) {
         return Err(ApiError::BadRequest(

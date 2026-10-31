@@ -104,6 +104,35 @@ Release archives contain both `pidmesh` and `pidmesh-mcp`:
 gh release download --repo Apurva3509/pidmesh --pattern 'pidmesh-*'
 ```
 
+### Shell completions
+
+`pidmesh completions <shell>` writes a completion script to stdout, generated from the parser
+itself, so every subcommand, flag and alias completes and nothing drifts between releases. Pick
+the line for your shell:
+
+```bash
+# bash
+pidmesh completions bash > /usr/local/etc/bash_completion.d/pidmesh
+
+# zsh — any directory on $fpath works
+pidmesh completions zsh > "${fpath[1]}/_pidmesh"
+
+# fish
+pidmesh completions fish > ~/.config/fish/completions/pidmesh.fish
+```
+
+`elvish` and `powershell` are generated too. This is the one command that does not emit JSON to a
+pipe: what lands on stdout is meant to be sourced.
+
+### Where to start
+
+```bash
+pidmesh quickstart
+```
+
+It prints the three commands that take a fresh checkout to a guarded merge — join, watch, gate —
+and what each one buys you.
+
 ## Open the local agent IDE
 
 Launch a private browser dashboard for the current workspace:
