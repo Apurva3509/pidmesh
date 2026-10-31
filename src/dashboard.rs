@@ -249,6 +249,12 @@ fn router(state: DashboardState) -> Router {
         .route("/api/v1/ide/sessions/{id}/terminal", get(ide_terminal))
         .route("/api/v1/ide/files", get(ide_files))
         .route("/api/v1/ide/file", get(ide_file))
+        // Reporting is a read and reclaiming is a delete, so the destructive half cannot be
+        // reached by the same request the dashboard makes on every refresh.
+        .route(
+            "/api/v1/ide/worktrees",
+            get(ide_worktrees).delete(ide_reclaim),
+        )
         .layer(DefaultBodyLimit::max(MAX_TEXT_BYTES))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -491,6 +497,26 @@ async fn ide_sessions(
     authorize(&state, &headers)?;
     let ide = state.ide.clone();
     Ok(Json(ide_blocking(move || ide.sessions()).await?))
+}
+
+async fn ide_worktrees(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.worktrees()).await?))
+}
+
+/// Reclaiming is gated on the control token rather than the read token: it is the only IDE
+/// operation that removes something from disk, so it sits beside launch, stop, and approve.
+async fn ide_reclaim(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize_control(&state, &headers)?;
+    let ide = state.ide.clone();
+    Ok(Json(ide_blocking(move || ide.reclaim()).await?))
 }
 
 async fn ide_launch(

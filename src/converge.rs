@@ -58,16 +58,6 @@ impl ChangeKind {
             Self::Modified
         }
     }
-
-    /// Classify a `git diff --name-status` letter.
-    #[must_use]
-    fn from_diff_letter(letter: char) -> Self {
-        match letter {
-            'A' => Self::Added,
-            'D' => Self::Deleted,
-            _ => Self::Modified,
-        }
-    }
 }
 
 /// One changed path inside an agent's checkout.
@@ -96,6 +86,12 @@ pub struct SymbolFootprint {
     pub removed_exports: Vec<(String, String)>,
     /// Identifiers appearing in this checkout's changed files.
     pub references: Vec<String>,
+    /// Whether the reference set hit its cap and is therefore incomplete.
+    ///
+    /// An incomplete set cannot be used to rule a break out, only to rule one in, so a truncated
+    /// checkout is treated as referencing everything. Silently dropping the overflow turned a
+    /// generated file in someone's worktree into a clean merge over a real break.
+    pub truncated: bool,
 }
 
 /// A complete observation of one checkout at a point in time.
@@ -230,17 +226,14 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         anyhow!("no merge base between HEAD and {base_ref}; a checkout with no commits cannot be scanned")
     })?;
 
-    // Later sources overwrite earlier ones, so uncommitted state wins over committed state.
-    let mut kinds: BTreeMap<String, ChangeKind> = BTreeMap::new();
-    for (path, kind) in committed_changes(checkout, &base_commit)? {
-        kinds.insert(path, kind);
+    let summary = read_diff(checkout, &base_commit)?;
+    let mut regions = summary.regions;
+    let removed_exports = summary.removed_exports;
+    let mut kinds = summary.kinds;
+    // The diff is authoritative for anything it covers; status only fills in what it cannot see.
+    for (path, kind) in status_only_changes(checkout)? {
+        kinds.entry(path).or_insert(kind);
     }
-    for (path, kind) in uncommitted_changes(checkout)? {
-        kinds.insert(path, kind);
-    }
-
-    let (mut regions, removed_exports, _) =
-        changed_regions(checkout, &base_commit).unwrap_or_default();
 
     let entries: Vec<FootprintEntry> = kinds
         .into_iter()
@@ -277,9 +270,11 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         .filter(|entry| entry.change_kind != ChangeKind::Deleted)
         .map(|entry| entry.path.clone())
         .collect();
+    let (references, truncated) = referenced_symbols(checkout, &live);
     let symbols = SymbolFootprint {
         removed_exports,
-        references: referenced_symbols(checkout, &live),
+        references,
+        truncated,
     };
     Ok(WorktreeScan {
         base_ref,
@@ -323,69 +318,24 @@ fn resolve_base_ref(checkout: &Path, requested: Option<&str>) -> Result<String> 
     bail!("no default integration branch found; pass an explicit --base")
 }
 
-/// Changes committed on this branch since the base commit.
-fn committed_changes(checkout: &Path, base_commit: &str) -> Result<Vec<(String, ChangeKind)>> {
-    let raw = git_bytes(
-        checkout,
-        &[
-            "diff",
-            "--name-status",
-            "--no-renames",
-            "-z",
-            base_commit,
-            "HEAD",
-        ],
-    )?;
-    // `-z` emits alternating NUL-terminated status and path fields.
-    let mut fields = split_nul(&raw).into_iter();
-    let mut changes = Vec::new();
-    while let Some(status) = fields.next() {
-        let Some(path) = fields.next() else {
-            break;
-        };
-        let Some(letter) = status.chars().next() else {
-            continue;
-        };
-        changes.push((path, ChangeKind::from_diff_letter(letter)));
-    }
-    Ok(changes)
-}
-
-/// Uncommitted changes, including untracked files.
-fn uncommitted_changes(checkout: &Path) -> Result<Vec<(String, ChangeKind)>> {
-    let raw = git_bytes(
-        checkout,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--no-renames",
-        ],
-    )?;
-    // `-z` emits one NUL-terminated `XY <path>` record per change.
-    Ok(split_nul(&raw)
-        .into_iter()
-        .filter_map(|record| {
-            let code = record.get(..2)?;
-            let path = record.get(3..)?;
-            if path.is_empty() {
-                return None;
-            }
-            Some((path.to_owned(), ChangeKind::from_status_code(code)))
-        })
-        .collect())
-}
-
-/// Regions of the base file each tracked path rewrote, in base-file line numbers.
-///
 /// One `git diff` covers every tracked path, committed and uncommitted alike, because diffing a
 /// commit against the working tree already unions both. Untracked files have no base side and so
 /// appear here at all.
-/// Per-path base regions, exported names withdrawn, and exported names introduced.
-type DiffSummary = (BTreeMap<String, String>, Vec<(String, String)>, Vec<String>);
+/// Everything one unified diff tells us: change kind and rewritten base regions per path, the
+/// exported names withdrawn, and the exported names introduced.
+struct DiffSummary {
+    kinds: BTreeMap<String, ChangeKind>,
+    regions: BTreeMap<String, String>,
+    removed_exports: Vec<(String, String)>,
+}
 
-fn changed_regions(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
+/// Read one `git diff` of the base against the working tree.
+///
+/// That single diff already unions committed and uncommitted work for every tracked path, so the
+/// change kind, the rewritten regions and the withdrawn exports all come from it. Running
+/// `diff --name-status` and `status` as well asked git the same question twice more, and git
+/// invocations are what a sweep actually spends its time on.
+fn read_diff(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
     let raw = git_bytes(
         checkout,
         &[
@@ -394,19 +344,47 @@ fn changed_regions(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
             "--no-renames",
             "--no-ext-diff",
             "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             base_commit,
         ],
     )?;
     let text = String::from_utf8_lossy(&raw);
     let mut regions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut kinds: BTreeMap<String, ChangeKind> = BTreeMap::new();
     let mut current: Option<String> = None;
+    let mut pending_add: Option<String> = None;
     let mut removed: Vec<(String, String)> = Vec::new();
     let mut added: Vec<String> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("--- ") {
-            // `--- a/path`, or `--- /dev/null` for an addition, which has no base side.
-            current = rest.strip_prefix("a/").map(ToOwned::to_owned);
+            // `--- a/path`, or `--- /dev/null` for an addition, which has no base side. git
+            // appends a tab to a header whose path contains a space.
+            current = rest
+                .strip_prefix("a/")
+                .map(|path| path.trim_end_matches('\t').to_owned());
+            pending_add = None;
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            // The pair of headers is what names the change: no base side means added, no working
+            // side means deleted, both present means modified.
+            let target = rest
+                .strip_prefix("b/")
+                .map(|path| path.trim_end_matches('\t').to_owned());
+            match (current.as_ref(), target.as_ref()) {
+                (None, Some(path)) => {
+                    kinds.insert(path.clone(), ChangeKind::Added);
+                    pending_add = Some(path.clone());
+                }
+                (Some(path), None) => {
+                    kinds.insert(path.clone(), ChangeKind::Deleted);
+                }
+                (Some(path), Some(_)) => {
+                    kinds.insert(path.clone(), ChangeKind::Modified);
+                }
+                (None, None) => {}
+            }
         } else if let Some(rest) = line.strip_prefix("@@ ") {
+            let _ = &pending_add;
             if let Some(path) = current.as_ref()
                 && let Some(span) = base_span(rest)
             {
@@ -432,7 +410,40 @@ fn changed_regions(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
         .into_iter()
         .map(|(path, spans)| (path, spans.join(",")))
         .collect();
-    Ok((regions, removed, added))
+    Ok(DiffSummary {
+        kinds,
+        regions,
+        removed_exports: removed,
+    })
+}
+
+/// Paths a diff against the base cannot mention: untracked files, and index-only state.
+///
+/// A diff of the base against the working tree is the primary truth, but it is blind to anything
+/// that exists only in the index — a file staged and then deleted from the worktree is absent
+/// from both sides of that diff while still being part of what this checkout would commit.
+fn status_only_changes(checkout: &Path) -> Result<Vec<(String, ChangeKind)>> {
+    let raw = git_bytes(
+        checkout,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    )?;
+    Ok(split_nul(&raw)
+        .into_iter()
+        .filter_map(|record| {
+            let code = record.get(..2)?;
+            let path = record.get(3..)?;
+            if path.is_empty() {
+                return None;
+            }
+            Some((path.to_owned(), ChangeKind::from_status_code(code)))
+        })
+        .collect())
 }
 
 /// The exported name a source line declares, if it declares one.
@@ -483,7 +494,7 @@ fn exported_name(line: &str) -> Option<String> {
 /// The exclusion is what makes this a dependency rather than a word list. Two checkouts that both
 /// changed one file each still hold their own copy of every declaration in it, and counting those
 /// copies as usages reports every edited file as breaking every other one.
-fn referenced_symbols(checkout: &Path, paths: &[String]) -> Vec<String> {
+fn referenced_symbols(checkout: &Path, paths: &[String]) -> (Vec<String>, bool) {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for path in paths {
         let Ok(content) = fs::read_to_string(checkout.join(path)) else {
@@ -506,11 +517,11 @@ fn referenced_symbols(checkout: &Path, paths: &[String]) -> Vec<String> {
             }
             seen.insert(candidate);
             if seen.len() >= MAX_REFERENCES {
-                return seen.into_iter().collect();
+                return (seen.into_iter().collect(), true);
             }
         }
     }
-    seen.into_iter().collect()
+    (seen.into_iter().collect(), false)
 }
 
 fn take_word(word: &mut String, seen: &mut BTreeSet<String>) {
@@ -571,10 +582,18 @@ fn split_nul(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Run git with the user's configuration neutralised where it would change our parsing.
+///
+/// `core.quotePath` C-quotes any non-ASCII path, and `diff.noprefix` / `diff.mnemonicPrefix`
+/// change or remove the `a/` and `b/` markers the diff parser keys on. Both are ordinary settings
+/// to have in a `~/.gitconfig`, and under either one this scan reads an empty diff and reports no
+/// conflicts at all — a silent wrong answer with a zero exit code. Scanning must depend on the
+/// repository, never on who is holding it.
 fn git_bytes(directory: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(directory)
+        .args(["-c", "core.quotePath=false"])
         .args(arguments)
         .output()?;
     ensure!(

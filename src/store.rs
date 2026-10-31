@@ -957,7 +957,7 @@ impl MeshStore {
     ///
     /// A supervisor uses this to observe a fleet that never calls `sync` itself: every checkout is
     /// already known from registration, so no agent cooperation is required.
-    pub fn live_checkouts(&self, root: Option<&Path>) -> Result<Vec<AgentCheckout>> {
+    pub fn live_checkouts(&self, root: Option<&Path>) -> Result<LiveCheckouts> {
         self.read(|connection| {
             let root = workspace_root(root)?;
             let workspace_id = connection
@@ -966,7 +966,7 @@ impl MeshStore {
                 })
                 .optional()?;
             let Some(workspace_id) = workspace_id else {
-                return Ok(Vec::new());
+                return Ok(LiveCheckouts::default());
             };
             let mut statement = connection.prepare(
                 "SELECT id, name, pid, checkout_path FROM agents
@@ -986,12 +986,55 @@ impl MeshStore {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             // A session marked running whose PID is gone should not have its checkout scanned.
-            Ok(rows
+            // The count is returned rather than discarded: a fleet that registered without a
+            // surviving process would otherwise sweep to an empty, healthy-looking workspace.
+            let (live, dead): (Vec<_>, Vec<_>) = rows
                 .into_iter()
-                .filter(|(_, pid)| process_is_alive(*pid))
-                .map(|(checkout, _)| checkout)
-                .collect())
+                .partition(|(_, pid)| process_is_alive(*pid));
+            Ok(LiveCheckouts {
+                checkouts: live.into_iter().map(|(checkout, _)| checkout).collect(),
+                stale: dead.len(),
+            })
         })
+    }
+
+    /// Whether this scan says anything the stored footprint does not already say.
+    ///
+    /// A watcher re-scans on an interval, and most ticks observe nothing new. Writing and
+    /// announcing regardless cost a row per agent per tick in the event log, which is how an
+    /// idle machine accumulated gigabytes, and it rewrote rows nobody had changed.
+    fn footprint_is_current(
+        transaction: &Transaction<'_>,
+        workspace_id: &str,
+        agent_id: &str,
+        scan: &WorktreeScan,
+    ) -> Result<bool> {
+        let mut statement = transaction.prepare(
+            "SELECT path, change_kind, digest, ranges, base_commit FROM footprints
+             WHERE workspace_id = ? AND agent_id = ? ORDER BY path",
+        )?;
+        let stored = statement
+            .query_map(params![workspace_id, agent_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if stored.len() != scan.entries.len() {
+            return Ok(false);
+        }
+        // Scan entries arrive sorted by path, matching the query's ordering.
+        Ok(stored.iter().zip(&scan.entries).all(|(row, entry)| {
+            row.0 == entry.path
+                && row.1 == entry.change_kind.as_str()
+                && row.2 == entry.digest
+                && row.3 == entry.ranges
+                && row.4.as_ref() == Some(&scan.base_commit)
+        }))
     }
 
     /// Replace one agent's footprint and symbol rows inside an open transaction.
@@ -1045,6 +1088,16 @@ impl MeshStore {
                 params![workspace_id, agent_id, symbol],
             )?;
         }
+        if scan.symbols.truncated {
+            // The reference set is incomplete, so it can rule a break in but never out. One
+            // sentinel row makes this checkout match every withdrawn export.
+            transaction.execute(
+                "INSERT OR IGNORE INTO symbol_footprints(
+                    workspace_id, agent_id, kind, symbol, path
+                 ) VALUES (?, ?, 'reference_truncated', '*', NULL)",
+                params![workspace_id, agent_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -1064,6 +1117,7 @@ impl MeshStore {
             let first = Self::agent_row(transaction, &batch[0].0)?;
             let workspace_id = first.workspace_id;
             let before = collision_signatures(transaction, &workspace_id)?;
+            let mut moved: Vec<&String> = Vec::new();
             for (agent_id, scan) in batch {
                 let agent = Self::agent_row(transaction, agent_id)?;
                 // A sweep is scoped to one workspace; anything else is a caller error rather
@@ -1072,7 +1126,11 @@ impl MeshStore {
                     agent.workspace_id == workspace_id,
                     "batch spans more than one workspace"
                 );
+                if Self::footprint_is_current(transaction, &workspace_id, agent_id, scan)? {
+                    continue;
+                }
                 Self::write_footprint_rows(transaction, &workspace_id, agent_id, scan, now)?;
+                moved.push(agent_id);
             }
             let contested = workspace_collisions(transaction, &workspace_id)?;
             let after = signatures_of(&contested);
@@ -1100,7 +1158,7 @@ impl MeshStore {
                     )?;
                 }
             }
-            for (agent_id, scan) in batch {
+            for (agent_id, scan) in batch.iter().filter(|(id, _)| moved.contains(&id)) {
                 Self::event(
                     transaction,
                     &workspace_id,
@@ -1115,7 +1173,7 @@ impl MeshStore {
                 )?;
             }
             Ok(json!({
-                "published": batch.len(),
+                "published": moved.len(),
                 "collisions": collision_report(&contested, ""),
                 "collision_count": contested.len()
             }))
@@ -1131,7 +1189,11 @@ impl MeshStore {
         self.write(|transaction| {
             let agent = Self::agent_row(transaction, agent_id)?;
             let before = collision_signatures(transaction, &agent.workspace_id)?;
-            Self::write_footprint_rows(transaction, &agent.workspace_id, agent_id, scan, now)?;
+            let unchanged =
+                Self::footprint_is_current(transaction, &agent.workspace_id, agent_id, scan)?;
+            if !unchanged {
+                Self::write_footprint_rows(transaction, &agent.workspace_id, agent_id, scan, now)?;
+            }
 
             let contested = workspace_collisions(transaction, &agent.workspace_id)?;
             let after = signatures_of(&contested);
@@ -1163,18 +1225,20 @@ impl MeshStore {
                 }
             }
 
-            Self::event(
-                transaction,
-                &agent.workspace_id,
-                Some(agent_id),
-                "footprint.published",
-                scan.branch.as_deref(),
-                &json!({
-                    "paths": scan.entries.len(),
-                    "base_ref": scan.base_ref,
-                    "base_commit": scan.base_commit
-                }),
-            )?;
+            if !unchanged {
+                Self::event(
+                    transaction,
+                    &agent.workspace_id,
+                    Some(agent_id),
+                    "footprint.published",
+                    scan.branch.as_deref(),
+                    &json!({
+                        "paths": scan.entries.len(),
+                        "base_ref": scan.base_ref,
+                        "base_commit": scan.base_commit
+                    }),
+                )?;
+            }
 
             Ok(json!({
                 "agent_id": agent_id,
@@ -1310,25 +1374,35 @@ impl MeshStore {
             return Ok(json!({
                 "agents": [],
                 "claims": [],
+                "convergence": no_convergence(),
                 "events": [],
                 "generated_at": now_ms()?,
                 "memories": [],
                 "messages": [],
                 "resources": [],
                 "stats": {
+                    "blocked_agents": 0,
                     "claims": 0,
+                    "contested_paths": 0,
                     "events": 0,
                     "memories": 0,
                     "messages": 0,
                     "resources": 0,
                     "running_agents": 0,
+                    "symbol_breaks": 0,
                     "total_agents": 0
                 },
                 "workspace": status["workspace"]
             }));
         };
-        let activity =
-            self.read(|connection| dashboard_activity(connection, &workspace_id, limit))?;
+        // One read, so a sweep landing mid-poll cannot hand the operator collisions that disagree
+        // with the activity shown beside them.
+        let (activity, convergence) = self.read(|connection| {
+            Ok((
+                dashboard_activity(connection, &workspace_id, limit)?,
+                workspace_convergence(connection, &workspace_id, limit)?,
+            ))
+        })?;
         let agents = status["agents"].as_array().cloned().unwrap_or_default();
         let claims = status["claims"].as_array().cloned().unwrap_or_default();
         let resources = status["resources"].as_array().cloned().unwrap_or_default();
@@ -1337,21 +1411,28 @@ impl MeshStore {
             .iter()
             .filter(|agent| agent["status"] == "running")
             .count();
+        let blocked_agents = convergence["blocked"].as_array().map_or(0, Vec::len);
+        let contested_paths = convergence["collision_count"].clone();
+        let symbol_breaks = convergence["symbol_break_count"].clone();
         Ok(json!({
             "agents": agents,
             "claims": claims,
+            "convergence": convergence,
             "events": activity.events,
             "generated_at": now_ms()?,
             "memories": activity.memories,
             "messages": activity.messages,
             "resources": resources,
             "stats": {
+                "blocked_agents": blocked_agents,
                 "claims": claims.len(),
+                "contested_paths": contested_paths,
                 "events": activity.totals.2,
                 "memories": activity.totals.0,
                 "messages": activity.totals.1,
                 "resources": resource_count,
                 "running_agents": running_agents,
+                "symbol_breaks": symbol_breaks,
                 "total_agents": agents.len()
             },
             "workspace": status["workspace"],
@@ -2033,6 +2114,14 @@ fn add_column_if_missing(
     Ok(())
 }
 
+/// Live checkouts in a workspace, and how many registrations were skipped as dead.
+#[derive(Clone, Debug, Default)]
+pub struct LiveCheckouts {
+    pub checkouts: Vec<AgentCheckout>,
+    /// Registered agents whose process no longer exists.
+    pub stale: usize,
+}
+
 /// A live agent session and the checkout it is working in.
 /// Task key reserved for the workspace-wide integration lease.
 ///
@@ -2131,7 +2220,9 @@ fn workspace_symbol_breaks(
         "SELECT DISTINCT r.symbol, r.path, r.agent_id, u.agent_id, a.name
          FROM symbol_footprints r
          JOIN symbol_footprints u
-           ON u.workspace_id = r.workspace_id AND u.symbol = r.symbol AND u.kind = 'reference'
+           ON u.workspace_id = r.workspace_id
+          AND u.kind IN ('reference', 'reference_truncated')
+          AND (u.kind = 'reference_truncated' OR u.symbol = r.symbol)
          JOIN agents ra ON ra.id = r.agent_id
          JOIN agents a ON a.id = u.agent_id
          WHERE r.workspace_id = ?1
@@ -2264,6 +2355,216 @@ fn collision_report(contested: &[(String, Vec<Participant>)], viewer: &str) -> V
         })
         .collect();
     Value::Array(entries)
+}
+
+/// Display order for collision severity: the two that demand attention sort first.
+///
+/// A dashboard truncates; without this a workspace full of benign duplicate edits could push the
+/// one delete/edit collision off the end of the list.
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "delete_edit" => 0,
+        "divergent" => 1,
+        "adjacent" => 2,
+        _ => 3,
+    }
+}
+
+/// Agent id to display name and liveness for one workspace.
+fn agent_directory(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<BTreeMap<String, (String, bool)>> {
+    let mut statement =
+        connection.prepare("SELECT id, name, status FROM agents WHERE workspace_id = ?")?;
+    let rows = statement.query_map([workspace_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)? == "running",
+            ),
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+}
+
+/// Symbol breaks carrying the removing agent's name as well as the referencing agent's.
+///
+/// An operator reads "`helper` removed by alpha, used by bravo"; an opaque session id on one side
+/// of that sentence is unreadable, and the break report keys the remover by id alone.
+fn convergence_symbol_report(
+    breaks: &[SymbolBreak],
+    directory: &BTreeMap<String, (String, bool)>,
+) -> Value {
+    Value::Array(
+        breaks
+            .iter()
+            .map(|entry| {
+                json!({
+                    "symbol": entry.symbol,
+                    "removed_from": entry.removed_from,
+                    "removed_by": {
+                        "agent_id": entry.removed_by,
+                        "agent_name": directory
+                            .get(&entry.removed_by)
+                            .map_or(entry.removed_by.as_str(), |(name, _)| name.as_str())
+                    },
+                    "used_by": {"agent_id": entry.used_by, "agent_name": entry.used_by_name}
+                })
+            })
+            .collect::<Vec<Value>>(),
+    )
+}
+
+/// Every live agent that cannot merge, and the peers that are why.
+///
+/// `stale_base` is deliberately absent: it needs the integration branch's head, which only a
+/// caller holding a checkout can resolve, so a watcher reports the blockers answerable from
+/// stored rows and leaves the authoritative verdict to `merge_readiness`. The integration lease
+/// is reported once beside this list rather than repeated against every agent waiting on it.
+fn convergence_blocked(
+    contested: &[(String, Vec<Participant>)],
+    breaks: &[SymbolBreak],
+    directory: &BTreeMap<String, (String, bool)>,
+) -> Vec<Value> {
+    let mut blocked: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for (path, participants) in contested {
+        for mine in participants
+            .iter()
+            .filter(|participant| participant.status == "running")
+        {
+            // Judged per pair, exactly as a merge is: four checkouts can share one file while
+            // only two of them actually overlap.
+            let peers: Vec<Value> = participants
+                .iter()
+                .filter(|peer| peer.agent_id != mine.agent_id && peer.status == "running")
+                .filter_map(|peer| {
+                    let severity = classify(&[mine.clone(), peer.clone()]);
+                    if severity == "identical" || severity == "adjacent" {
+                        return None;
+                    }
+                    Some(json!({
+                        "agent_id": peer.agent_id,
+                        "agent_name": peer.agent_name,
+                        "severity": severity
+                    }))
+                })
+                .collect();
+            if peers.is_empty() {
+                continue;
+            }
+            blocked
+                .entry(mine.agent_id.as_str())
+                .or_default()
+                .push(json!({"code": "contested_path", "path": path, "peers": peers}));
+        }
+    }
+    for entry in breaks {
+        let live = |agent: &str| directory.get(agent).is_some_and(|(_, live)| *live);
+        if !live(&entry.removed_by) || !live(&entry.used_by) {
+            continue;
+        }
+        blocked
+            .entry(entry.removed_by.as_str())
+            .or_default()
+            .push(json!({
+                "code": "removed_export_in_use",
+                "symbol": entry.symbol,
+                "path": entry.removed_from,
+                "used_by": {"agent_id": entry.used_by, "agent_name": entry.used_by_name}
+            }));
+    }
+    blocked
+        .into_iter()
+        .map(|(agent_id, blockers)| {
+            json!({
+                "agent_id": agent_id,
+                "agent_name": directory
+                    .get(agent_id)
+                    .map_or(agent_id, |(name, _)| name.as_str()),
+                "blockers": blockers
+            })
+        })
+        .collect()
+}
+
+/// Whoever is merging right now, or null when the queue is free.
+fn integration_lease_holder(
+    connection: &Connection,
+    workspace_id: &str,
+    now: i64,
+    directory: &BTreeMap<String, (String, bool)>,
+) -> Result<Value> {
+    let lease: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT agent_id, lease_expires_at FROM claims
+             WHERE workspace_id = ? AND task_key = ? AND lease_expires_at > ?",
+            params![workspace_id, INTEGRATION_TASK_KEY, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((agent_id, lease_expires_at)) = lease else {
+        return Ok(Value::Null);
+    };
+    let agent_name = directory
+        .get(&agent_id)
+        .map_or_else(|| agent_id.clone(), |(name, _)| name.clone());
+    Ok(json!({
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "lease_expires_at": lease_expires_at
+    }))
+}
+
+/// Workspace-wide convergence state, shaped for a reader that holds no footprint of its own.
+///
+/// `collisions` answers each contested path from a viewer's own side; a dashboard watches the
+/// fleet rather than participating in it, so it reports every path and lets the participant list
+/// say who is involved.
+fn workspace_convergence(connection: &Connection, workspace_id: &str, limit: u32) -> Result<Value> {
+    let now = now_ms()?;
+    let mut contested = workspace_collisions(connection, workspace_id)?;
+    let breaks = workspace_symbol_breaks(connection, workspace_id)?;
+    let directory = agent_directory(connection, workspace_id)?;
+    let mut severity = BTreeMap::from([
+        ("adjacent", 0_usize),
+        ("delete_edit", 0),
+        ("divergent", 0),
+        ("identical", 0),
+    ]);
+    for (_, participants) in &contested {
+        *severity.entry(classify(participants)).or_default() += 1;
+    }
+    contested
+        .sort_by_key(|(path, participants)| (severity_rank(classify(participants)), path.clone()));
+    let blocked = convergence_blocked(&contested, &breaks, &directory);
+    let lease = integration_lease_holder(connection, workspace_id, now, &directory)?;
+    let window = usize::try_from(limit).unwrap_or(usize::MAX);
+    Ok(json!({
+        "blocked": blocked,
+        // The viewer publishes no footprint, so `involves_me` is uniformly false here and the
+        // participant list is what identifies the agents on a path.
+        "collisions": collision_report(&contested[..contested.len().min(window)], ""),
+        "collision_count": contested.len(),
+        "integration_lease": lease,
+        "severity": severity,
+        "symbol_breaks": convergence_symbol_report(&breaks[..breaks.len().min(window)], &directory),
+        "symbol_break_count": breaks.len()
+    }))
+}
+
+/// What `workspace_convergence` reports for a workspace that has never been observed.
+fn no_convergence() -> Value {
+    json!({
+        "blocked": [],
+        "collisions": [],
+        "collision_count": 0,
+        "integration_lease": Value::Null,
+        "severity": {"adjacent": 0, "delete_edit": 0, "divergent": 0, "identical": 0},
+        "symbol_breaks": [],
+        "symbol_break_count": 0
+    })
 }
 
 fn dashboard_activity(

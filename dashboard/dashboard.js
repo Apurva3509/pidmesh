@@ -16,6 +16,7 @@ const state = {
   view: "ide",
   websocket: null,
   workspaceFilter: "",
+  worktrees: null,
 };
 
 const byId = (id) => document.getElementById(id);
@@ -91,12 +92,16 @@ function setConnection(connected) {
 
 async function refresh() {
   try {
-    const [snapshot, sessions] = await Promise.all([
+    const [snapshot, sessions, worktrees] = await Promise.all([
       api("/api/v1/snapshot?limit=100"),
       api("/api/v1/ide/sessions"),
+      // Managed worktrees outlive the dashboard process that created them, so the inventory is
+      // read on every refresh rather than derived from the session list.
+      api("/api/v1/ide/worktrees"),
     ]);
     state.snapshot = snapshot;
     state.sessions = sessions;
+    state.worktrees = worktrees;
     if (state.selectedSessionId && !selectedSession()) state.selectedSessionId = null;
     if (!state.selectedSessionId && sessions.length) state.selectedSessionId = sessions[0].id;
     renderAll();
@@ -518,19 +523,29 @@ function renderOperations() {
   const snapshot = state.snapshot;
   if (!snapshot) return;
   const stats = snapshot.stats || {};
+  const convergence = snapshot.convergence || {};
   const values = [
-    ["Running agents", (snapshot.agents || []).filter((agent) => agent.status === "running").length],
-    ["Task claims", stats.claims || 0],
-    ["Resources", stats.resources || 0],
-    ["Memories", stats.memories || 0],
+    ["Running agents", (snapshot.agents || []).filter((agent) => agent.status === "running").length, false],
+    ["Contested paths", stats.contested_paths || 0, urgentCollisions(convergence) > 0],
+    ["Symbol breaks", stats.symbol_breaks || 0, (stats.symbol_breaks || 0) > 0],
+    ["Agents blocked", stats.blocked_agents || 0, (stats.blocked_agents || 0) > 0],
+    ["Task claims", stats.claims || 0, false],
+    ["Resources", stats.resources || 0, false],
+    ["Memories", stats.memories || 0, false],
   ];
   byId("operation-metrics").replaceChildren(
-    ...values.map(([label, value]) => {
-      const card = node("article", "metric-card");
+    ...values.map(([label, value, alert]) => {
+      const card = node("article", `metric-card ${alert ? "alert" : ""}`);
       card.append(node("span", "", label), node("strong", "", String(value)));
       return card;
     }),
   );
+  // An operator living in the workspace view still has to learn that the fleet has stopped
+  // converging, without switching views to find out.
+  byId("activity-blocked-count").textContent = String(stats.blocked_agents || "");
+  renderCollisions(convergence);
+  renderMergeReadiness(convergence, snapshot);
+  renderSymbolBreaks(convergence);
   renderOperationRows(
     byId("operation-agents"),
     snapshot.agents || [],
@@ -541,11 +556,150 @@ function renderOperations() {
     ...(snapshot.resources || []).map((resource) => ({ title: `${resource.resource_type}:${resource.resource_key}`, detail: resource.agent_name, state: "scope" })),
   ];
   renderOperationRows(byId("operation-ownership"), ownership, (item) => [item.title, item.detail, item.state]);
+  renderWorktrees();
   renderOperationRows(
     byId("operation-events"),
     snapshot.events || [],
     (event) => [event.event_type, event.subject || event.agent_name || "mesh", relativeTime(event.created_at)],
   );
+}
+
+// `identical` is duplicated effort and `adjacent` is what three-way merging exists to resolve;
+// only the other two mean somebody is about to lose work.
+const BENIGN_SEVERITIES = new Set(["identical", "adjacent"]);
+
+const SEVERITY_LABELS = {
+  adjacent: "adjacent",
+  delete_edit: "delete/edit",
+  divergent: "divergent",
+  identical: "identical",
+};
+
+function severityLabel(severity) {
+  return SEVERITY_LABELS[severity] || String(severity || "unknown");
+}
+
+function urgentCollisions(convergence) {
+  const severity = convergence.severity || {};
+  return (severity.divergent || 0) + (severity.delete_edit || 0);
+}
+
+function convergenceRow(pill, severity, title, detail, titleClass = "") {
+  const row = node("div", `convergence-row ${BENIGN_SEVERITIES.has(severity) ? "benign" : ""}`);
+  const copy = node("div", "operation-row-copy");
+  copy.append(node("strong", titleClass, title), node("span", "", detail));
+  row.append(node("span", `severity-pill severity-${String(severity).replaceAll("_", "-")}`, pill), copy);
+  return row;
+}
+
+function participantSummary(collision) {
+  const who = (collision.participants || [])
+    .map((participant) => {
+      const branch = participant.branch ? ` (${participant.branch})` : "";
+      const stopped = participant.status === "running" ? "" : " — stopped";
+      return `${participant.agent_name}${branch}${stopped}`;
+    })
+    .join(" · ");
+  return collision.base_divergent ? `${who} · cut from different bases` : who;
+}
+
+function renderCollisions(convergence) {
+  const collisions = convergence.collisions || [];
+  const total = convergence.collision_count || 0;
+  const urgent = urgentCollisions(convergence);
+  byId("collision-summary").textContent = total
+    ? `${urgent} of ${total} need attention`
+    : "Nothing contested";
+  const container = byId("operation-collisions");
+  if (!collisions.length) {
+    empty(container, "No path is changed in more than one checkout.");
+    return;
+  }
+  container.replaceChildren(
+    ...collisions.map((collision) =>
+      convergenceRow(severityLabel(collision.severity), collision.severity, collision.path, participantSummary(collision), "mono"),
+    ),
+  );
+}
+
+function renderSymbolBreaks(convergence) {
+  const breaks = convergence.symbol_breaks || [];
+  const container = byId("operation-symbols");
+  if (!breaks.length) {
+    empty(container, "No checkout withdraws an export another checkout still calls.");
+    return;
+  }
+  container.replaceChildren(
+    ...breaks.map((entry) => {
+      const row = convergenceRow("break", "delete_edit", "", entry.removed_from);
+      const title = row.querySelector("strong");
+      title.append(node("code", "mono", entry.symbol), ` removed by ${entry.removed_by.agent_name}, used by ${entry.used_by.agent_name}`);
+      return row;
+    }),
+  );
+}
+
+function blockerSummary(blocker) {
+  if (blocker.code === "removed_export_in_use") {
+    return `${blocker.symbol} still referenced by ${blocker.used_by.agent_name}`;
+  }
+  const peers = (blocker.peers || [])
+    .map((peer) => `${peer.agent_name} (${severityLabel(peer.severity)})`)
+    .join(", ");
+  return `${blocker.path} overlaps ${peers}`;
+}
+
+function renderMergeReadiness(convergence, snapshot) {
+  const lease = convergence.integration_lease;
+  byId("integration-lease").textContent = lease ? `${lease.agent_name} is merging now` : "Integration lease free";
+  const blocked = convergence.blocked || [];
+  const container = byId("operation-readiness");
+  if (!blocked.length) {
+    const running = (snapshot.agents || []).filter((agent) => agent.status === "running").length;
+    empty(container, running ? `All ${running} running agents are clear to merge.` : "No running agents.");
+    return;
+  }
+  container.replaceChildren(
+    ...blocked.map((entry) =>
+      convergenceRow("blocked", "divergent", entry.agent_name, (entry.blockers || []).map(blockerSummary).join(" · ")),
+    ),
+  );
+}
+
+// Retained worktrees are listed first and never hidden: an accumulating checkout the operator
+// cannot see is the whole bug, and the reason for keeping each one is the reason reclaiming it
+// would have destroyed work.
+function renderWorktrees() {
+  const inventory = state.worktrees || { reclaimable: [], retained: [] };
+  const reclaimable = inventory.reclaimable || [];
+  const retained = inventory.retained || [];
+  byId("worktree-summary").textContent =
+    `${retained.length} retained · ${reclaimable.length} reclaimable`;
+  const button = byId("reclaim-button");
+  button.disabled = reclaimable.length === 0;
+  button.textContent = reclaimable.length ? `Reclaim ${reclaimable.length} safe` : "Reclaim safe";
+  const rows = [...retained, ...reclaimable];
+  if (!rows.length) {
+    empty(byId("operation-worktrees"), "No managed worktrees are using disk.");
+    return;
+  }
+  renderOperationRows(
+    byId("operation-worktrees"),
+    rows,
+    (entry) => [entry.branch || basename(entry.path), entry.reason, entry.reclaimable ? "reclaimable" : "retained"],
+  );
+}
+
+function confirmReclaim() {
+  const reclaimable = state.worktrees?.reclaimable || [];
+  if (!reclaimable.length) return;
+  openConfirm({
+    overline: "Reclaim disk",
+    title: `Remove ${reclaimable.length} spent worktree(s)?`,
+    description: "Only worktrees with no uncommitted changes whose commits are already in the primary checkout are removed. Everything listed as retained is left exactly where it is.",
+    label: "Reclaim",
+    action: () => api("/api/v1/ide/worktrees", { method: "DELETE" }),
+  });
 }
 
 function renderOperationRows(container, items, mapper) {
@@ -816,6 +970,7 @@ function bindEvents() {
     renderSessions();
   });
   byId("operations-refresh").addEventListener("click", refresh);
+  byId("reclaim-button").addEventListener("click", confirmReclaim);
   byId("files-refresh").addEventListener("click", () => loadFiles(state.currentDirectory));
   byId("copy-file").addEventListener("click", async () => {
     if (state.currentFile) await navigator.clipboard.writeText(state.currentFile.content);

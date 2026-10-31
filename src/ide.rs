@@ -456,6 +456,35 @@ impl IdeManager {
         session_view(&session)
     }
 
+    /// Report every managed worktree on disk together with the evidence behind its disposition.
+    ///
+    /// Reporting is the default surface on purpose. Deleting dirty worktrees after a failed or
+    /// stopped run is an explicit product non-goal, so the cure for the leak cannot be cleanup on
+    /// `stop`, `reject`, `approve`, or `stop_all`. It is visibility: every refresh states how much
+    /// disk the managed runs hold, which of it is provably redundant, and exactly which
+    /// uncommitted work is the reason the rest is being kept.
+    pub fn worktrees(&self) -> Result<Value> {
+        let repository = repository_root(&self.inner.workspace)?;
+        let root = managed_root(&repository)?;
+        inventory_worktrees(&repository, &root, &self.managed_runs()?)
+    }
+
+    /// Remove only the managed worktrees that [`Self::worktrees`] proves have nothing left to lose.
+    ///
+    /// This is the explicit opt-in half of the design, and nothing in the run lifecycle calls it.
+    /// Removal deliberately uses `git worktree remove` and `git branch -d` *without* their force
+    /// flags, unlike `rollback_worktree`: git then re-checks cleanliness and merge status itself
+    /// and refuses anything that still holds work. That second opinion is not redundant, because
+    /// the classification reads a worktree a moment before the removal and a stray process may
+    /// write into it in between.
+    pub fn reclaim(&self) -> Result<Value> {
+        let repository = repository_root(&self.inner.workspace)?;
+        let root = managed_root(&repository)?;
+        let (report, closed) = reclaim_worktrees(&repository, &root, &self.managed_runs()?)?;
+        self.close_runs(&closed)?;
+        Ok(report)
+    }
+
     pub fn files(&self, session_id: Option<&str>, relative: &str) -> Result<Value> {
         let root = self.checkout_root(session_id)?;
         let directory = safe_path(&root, relative)?;
@@ -539,6 +568,39 @@ impl IdeManager {
             || Ok(self.inner.workspace.clone()),
             |session_id| Ok(self.session(session_id)?.worktree.clone()),
         )
+    }
+
+    /// Index the in-memory runs by the worktree each one occupies.
+    ///
+    /// `merged` and `rejected` are the only statuses treated as closed, because they are the two
+    /// where a human made an explicit decision about the run. Everything else — including `failed`
+    /// and `stopped` — still backs a Files, Diff, and Terminal pane the operator may be about to
+    /// open, so its worktree is off limits however clean it looks.
+    fn managed_runs(&self) -> Result<BTreeMap<PathBuf, RunHandle>> {
+        let mut runs = BTreeMap::new();
+        for session in self.session_map()?.values() {
+            let status = lock(&session.runtime)?.status.clone();
+            runs.insert(
+                resolved(&session.worktree),
+                RunHandle {
+                    id: session.id.clone(),
+                    open: !matches!(status.as_str(), "merged" | "rejected"),
+                    status,
+                },
+            );
+        }
+        Ok(runs)
+    }
+
+    /// Drop runs whose worktree was just reclaimed, so no dashboard row points at a path that no
+    /// longer exists. Only a decided run can reach this, and its terminal scrollback is the one
+    /// thing lost; the operator asked for exactly that by invoking the reclaim.
+    fn close_runs(&self, ids: &[String]) -> Result<()> {
+        let mut sessions = self.session_map()?;
+        for id in ids {
+            sessions.remove(id);
+        }
+        Ok(())
     }
 
     fn live_session_count(&self) -> Result<usize> {
@@ -746,7 +808,7 @@ fn repository_root(workspace: &Path) -> Result<PathBuf> {
         .context("failed to resolve repository root")
 }
 
-fn managed_worktree_path(repository: &Path, session_id: &str) -> Result<PathBuf> {
+fn managed_root(repository: &Path) -> Result<PathBuf> {
     let home = env::var_os("HOME").context("HOME is not set")?;
     let repository_id = Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
@@ -755,8 +817,243 @@ fn managed_worktree_path(repository: &Path, session_id: &str) -> Result<PathBuf>
     Ok(PathBuf::from(home)
         .join(".pidmesh")
         .join("worktrees")
-        .join(&repository_id.simple().to_string()[..12])
-        .join(session_id))
+        .join(&repository_id.simple().to_string()[..12]))
+}
+
+fn managed_worktree_path(repository: &Path, session_id: &str) -> Result<PathBuf> {
+    Ok(managed_root(repository)?.join(session_id))
+}
+
+/// One worktree git knows about, reduced to the two facts a disposition depends on.
+struct WorktreeEntry {
+    branch: Option<String>,
+    path: PathBuf,
+}
+
+/// An in-memory run occupying a managed worktree.
+struct RunHandle {
+    id: String,
+    open: bool,
+    status: String,
+}
+
+/// Git reports worktree paths through `realpath`, so a `HOME`-derived root has to be resolved the
+/// same way or `/tmp` versus `/private/tmp` hides every managed worktree from the comparison.
+/// A path that cannot be resolved is kept verbatim: it is almost always one that no longer exists,
+/// which is a case the classifier handles rather than a reason to drop the entry.
+fn resolved(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_owned())
+}
+
+fn parse_worktree_list(listing: &str) -> Vec<WorktreeEntry> {
+    listing
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut entry = WorktreeEntry {
+                branch: None,
+                path: PathBuf::new(),
+            };
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("worktree ") {
+                    entry.path = PathBuf::from(value);
+                } else if let Some(value) = line.strip_prefix("branch refs/heads/") {
+                    entry.branch = Some(value.to_owned());
+                }
+            }
+            if entry.path.as_os_str().is_empty() {
+                None
+            } else {
+                Some(entry)
+            }
+        })
+        .collect()
+}
+
+/// Every worktree of `repository` that lives under the managed `root`.
+///
+/// The inventory comes from git rather than from the session map, because the leak outlives the
+/// process that created it: a worktree left behind by yesterday's dashboard has no session at all,
+/// and listing the directory alone would miss the administrative records git keeps for worktrees
+/// whose directory a user already deleted by hand.
+fn managed_worktree_entries(repository: &Path, root: &Path) -> Result<Vec<WorktreeEntry>> {
+    let listing = git_text(repository, ["worktree", "list", "--porcelain"])?;
+    let root = resolved(root);
+    Ok(parse_worktree_list(&listing)
+        .into_iter()
+        .filter(|entry| resolved(&entry.path).starts_with(&root))
+        .collect())
+}
+
+/// Decide a worktree's fate and render the evidence for it.
+///
+/// Returns `true` only when both places a managed run can hold work are provably redundant: the
+/// working tree carries nothing uncommitted, and every commit on its branch is already an ancestor
+/// of the primary checkout's `HEAD`. The test is observational (product principle 8) — it reads
+/// git, never a recorded run status — so a worktree orphaned by an earlier process is judged on
+/// the same evidence as one this process launched. `HEAD` is the reference point because it is
+/// also what `git branch -d` checks, which keeps the classification and git's own refusal from
+/// disagreeing about the same branch.
+fn describe_worktree(
+    repository: &Path,
+    entry: &WorktreeEntry,
+    runs: &BTreeMap<PathBuf, RunHandle>,
+) -> (bool, Value) {
+    let run = runs.get(&resolved(&entry.path));
+    let (reclaimable, reason) = run.filter(|run| run.open).map_or_else(
+        || classify_worktree(repository, entry),
+        |run| (false, format!("run is still open ({})", run.status)),
+    );
+    (
+        reclaimable,
+        json!({
+            "path": entry.path,
+            "branch": entry.branch,
+            "session_id": run.map(|run| run.id.as_str()),
+            "status": run.map(|run| run.status.as_str()),
+            "reclaimable": reclaimable,
+            "reason": reason
+        }),
+    )
+}
+
+fn classify_worktree(repository: &Path, entry: &WorktreeEntry) -> (bool, String) {
+    if !entry.path.exists() {
+        return (
+            true,
+            "the directory is already gone; only git's record of it remains".to_owned(),
+        );
+    }
+    let changed = match changed_files(&entry.path) {
+        Ok(changed) => changed,
+        // An unreadable worktree is not an empty one. Failing closed keeps a broken checkout
+        // visible to the operator instead of quietly qualifying it for removal.
+        Err(error) => return (false, format!("git could not inspect it: {error}")),
+    };
+    if !changed.is_empty() {
+        return (
+            false,
+            format!("{} uncommitted change(s) no commit holds", changed.len()),
+        );
+    }
+    let Some(branch) = entry.branch.as_deref() else {
+        return (
+            false,
+            "detached worktree with no branch to compare against".to_owned(),
+        );
+    };
+    if is_ancestor_of_head(repository, branch) {
+        (
+            true,
+            "clean, and every commit on its branch is already in the primary checkout".to_owned(),
+        )
+    } else {
+        (
+            false,
+            format!("{branch} holds commits the primary checkout does not"),
+        )
+    }
+}
+
+fn is_ancestor_of_head(repository: &Path, branch: &str) -> bool {
+    git_status(
+        repository,
+        [
+            OsStr::new("merge-base"),
+            OsStr::new("--is-ancestor"),
+            OsStr::new(branch),
+            OsStr::new("HEAD"),
+        ],
+    )
+    .is_ok()
+}
+
+fn inventory_worktrees(
+    repository: &Path,
+    root: &Path,
+    runs: &BTreeMap<PathBuf, RunHandle>,
+) -> Result<Value> {
+    let (mut reclaimable, mut retained) = (Vec::new(), Vec::new());
+    for entry in managed_worktree_entries(repository, root)? {
+        let (safe, view) = describe_worktree(repository, &entry, runs);
+        if safe {
+            reclaimable.push(view);
+        } else {
+            retained.push(view);
+        }
+    }
+    Ok(json!({
+        "root": root,
+        "reclaimable": reclaimable,
+        "retained": retained
+    }))
+}
+
+/// Sweep `root`, removing only what `describe_worktree` cleared, and name the runs that went with
+/// it. The sweep is all-or-nothing per worktree and never per batch: one refusal leaves that one
+/// worktree alone and the rest of the sweep continues.
+fn reclaim_worktrees(
+    repository: &Path,
+    root: &Path,
+    runs: &BTreeMap<PathBuf, RunHandle>,
+) -> Result<(Value, Vec<String>)> {
+    let (mut reclaimed, mut retained, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+    let mut closed = Vec::new();
+    for entry in managed_worktree_entries(repository, root)? {
+        let (safe, view) = describe_worktree(repository, &entry, runs);
+        if !safe {
+            retained.push(view);
+            continue;
+        }
+        match remove_managed_worktree(repository, &entry) {
+            Ok(()) => {
+                if let Some(run) = runs.get(&resolved(&entry.path)) {
+                    closed.push(run.id.clone());
+                }
+                reclaimed.push(view);
+            }
+            // A refusal here means git disagreed with the classification, so the worktree survives
+            // and the operator is told why instead of being shown a silently partial sweep.
+            Err(error) => failed.push(json!({"path": entry.path, "error": error.to_string()})),
+        }
+    }
+    // The per-repository directory goes only when it is already empty, so anything held back above
+    // keeps its parent alive.
+    let _ = fs::remove_dir(root);
+    Ok((
+        json!({
+            "root": root,
+            "reclaimed": reclaimed,
+            "retained": retained,
+            "failed": failed
+        }),
+        closed,
+    ))
+}
+
+fn remove_managed_worktree(repository: &Path, entry: &WorktreeEntry) -> Result<()> {
+    if entry.path.exists() {
+        // No `--force`: git removes a worktree only when it has no modified tracked files and no
+        // untracked ones, which is the same promise the classification made a moment earlier.
+        git_status(
+            repository,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                entry.path.as_os_str(),
+            ],
+        )?;
+    } else {
+        git_status(repository, [OsStr::new("worktree"), OsStr::new("prune")])?;
+    }
+    if let Some(branch) = entry.branch.as_deref() {
+        // `-d`, never `-D`: git refuses to delete a branch carrying commits `HEAD` does not have,
+        // so an unmerged branch survives even if the classification were wrong about it.
+        git_status(
+            repository,
+            [OsStr::new("branch"), OsStr::new("-d"), OsStr::new(branch)],
+        )?;
+    }
+    Ok(())
 }
 
 fn create_worktree(
@@ -1030,14 +1327,65 @@ mod tests {
 
     use anyhow::{Context, Result};
 
+    use std::collections::BTreeMap;
+
+    use serde_json::Value;
+
     use super::{
-        ApproveRequest, IdeManager, LaunchRequest, git_status, outside_scope, rollback_worktree,
+        ApproveRequest, IdeManager, LaunchRequest, RunHandle, git_status, git_text,
+        inventory_worktrees, outside_scope, reclaim_worktrees, resolved, rollback_worktree,
         session_view, slugify, validate_relative,
     };
     use crate::store::MeshStore;
 
     fn git(directory: &Path, arguments: &[&str]) -> Result<()> {
         git_status(directory, arguments)
+    }
+
+    fn seed_repository(directory: &Path) -> Result<std::path::PathBuf> {
+        let repository = directory.join("repository");
+        fs::create_dir_all(repository.join("src"))?;
+        git(&repository, &["init", "-b", "main"])?;
+        git(
+            &repository,
+            &["config", "user.email", "pidmesh@example.com"],
+        )?;
+        git(&repository, &["config", "user.name", "PidMesh Test"])?;
+        fs::write(repository.join("src/lib.rs"), "pub fn existing() {}\n")?;
+        git(&repository, &["add", "."])?;
+        git(&repository, &["commit", "-m", "initial"])?;
+        Ok(repository)
+    }
+
+    /// Stand up a managed worktree the way `launch` does, but under a caller-chosen root so the
+    /// test never touches the real `HOME`.
+    fn add_worktree(repository: &Path, root: &Path, name: &str) -> Result<std::path::PathBuf> {
+        let worktree = root.join(name);
+        let branch = format!("pidmesh/{name}");
+        git(
+            repository,
+            &[
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                &branch,
+                worktree.to_str().context("worktree path is not UTF-8")?,
+                "HEAD",
+            ],
+        )?;
+        Ok(worktree)
+    }
+
+    fn branch_names(value: &Value) -> Vec<String> {
+        let mut names = value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["branch"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     #[test]
@@ -1069,17 +1417,7 @@ mod tests {
     #[test]
     fn managed_run_streams_pty_output_and_blocks_scope_violations() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let repository = directory.path().join("repository");
-        fs::create_dir_all(repository.join("src"))?;
-        git(&repository, &["init", "-b", "main"])?;
-        git(
-            &repository,
-            &["config", "user.email", "pidmesh@example.com"],
-        )?;
-        git(&repository, &["config", "user.name", "PidMesh Test"])?;
-        fs::write(repository.join("src/lib.rs"), "pub fn existing() {}\n")?;
-        git(&repository, &["add", "."])?;
-        git(&repository, &["commit", "-m", "initial"])?;
+        let repository = seed_repository(directory.path())?;
 
         let provider = directory.path().join("fake-claude");
         fs::write(
@@ -1133,6 +1471,134 @@ mod tests {
         if let Some(parent) = session.worktree.parent() {
             let _ = fs::remove_dir(parent);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reclaim_removes_spent_worktrees_and_keeps_every_scrap_of_work() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let repository = seed_repository(directory.path())?;
+        let root = directory.path().join("managed");
+        let spent = add_worktree(&repository, &root, "spent")?;
+        let merged = add_worktree(&repository, &root, "merged")?;
+        let dirty = add_worktree(&repository, &root, "dirty")?;
+        let unmerged = add_worktree(&repository, &root, "unmerged")?;
+
+        // An approved run: committed inside its worktree, then merged no-fast-forward into the
+        // primary checkout. Every commit it holds is reachable from HEAD.
+        fs::write(merged.join("src/merged.rs"), "pub fn merged() {}\n")?;
+        git(&merged, &["add", "-A"])?;
+        git(&merged, &["commit", "-m", "merged work"])?;
+        git(
+            &repository,
+            &["merge", "--no-ff", "pidmesh/merged", "-m", "merge"],
+        )?;
+        // A run an agent abandoned mid-flight: work exists only in the working tree.
+        fs::write(dirty.join("src/wip.rs"), "pub fn wip() {}\n")?;
+        // A run that committed but was never approved.
+        fs::write(unmerged.join("src/pending.rs"), "pub fn pending() {}\n")?;
+        git(&unmerged, &["add", "-A"])?;
+        git(&unmerged, &["commit", "-m", "pending work"])?;
+
+        let mut runs = BTreeMap::new();
+        runs.insert(
+            resolved(&merged),
+            RunHandle {
+                id: "run-merged".to_owned(),
+                open: false,
+                status: "merged".to_owned(),
+            },
+        );
+        let inventory = inventory_worktrees(&repository, &root, &runs)?;
+        assert_eq!(
+            branch_names(&inventory["reclaimable"]),
+            ["pidmesh/merged", "pidmesh/spent"]
+        );
+        assert_eq!(
+            branch_names(&inventory["retained"]),
+            ["pidmesh/dirty", "pidmesh/unmerged"]
+        );
+
+        let (report, closed) = reclaim_worktrees(&repository, &root, &runs)?;
+        assert_eq!(closed, ["run-merged"]);
+        assert!(report["failed"].as_array().is_some_and(Vec::is_empty));
+        assert!(!spent.exists() && !merged.exists());
+        // The uncommitted file is the one thing the non-goal protects, so it is checked by content
+        // rather than by the worktree merely still existing.
+        assert_eq!(
+            fs::read_to_string(dirty.join("src/wip.rs"))?,
+            "pub fn wip() {}\n"
+        );
+        assert!(unmerged.join("src/pending.rs").is_file());
+
+        let branches = git_text(&repository, ["branch", "--format=%(refname:short)"])?;
+        assert!(!branches.contains("pidmesh/spent"));
+        assert!(!branches.contains("pidmesh/merged"));
+        assert!(branches.contains("pidmesh/dirty"));
+        assert!(branches.contains("pidmesh/unmerged"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_open_run_keeps_its_worktree_however_clean_it_looks() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let repository = seed_repository(directory.path())?;
+        let root = directory.path().join("managed");
+        let worktree = add_worktree(&repository, &root, "live")?;
+
+        // Identical evidence on disk, two answers: unowned the worktree is spent, but while a run
+        // still owns it the operator may be about to open its Files, Diff, or Terminal pane.
+        assert_eq!(
+            branch_names(
+                &inventory_worktrees(&repository, &root, &BTreeMap::new())?["reclaimable"]
+            ),
+            ["pidmesh/live"]
+        );
+        let mut runs = BTreeMap::new();
+        runs.insert(
+            resolved(&worktree),
+            RunHandle {
+                id: "run-live".to_owned(),
+                open: true,
+                status: "ready_for_review".to_owned(),
+            },
+        );
+        let inventory = inventory_worktrees(&repository, &root, &runs)?;
+        assert!(
+            inventory["reclaimable"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(
+            inventory["retained"][0]["reason"],
+            "run is still open (ready_for_review)"
+        );
+
+        let (report, closed) = reclaim_worktrees(&repository, &root, &runs)?;
+        assert_eq!(closed, Vec::<String>::new(), "no run was decided");
+        assert!(report["reclaimed"].as_array().is_some_and(Vec::is_empty));
+        assert!(worktree.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn a_vanished_worktree_leaves_only_a_git_record_to_prune() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let repository = seed_repository(directory.path())?;
+        let root = directory.path().join("managed");
+        let gone = add_worktree(&repository, &root, "gone")?;
+        // Somebody deleted the checkout by hand; git still carries the administrative record, and
+        // `pidmesh gc` has never had a reason to look at it.
+        fs::remove_dir_all(&gone)?;
+
+        let runs = BTreeMap::new();
+        let inventory = inventory_worktrees(&repository, &root, &runs)?;
+        assert_eq!(branch_names(&inventory["reclaimable"]), ["pidmesh/gone"]);
+
+        let (report, _) = reclaim_worktrees(&repository, &root, &runs)?;
+        assert!(report["failed"].as_array().is_some_and(Vec::is_empty));
+        let listing = git_text(&repository, ["worktree", "list", "--porcelain"])?;
+        assert!(!listing.contains("gone"));
         Ok(())
     }
 }

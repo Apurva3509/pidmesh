@@ -47,7 +47,7 @@
             <button class="activity-button" type="button" data-workbench-view="diff" aria-label="Changes" aria-selected="false" title="Changes"><span aria-hidden="true">±</span><i id="activity-diff-count" aria-hidden="true"></i></button>
           </div>
           <div class="activity-secondary">
-            <button class="activity-button" type="button" data-app-view="operations" aria-label="Fleet" aria-pressed="false" title="Fleet"><span aria-hidden="true">◌</span></button>
+            <button class="activity-button" type="button" data-app-view="operations" aria-label="Fleet" aria-pressed="false" title="Fleet"><span aria-hidden="true">◌</span><i class="alert-count" id="activity-blocked-count" aria-hidden="true"></i></button>
             <button class="activity-button" id="activity-details" type="button" aria-label="Workspace details" title="Workspace details"><span aria-hidden="true">ⓘ</span></button>
           </div>
         </nav>
@@ -201,11 +201,27 @@
         </div>
 
         <main class="operations-view hidden" id="operations-view">
-        <header class="operations-heading"><div><span class="overline">Live mesh</span><h1>Operations</h1><p>Process health, ownership, and recent coordination events across the workspace.</p></div><button class="button secondary" id="operations-refresh" type="button">Refresh</button></header>
+        <header class="operations-heading"><div><span class="overline">Live mesh</span><h1>Operations</h1><p>Process health, convergence, ownership, and recent coordination events across the workspace.</p></div><button class="button secondary" id="operations-refresh" type="button">Refresh</button></header>
         <div class="metric-grid" id="operation-metrics"></div>
         <div class="operations-grid">
+          <section class="operation-panel full-span" aria-labelledby="collisions-heading">
+            <div class="pane-heading"><div><span class="overline">Convergence</span><h2 id="collisions-heading">Contested paths</h2></div><span class="change-summary" id="collision-summary">—</span></div>
+            <div class="operation-list" id="operation-collisions"></div>
+          </section>
+          <section class="operation-panel" aria-labelledby="readiness-heading">
+            <div class="pane-heading"><div><span class="overline">Merge ordering</span><h2 id="readiness-heading">Who is blocked</h2></div><span class="change-summary" id="integration-lease">—</span></div>
+            <div class="operation-list" id="operation-readiness"></div>
+          </section>
+          <section class="operation-panel" aria-labelledby="symbols-heading">
+            <div class="pane-heading"><div><span class="overline">Symbol footprints</span><h2 id="symbols-heading">Removed exports in use</h2></div></div>
+            <div class="operation-list" id="operation-symbols"></div>
+          </section>
           <section class="operation-panel"><div class="pane-heading"><div><span class="overline">Fleet</span><h2>Agents</h2></div></div><div class="operation-list" id="operation-agents"></div></section>
           <section class="operation-panel"><div class="pane-heading"><div><span class="overline">Ownership</span><h2>Claims &amp; resources</h2></div></div><div class="operation-list" id="operation-ownership"></div></section>
+          <section class="operation-panel full-span" aria-labelledby="worktrees-heading">
+            <div class="pane-heading"><div><span class="overline">Disk</span><h2 id="worktrees-heading">Managed worktrees</h2></div><div class="pane-actions"><span class="change-summary" id="worktree-summary">—</span><button class="button secondary" id="reclaim-button" type="button" disabled>Reclaim safe</button></div></div>
+            <div class="operation-list" id="operation-worktrees"></div>
+          </section>
           <section class="operation-panel full-span"><div class="pane-heading"><div><span class="overline">Ledger</span><h2>Recent events</h2></div></div><div class="operation-list event-list" id="operation-events"></div></section>
         </div>
         </main>

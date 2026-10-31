@@ -187,3 +187,29 @@ checkpoint a sequence and request only later events, which makes polling determi
 The bounded wait operation long-polls this sequence for up to 60 seconds, allowing an agent to sleep
 until another session creates a memory, message, claim, resource reservation, handoff, or lifecycle
 event.
+
+## Managed worktree reclamation
+
+Every managed run gets its own checkout and branch, and preserving dirty or failed worktrees is a
+stated product invariant: cleanup on `stop`, `reject`, `approve`, or shutdown would destroy
+uncommitted agent work, which is an explicit non-goal. The cost of that invariant is that disk use
+grows with every run forever, including runs whose worktree a later dashboard process knows nothing
+about.
+
+The protocol splits the problem in two. Reporting is continuous and free of side effects: the
+managed root is inventoried from `git worktree list`, not from the session table, so a worktree
+orphaned by an earlier process is listed on the same footing as a live one, each with the reason it
+is being kept. Removal is a separate, explicit operation that nothing in the run lifecycle calls.
+
+A worktree is reclaimable only when both places it can hold work are provably redundant: its
+working tree has no modified or untracked files, and every commit on its branch is already an
+ancestor of the primary checkout's `HEAD`. The test is observational rather than declarative, so it
+never trusts a recorded run status; an approved and merged run simply satisfies both halves on its
+own. Removal then runs `git worktree remove` and `git branch -d` without their force flags, so git
+independently re-checks cleanliness and merge status and refuses anything that still holds work.
+That second opinion matters because a worktree is classified a moment before it is removed, and a
+stray process may write into it in between.
+
+A worktree an in-memory run still owns is retained regardless of how clean it looks, because it
+backs a Files, Diff, and Terminal pane the operator may be about to open. Only `merged` and
+`rejected` count as decided; `failed` and `stopped` do not, because no human has looked at them yet.

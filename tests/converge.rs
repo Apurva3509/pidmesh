@@ -1588,3 +1588,241 @@ fn a_repository_with_no_commits_is_still_discovered() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression: scanning must depend on the repository, not on who is holding it.
+///
+/// `diff.noprefix` and `diff.mnemonicPrefix` change or drop the `a/` and `b/` markers the diff
+/// parser keys on, and `core.quotePath` C-quotes any non-ASCII path. All three are ordinary
+/// `~/.gitconfig` settings, and under any of them the scan read an empty diff and reported no
+/// conflicts — a silent wrong answer with a zero exit code.
+#[test]
+fn user_git_configuration_cannot_switch_detection_off() -> Result<()> {
+    for (key, value) in [
+        ("diff.noprefix", "true"),
+        ("diff.mnemonicPrefix", "true"),
+        ("core.quotePath", "true"),
+    ] {
+        let fleet = Fleet::new()?;
+        git(&fleet.repository, &["config", key, value])?;
+        std::fs::write(
+            fleet.repository.join("src/api.rs"),
+            "pub fn compute_total() -> u32 {\n    7\n}\n",
+        )?;
+        git(&fleet.repository, &["add", "-A"])?;
+        git(&fleet.repository, &["commit", "-m", "api"])?;
+
+        let (alpha, alpha_tree) = fleet.agent("alpha")?;
+        let (bravo, bravo_tree) = fleet.agent("bravo")?;
+        git(&alpha_tree, &["config", key, value])?;
+        git(&bravo_tree, &["config", key, value])?;
+
+        std::fs::write(
+            alpha_tree.join("src/api.rs"),
+            "pub fn compute_subtotal() -> u32 {\n    7\n}\n",
+        )?;
+        std::fs::write(
+            bravo_tree.join("src/shared.rs"),
+            "fn report() -> u32 {\n    compute_total()\n}\n",
+        )?;
+        fleet.sync(&alpha, &alpha_tree)?;
+        fleet.sync(&bravo, &bravo_tree)?;
+
+        let report = readiness(&fleet, &alpha, &alpha_tree)?;
+        assert_eq!(
+            report["mergeable"], false,
+            "{key}={value} must not hide the break: {report}"
+        );
+    }
+    Ok(())
+}
+
+/// Regression: a non-ASCII or space-containing filename must not hide a break.
+#[test]
+fn unusual_filenames_are_still_scanned() -> Result<()> {
+    for name in ["café.rs", "my api.rs"] {
+        let fleet = Fleet::new()?;
+        std::fs::write(
+            fleet.repository.join(format!("src/{name}")),
+            "pub fn compute_total() -> u32 {\n    7\n}\n",
+        )?;
+        git(&fleet.repository, &["add", "-A"])?;
+        git(&fleet.repository, &["commit", "-m", "api"])?;
+
+        let (alpha, alpha_tree) = fleet.agent("alpha")?;
+        let (bravo, bravo_tree) = fleet.agent("bravo")?;
+        std::fs::write(
+            alpha_tree.join(format!("src/{name}")),
+            "pub fn compute_subtotal() -> u32 {\n    7\n}\n",
+        )?;
+        std::fs::write(
+            bravo_tree.join("src/shared.rs"),
+            "fn report() -> u32 {\n    compute_total()\n}\n",
+        )?;
+        fleet.sync(&alpha, &alpha_tree)?;
+        fleet.sync(&bravo, &bravo_tree)?;
+
+        let report = readiness(&fleet, &alpha, &alpha_tree)?;
+        assert_eq!(
+            report["mergeable"], false,
+            "{name} must not hide the break: {report}"
+        );
+    }
+    Ok(())
+}
+
+/// A watcher re-scans forever, so an unchanged sweep must cost nothing.
+///
+/// `footprint.published` fired every pass per agent whether or not anything moved, which is a row
+/// per agent per tick in an append-only log: measured at roughly three gigabytes a month for a
+/// twenty-agent machine that was merely left running.
+#[test]
+fn an_unchanged_sweep_writes_no_events() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+    let batch = vec![
+        (alpha.clone(), scan_worktree(&alpha_tree, Some("main"))?),
+        (bravo.clone(), scan_worktree(&bravo_tree, Some("main"))?),
+    ];
+    fleet.store.publish_footprints(&batch)?;
+
+    let count = |fleet: &Fleet| -> Result<usize> {
+        Ok(fleet
+            .store
+            .events(&alpha, 0, 5000)?
+            .as_array()
+            .context("events")?
+            .len())
+    };
+    let settled = count(&fleet)?;
+    for _ in 0..10 {
+        let report = fleet.store.publish_footprints(&batch)?;
+        assert_eq!(report["published"], 0, "nothing moved: {report}");
+    }
+    assert_eq!(count(&fleet)?, settled, "an idle sweep must be silent");
+
+    // A real change still announces itself.
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a2 */ }\n",
+    )?;
+    let moved = vec![
+        (alpha.clone(), scan_worktree(&alpha_tree, Some("main"))?),
+        (bravo.clone(), scan_worktree(&bravo_tree, Some("main"))?),
+    ];
+    let report = fleet.store.publish_footprints(&moved)?;
+    assert_eq!(
+        report["published"], 1,
+        "only the agent that moved: {report}"
+    );
+    assert!(count(&fleet)? > settled, "a real change is still announced");
+    Ok(())
+}
+
+/// What the local dashboard has to be able to say without the operator opening a terminal.
+///
+/// A watcher holds no footprint of its own, so the snapshot must report the whole workspace,
+/// rank it by severity, and name both sides of a symbol break rather than an opaque session id.
+#[test]
+fn the_dashboard_snapshot_carries_workspace_convergence() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn compute_total() -> u32 {\n    7\n}\n",
+    )?;
+    std::fs::write(fleet.repository.join("src/caller.rs"), "fn unused() {}\n")?;
+    std::fs::write(
+        fleet.repository.join("src/duplicate.rs"),
+        "fn duplicate() {}\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // A real conflict on one path, duplicated effort on another, and a merge that is textually
+    // clean and still broken.
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+    std::fs::write(
+        alpha_tree.join("src/duplicate.rs"),
+        "fn duplicate() { same() }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/duplicate.rs"),
+        "fn duplicate() { same() }\n",
+    )?;
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn compute_subtotal() -> u32 {\n    7\n}\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/caller.rs"),
+        "fn report() -> u32 {\n    compute_total()\n}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let snapshot = fleet.store.dashboard_snapshot(&fleet.repository, 100)?;
+    let convergence = &snapshot["convergence"];
+    assert_eq!(snapshot["stats"]["contested_paths"], 2, "{convergence}");
+    assert_eq!(snapshot["stats"]["symbol_breaks"], 1, "{convergence}");
+    assert_eq!(snapshot["stats"]["blocked_agents"], 2, "{convergence}");
+    assert_eq!(convergence["severity"]["divergent"], 1);
+    assert_eq!(convergence["severity"]["identical"], 1);
+
+    // A truncating reader must not lose the conflict behind the duplicated work.
+    assert_eq!(convergence["collisions"][0]["path"], "src/shared.rs");
+    assert_eq!(convergence["collisions"][0]["severity"], "divergent");
+    assert_eq!(convergence["collisions"][1]["severity"], "identical");
+
+    let breaks = convergence["symbol_breaks"].as_array().context("breaks")?;
+    assert_eq!(breaks[0]["symbol"], "compute_total");
+    assert_eq!(breaks[0]["removed_by"]["agent_name"], "alpha");
+    assert_eq!(breaks[0]["used_by"]["agent_name"], "bravo");
+
+    // Byte-identical work is never a blocker, and alpha carries both of the ones it does have.
+    let blocked = convergence["blocked"].as_array().context("blocked")?;
+    let entry = blocked
+        .iter()
+        .find(|entry| entry["agent_id"] == alpha.as_str())
+        .context("alpha is blocked")?;
+    let codes: Vec<&str> = entry["blockers"]
+        .as_array()
+        .context("blockers")?
+        .iter()
+        .filter_map(|blocker| blocker["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        ["contested_path", "removed_export_in_use"],
+        "{entry}"
+    );
+    assert_eq!(convergence["integration_lease"], Value::Null);
+
+    // Whoever is mid-merge is reported once rather than against every agent waiting on them.
+    fleet
+        .store
+        .claim(&bravo, pidmesh::store::INTEGRATION_TASK_KEY, 300, None)?;
+    let held = fleet.store.dashboard_snapshot(&fleet.repository, 100)?;
+    assert_eq!(
+        held["convergence"]["integration_lease"]["agent_name"],
+        "bravo"
+    );
+    Ok(())
+}
