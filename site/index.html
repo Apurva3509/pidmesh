@@ -257,19 +257,25 @@
             <div class="terminal-head">
               <span><i></i><i></i><i></i></span><b>pidmesh — zsh</b>
             </div>
-            <pre><code><span class="prompt">$</span> pidmesh watch --once<samp>
+            <pre
+              tabindex="0"
+              role="region"
+              aria-label="Output of pidmesh watch --once"
+            ><code><span class="prompt">$</span> pidmesh watch --once<samp>
 2 checkouts scanned, 2 updated
 4 contested paths
   <span class="sev-bad">x</span> src/legacy.rs               <span class="sev-bad">delete_edit</span>  alpha, bravo
   <span class="sev-bad">x</span> src/store.rs                <span class="sev-bad">divergent</span>    alpha, bravo
   <span class="sev-warn">~</span> src/main.rs                 <span class="sev-warn">adjacent</span>     alpha, bravo
-  <span class="sev-dim">·</span> NOTES.md                    <span class="sev-dim">identical</span>    alpha, bravo</samp>
+  <span class="sev-dim">·</span> NOTES.md                    <span class="sev-dim">identical</span>    alpha, bravo
+    delete_edit  one checkout deleted this path while another kept editing it — git merges that quietly in several orderings, and the edit is lost
+    divergent  two checkouts rewrote overlapping regions of this path — merging either one overwrites the other's work
+    adjacent  the same path, but in separable regions — git three-way merges this cleanly, so it does not block
+    identical  every checkout reached the same content here — duplicated effort, safe to merge
 
-<span class="prompt">$</span> pidmesh mergeable<samp>
-Cannot merge yet — 3 blockers
-  <span class="sev-bad">x</span> src/legacy.rs overlaps bravo (<span class="sev-bad">delete_edit</span>)
-  <span class="sev-bad">x</span> src/store.rs overlaps bravo (<span class="sev-bad">divergent</span>)
-  <span class="sev-bad">x</span> removes compute_total() which bravo still calls</samp></code></pre>
+1 symbol break
+  <span class="sev-bad">x</span> compute_total() removed from src/api.rs, still used by bravo
+  Next  `pidmesh mergeable` says whether your own branch can merge right now.</samp></code></pre>
           </div>
 
           <div class="severity-copy reveal">
@@ -309,8 +315,9 @@ Cannot merge yet — 3 blockers
             <p class="severity-note">
               Then the conflict that shares no file: one agent withdraws an
               exported name another still calls. Git merges both without
-              complaint and the result does not build. Detection is textual and
-              deliberately conservative—it says nothing when unsure.
+              complaint and the result does not build. One watcher sees it for
+              the whole workspace, and no agent has to take part. Detection is
+              textual and deliberately conservative—it says nothing when unsure.
             </p>
             <p class="severity-note">
               The guard reports; it never touches anyone's branches.
