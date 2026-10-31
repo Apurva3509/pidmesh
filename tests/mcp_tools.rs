@@ -950,12 +950,18 @@ fn bad_calls_fail_as_tool_errors_and_leave_the_session_usable() -> Result<()> {
     let mut inside = Session::start("inside", &repository.database, &repository.root, None)?;
     let mut outside = Session::start("outside", &plain.database, &plain.root, Some(&plain.root))?;
 
-    // Outside a repository there is no integration branch to measure against.
+    // Outside a repository, the failure has to name the actual cause. This used to answer "no
+    // default integration branch found; pass an explicit --base", which is a misdiagnosis: no
+    // branch name fixes a directory git will never read.
     for tool in ["sync_footprint", "mergeable"] {
         let message = outside.failure(tool, json!({}))?;
         assert!(
-            message.contains("no default integration branch"),
-            "{tool} outside a repository should explain itself: {message}"
+            message.contains("not inside a git repository"),
+            "{tool} outside a repository should name the real cause: {message}"
+        );
+        assert!(
+            message.contains("git init"),
+            "{tool} outside a repository should say what to do next: {message}"
         );
     }
 

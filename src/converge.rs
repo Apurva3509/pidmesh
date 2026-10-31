@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -355,18 +355,12 @@ pub fn integration_head(checkout: &Path, base_ref: Option<&str>) -> Result<(Stri
 
 /// Whether a ref resolves, keeping a failure to run git distinct from a ref that is absent.
 fn ref_exists(checkout: &Path, reference: &str) -> Result<bool> {
-    let program = git_program();
-    let output = Command::new(program)
+    let output = Command::new(git_program())
         .arg("-C")
         .arg(checkout)
         .args(["rev-parse", "--verify", "--quiet", reference])
         .output()
-        .map_err(|error| {
-            anyhow!(
-                "could not run git at {}: {error}",
-                Path::new(program).display()
-            )
-        })?;
+        .map_err(|error| git_unavailable(&error))?;
     Ok(output.status.success())
 }
 
@@ -414,7 +408,18 @@ fn resolve_base_ref(checkout: &Path, requested: Option<&str>) -> Result<String> 
             return Ok(candidate.to_owned());
         }
     }
-    bail!("no default integration branch found; pass an explicit --base")
+    // Reaching here means neither main nor master resolved, and the overwhelmingly common
+    // reasons for that are not "this repository names its trunk something else": they are no
+    // git, no repository, or no commits. Advising `--base` for any of those sends someone to
+    // try branch names against a directory git will never read.
+    if let Some(problem) = checkout_problem(checkout) {
+        bail!(problem);
+    }
+    bail!(
+        "this repository has no {} branch, so there is no default branch to measure against. \
+         Pass --base with the branch you merge into.",
+        DEFAULT_BASE_REFS.join(" or ")
+    )
 }
 
 /// One `git diff` covers every tracked path, committed and uncommitted alike, because diffing a
@@ -875,7 +880,10 @@ fn split_nul(raw: &[u8]) -> Vec<String> {
 /// configuration. Four invocations per checkout per tick makes that worth resolving past.
 ///
 /// `PIDMESH_GIT` overrides the choice outright for anyone who needs a particular git.
-fn git_program() -> &'static OsString {
+///
+/// Public because `store` and `ide` shell out too, and resolving git three different ways meant
+/// `PIDMESH_GIT` was honoured by a sync and ignored by `worktrees`.
+pub fn git_program() -> &'static OsString {
     static PROGRAM: OnceLock<OsString> = OnceLock::new();
     PROGRAM.get_or_init(|| {
         if let Some(configured) = std::env::var_os("PIDMESH_GIT") {
@@ -907,26 +915,98 @@ fn developer_tools_git() -> Option<OsString> {
     Some(candidate.into_os_string())
 }
 
+/// What to say when git itself will not start.
+///
+/// A bare `No such file or directory (os error 2)` names neither the program nor the fix, and it
+/// is what someone with a trimmed PATH used to get out of several commands here.
+#[must_use]
+pub fn git_unavailable(error: &std::io::Error) -> anyhow::Error {
+    let program = Path::new(git_program()).display().to_string();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        anyhow!(
+            "git is not installed, or not on PATH (looked for `{program}`). \
+             pidmesh observes checkouts entirely through git. Install git, or set PIDMESH_GIT \
+             to the full path of the executable."
+        )
+    } else {
+        anyhow!("could not run git at {program}: {error}")
+    }
+}
+
+/// Turn git's own stderr into something that names the fix when we recognise the complaint.
+fn git_refused(directory: &Path, stderr: &str) -> anyhow::Error {
+    let stderr = stderr.trim();
+    if stderr.contains("not a git repository") {
+        return anyhow!(
+            "{} is not inside a git repository. pidmesh watches git checkouts, so run it from \
+             one — or `git init` here first.",
+            directory.display()
+        );
+    }
+    anyhow!("git failed: {stderr}")
+}
+
+/// Why this checkout cannot be measured, if it cannot: no git, no repository, or no history.
+///
+/// Every one of these used to surface as advice about `--base`, which is never the fix for any
+/// of them.
+#[must_use]
+pub fn checkout_problem(checkout: &Path) -> Option<String> {
+    let probe = Command::new(git_program())
+        .arg("-C")
+        .arg(checkout)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    match probe {
+        Err(error) => Some(format!("{:#}", git_unavailable(&error))),
+        Ok(output) if !output.status.success() => Some(format!(
+            "{} is not inside a git repository. pidmesh watches git checkouts, so run it from \
+             one — or `git init` here first.",
+            checkout.display()
+        )),
+        // An unborn HEAD resolves a toplevel but nothing else, so it has to be checked
+        // separately or it reads as a repository missing its main branch.
+        Ok(_) if git_text(checkout, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_err() => {
+            Some(format!(
+                "{} has no commits yet, so there is nothing to compare against. Make the first \
+                 commit, then run this again.",
+                checkout.display()
+            ))
+        }
+        Ok(_) => None,
+    }
+}
+
+/// Every working tree git knows about for this repository, primary and linked alike.
+///
+/// This is the authoritative answer to "what is actually checked out here", and it is the only
+/// way to tell an empty mesh from a mesh that is not looking at anything: registration alone
+/// cannot distinguish them, because an agent that never joined leaves no trace to count.
+pub fn worktree_paths(checkout: &Path) -> Result<Vec<PathBuf>> {
+    Ok(git_text(checkout, &["worktree", "list", "--porcelain"])?
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(|path| {
+            let path = PathBuf::from(path);
+            path.canonicalize().unwrap_or(path)
+        })
+        .collect())
+}
+
 fn git_bytes(directory: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
-    let program = git_program();
-    let output = Command::new(program)
+    let output = Command::new(git_program())
         .arg("-C")
         .arg(directory)
         .args(["-c", "core.quotePath=false"])
         .args(arguments)
         .output()
-        .map_err(|error| {
-            // Failing to start git is a different problem from git refusing a request, and
-            // reporting it as the latter sends people looking at their branches.
-            anyhow!(
-                "could not run git at {}: {error}",
-                Path::new(program).display()
-            )
-        })?;
+        // Failing to start git is a different problem from git refusing a request, and
+        // reporting it as the latter sends people looking at their branches.
+        .map_err(|error| git_unavailable(&error))?;
     ensure!(
         output.status.success(),
-        "git failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "{:#}",
+        git_refused(directory, &String::from_utf8_lossy(&output.stderr))
     );
     Ok(output.stdout)
 }
