@@ -29,6 +29,26 @@ the names appear in the peer's changed files, not because anything parsed Rust. 
 mentions the name — reached through a re-export, a macro, or a trait method resolved by inference —
 would not be seen. The table shows the shapes that are covered, not a proof that none are missing.
 
+### Why references come only from changed files
+
+References are harvested from each checkout's *changed* files, never the whole tree. That is a
+deliberate boundary rather than a shortcut, and it is the line between a problem an agent can see
+for itself and one it cannot.
+
+| the usage lives in | break reported | the removing agent's branch builds | the merge builds |
+| --- | --- | --- | --- |
+| a file neither agent touched | no | **no** | no |
+| a file the peer changed | **yes** | **yes** | no |
+
+In the first row the removing agent has deleted something the untouched code still calls, so its
+own branch does not compile. No coordination is required to discover that; a build does it, and a
+mesh reporting it would be telling an agent what its compiler already said.
+
+The second row is the one nothing else catches. Both branches compile. The merge is textually
+clean. The result does not build, and neither agent can see it alone, because the conflict exists
+only in the combination. Harvesting the whole tree would add cost to every scan to re-find the
+first row, which is already covered, and would not improve the second.
+
 ## Differential validation against git
 
 Severity is a claim about what a merge will do, so it can be checked against one. Eighty generated

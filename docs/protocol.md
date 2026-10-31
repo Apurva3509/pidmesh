@@ -147,6 +147,12 @@ JavaScript, Python and Go. It yields nothing when unsure. The asymmetry is delib
 warning costs an unreported break, while a wrong one costs a false alarm against work that was
 fine, and false alarms are what teach an operator to stop reading the output.
 
+References are harvested from a checkout's changed files only. Measured: when the usage lives in
+a file neither agent touched, the removing agent's own branch already fails to compile, so a build
+finds it without any coordination. When the usage lives in a file the peer changed, both branches
+compile, the merge is clean, and the result does not build — which is the case nothing but the
+mesh can see. Scanning the whole tree would re-find the first and not improve the second.
+
 A withdrawn name that another checkout references is a symbol break. It is attributed to the
 checkout doing the removing rather than the one doing the calling, because that is the side whose
 merge introduces the failure, and it is matched across checkouts rather than agents so two
