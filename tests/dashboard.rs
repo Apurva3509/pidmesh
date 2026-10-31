@@ -1049,6 +1049,177 @@ fn the_ide_file_routes_cannot_reach_outside_the_workspace() -> Result<()> {
     dashboard.assert_alive()
 }
 
+/// Credentials planted in the two `.git/config` files the probe below creates. Finding either
+/// one in a response is the leak itself, not a proxy for it.
+const GIT_CONFIG_SECRET: &str = "PIDMESH-CREDENTIAL-IN-GIT-CONFIG";
+const NESTED_GIT_CONFIG_SECRET: &str = "PIDMESH-CREDENTIAL-IN-NESTED-GIT-CONFIG";
+
+/// Every way of naming something at or under a git directory that resolves to real bytes in the
+/// probe workspace. They are listed rather than generated because each one is a distinct way a
+/// rule could be wrong: a bare name, a trailing separator, an interior `.`, a nested repository,
+/// a symlink whose name is innocent, and an encoding axum unwraps before the handler runs.
+const GIT_SPELLINGS: &[&str] = &[
+    ".git",
+    ".git/",
+    ".git/.",
+    ".git/config",
+    "./.git/config",
+    ".git/./config",
+    ".git/HEAD",
+    ".git/COMMIT_EDITMSG",
+    ".git/objects",
+    ".git/hooks",
+    ".git/logs/HEAD",
+    "vendor/.git",
+    "vendor/.git/config",
+    "./vendor/.git/config",
+    "gitlink",
+    "gitlink/config",
+    "innocent.txt",
+    "%2egit/config",
+    ".git%2fconfig",
+    ".git%2Fconfig",
+    "%2egit%2fconfig",
+];
+
+/// Spellings that only reach the git directory where the filesystem folds case.
+const GIT_SPELLINGS_WHEN_CASE_INSENSITIVE: &[&str] =
+    &[".GIT/config", ".Git/config", ".GIT", "vendor/.GIT/config"];
+
+/// Plant, in a started dashboard's workspace, everything the git-directory probe needs: a
+/// credential in `.git/config`, a second repository nested inside the workspace, two symlinks
+/// whose names say nothing about where they land, and tracked content whose name merely begins
+/// with `.git`.
+fn seed_git_exposure_probe(workspace: &Path) -> Result<()> {
+    git(
+        workspace,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://user:{GIT_CONFIG_SECRET}@github.com/acme/private.git"),
+        ],
+    )?;
+    let nested = workspace.join("vendor");
+    std::fs::create_dir_all(&nested)?;
+    git(&nested, &["init", "--quiet", "--initial-branch", "main"])?;
+    git(
+        &nested,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://user:{NESTED_GIT_CONFIG_SECRET}@github.com/acme/vendor.git"),
+        ],
+    )?;
+    std::fs::write(nested.join("vendored.txt"), "vendored content\n")?;
+    std::os::unix::fs::symlink(workspace.join(".git"), workspace.join("gitlink"))?;
+    std::os::unix::fs::symlink(
+        workspace.join(".git/config"),
+        workspace.join("innocent.txt"),
+    )?;
+    std::fs::write(workspace.join(".gitignore"), "target/\n")?;
+    std::fs::create_dir_all(workspace.join(".github"))?;
+    std::fs::write(workspace.join(".github/ci.yml"), "name: ci\n")?;
+    Ok(())
+}
+
+/// `.git` is inside the workspace, so nothing above has anything to say about it -- and it was
+/// served. `/api/v1/ide/file?path=.git/config` came back `200` with the remote URL, credentials
+/// and all; `/api/v1/ide/files?path=.git` listed the object database. `.git` was filtered out of
+/// its *parent's* listing, which is the clearest evidence this was an oversight rather than a
+/// decision: the browser already declined to show it and then served it to anyone who typed the
+/// name.
+///
+/// What a token holder got was not a file in the workspace. It was `.git/config`, which in a
+/// cloned repository routinely carries `https://user:token@host/...`; `.git/objects`, which is
+/// every version of every file ever committed, including content long since deleted from the
+/// working tree; and `.git/hooks`, which is code that runs on the developer's machine at commit
+/// time. The token is a real boundary, but the dashboard is a workspace file browser, and this
+/// turned it into a credential and history reader.
+///
+/// The spellings below are not variations for their own sake: each one is a different way of
+/// arriving at the same bytes, and a rule that matched on the string the caller typed would
+/// fall to one of them.
+#[test]
+fn the_git_directory_is_not_served_by_any_spelling() -> Result<()> {
+    let dashboard = Dashboard::start()?;
+    let authorization = dashboard.authorization();
+    let workspace = dashboard.workspace();
+    seed_git_exposure_probe(&workspace)?;
+
+    let mut refused = GIT_SPELLINGS.to_vec();
+    // A case-insensitive filesystem -- macOS's default -- opens `.git/config` for `.GIT/config`,
+    // so the rule has to ignore case there. Asserting it on a case-sensitive filesystem would
+    // assert only that a path which does not exist cannot be read, so it is probed for first.
+    if workspace.join(".GIT/config").exists() {
+        refused.extend(GIT_SPELLINGS_WHEN_CASE_INSENSITIVE);
+    }
+
+    for path in &refused {
+        for endpoint in ["file", "files"] {
+            let reply = dashboard.send(
+                "GET",
+                &format!("/api/v1/ide/{endpoint}?path={path}"),
+                &[("Authorization", authorization.as_str())],
+                "",
+            )?;
+            assert_ne!(
+                reply.status, 200,
+                "/api/v1/ide/{endpoint}?path={path} was served: {reply:?}"
+            );
+            assert!(
+                !reply.body.contains(GIT_CONFIG_SECRET)
+                    && !reply.body.contains(NESTED_GIT_CONFIG_SECRET),
+                "/api/v1/ide/{endpoint}?path={path} leaked a credential from .git/config: {reply:?}"
+            );
+            // `.git/HEAD` and `refs/heads/main` are the shape of the object database; nothing
+            // that names a ref should come back from either route.
+            assert!(
+                !reply.body.contains("refs/heads/"),
+                "/api/v1/ide/{endpoint}?path={path} leaked the repository's refs: {reply:?}"
+            );
+        }
+    }
+
+    // A listing must not offer a name the file route will then refuse, and must not hide one it
+    // would serve. `.git` is absent from both the workspace root and the nested checkout.
+    for (directory, present, absent) in [
+        (".", "probe.txt", "\".git\""),
+        ("vendor", "vendored.txt", "\".git\""),
+    ] {
+        let listing = dashboard.send(
+            "GET",
+            &format!("/api/v1/ide/files?path={directory}"),
+            &[("Authorization", authorization.as_str())],
+            "",
+        )?;
+        assert_eq!(listing.status, 200, "{directory}: {listing:?}");
+        assert!(listing.body.contains(present), "{directory}: {listing:?}");
+        assert!(!listing.body.contains(absent), "{directory}: {listing:?}");
+    }
+
+    // The refusal is narrow on purpose. `.gitignore`, `.gitattributes` and `.github` are tracked
+    // workspace content that people read in the browser, and hiding them would cost a real
+    // feature for no security at all.
+    for (path, expected) in [
+        (".gitignore", "target/"),
+        (".github/ci.yml", "name: ci"),
+        ("vendor/vendored.txt", "vendored content"),
+        ("probe.txt", "in-workspace probe"),
+    ] {
+        let reply = dashboard.send(
+            "GET",
+            &format!("/api/v1/ide/file?path={path}"),
+            &[("Authorization", authorization.as_str())],
+            "",
+        )?;
+        assert_eq!(reply.status, 200, "{path}: {reply:?}");
+        assert!(reply.body.contains(expected), "{path}: {reply:?}");
+    }
+    dashboard.assert_alive()
+}
+
 /// The session identifier is the other caller-supplied path segment the IDE routes take; it
 /// names a worktree, so it must not be usable as a path either.
 #[test]
