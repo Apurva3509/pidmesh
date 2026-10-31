@@ -1441,3 +1441,150 @@ fn a_withdrawn_export_nobody_uses_does_not_block() -> Result<()> {
     assert_eq!(readiness(&fleet, &alpha, &alpha_tree)?["mergeable"], true);
     Ok(())
 }
+
+/// Regression: another checkout's copy of a declaration is not a usage of it.
+///
+/// References were every identifier in a changed file, so two agents who each edited one shared
+/// module both "referenced" every name that module declares. At 24 agents that produced 8,336
+/// phantom breaks and a 2.8s query — the false-alarm flood that teaches an operator to stop
+/// reading the output.
+#[test]
+fn a_copy_of_a_declaration_is_not_a_reference_to_it() -> Result<()> {
+    let fleet = Fleet::new()?;
+    std::fs::write(
+        fleet.repository.join("src/api.rs"),
+        "pub fn alpha_owned() {}\npub fn shared_helper() {}\npub fn bravo_owned() {}\n",
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // alpha retires shared_helper. bravo edits the same file but only its own function, so its
+    // copy still *declares* shared_helper without ever calling it.
+    std::fs::write(
+        alpha_tree.join("src/api.rs"),
+        "pub fn alpha_owned() {}\npub fn bravo_owned() {}\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/api.rs"),
+        "pub fn alpha_owned() {}\npub fn shared_helper() {}\npub fn bravo_owned_v2() {}\n",
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    assert_eq!(
+        fleet.store.collisions(&alpha)?["symbol_break_count"],
+        0,
+        "holding a copy of a declaration is not depending on it"
+    );
+    Ok(())
+}
+
+/// A sweep is one logical observation, so it publishes in one transaction.
+///
+/// Publishing agent by agent recomputes the workspace collision set twice per agent, which is
+/// most of a tick once a fleet is large. Batching must not change what peers observe: the same
+/// collisions, and the same transition events they would have been woken by.
+#[test]
+fn a_batched_sweep_reports_what_serial_publishing_would() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/shared.rs"),
+        "fn shared() { /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/shared.rs"),
+        "fn shared() { /* b */ }\n",
+    )?;
+
+    let batch = vec![
+        (alpha.clone(), scan_worktree(&alpha_tree, Some("main"))?),
+        (bravo.clone(), scan_worktree(&bravo_tree, Some("main"))?),
+    ];
+    let report = fleet.store.publish_footprints(&batch)?;
+    assert_eq!(report["published"], 2);
+    assert_eq!(report["collision_count"], 1, "{report}");
+
+    let collisions = fleet.collisions(&alpha)?;
+    let shared = at(&collisions, "src/shared.rs").context("expected a collision")?;
+    assert_eq!(shared["severity"], "divergent");
+
+    // The overlap must have been announced exactly once, to a workspace-scoped listener.
+    let detected = fleet.store.events(&bravo, 0, 500)?;
+    let detected = detected
+        .as_array()
+        .context("events")?
+        .iter()
+        .filter(|event| event["event_type"] == "collision.detected")
+        .count();
+    assert_eq!(detected, 1, "one transition, one announcement");
+
+    // Re-publishing unchanged state must stay silent, exactly as the serial path does.
+    fleet.store.publish_footprints(&batch)?;
+    let again = fleet.store.events(&bravo, 0, 500)?;
+    let again = again
+        .as_array()
+        .context("events")?
+        .iter()
+        .filter(|event| event["event_type"] == "collision.detected")
+        .count();
+    assert_eq!(again, detected, "steady state must not re-announce");
+    Ok(())
+}
+
+#[test]
+fn an_empty_sweep_is_not_an_error() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let report = fleet.store.publish_footprints(&[])?;
+    assert_eq!(report["published"], 0);
+    Ok(())
+}
+
+/// Regression: a repository with no commits is still a repository.
+///
+/// `git rev-parse` cannot resolve an unborn HEAD and exits non-zero even though it printed the
+/// toplevel and git directory it did resolve. Treating that as "not a repository" dropped
+/// linked-worktree discovery, which silently splits one repository into unrelated meshes — the
+/// exact failure `pidmesh doctor` exists to catch.
+#[test]
+fn a_repository_with_no_commits_is_still_discovered() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let repository = directory.path().join("unborn");
+    std::fs::create_dir(&repository)?;
+    git(&repository, &["init", "-b", "main"])?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .current_dir(&repository)
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            directory
+                .path()
+                .join("mesh.db")
+                .to_str()
+                .context("database path")?,
+            "--json",
+            "doctor",
+        ])
+        .output()?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let codes: Vec<&str> = report["warnings"]
+        .as_array()
+        .context("warnings")?
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"not_a_repository"),
+        "an empty repository is still a repository: {report}"
+    );
+    assert!(
+        report["primary_repository"].is_string(),
+        "the repository root must resolve: {report}"
+    );
+    Ok(())
+}

@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::num::NonZeroUsize;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,7 +14,8 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use pidmesh::converge::{integration_head, scan_worktree};
+use pidmesh::converge::{WorktreeScan, integration_head, scan_worktree};
+use pidmesh::render::{self, Shape};
 use pidmesh::store::{
     AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, default_database_path, diagnose, workspace_root,
 };
@@ -22,6 +25,10 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(name = "pidmesh", version, about)]
 struct Cli {
+    /// Emit JSON even when stdout is a terminal.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[arg(long, global = true, env = "PIDMESH_DB")]
     db: Option<PathBuf>,
     #[command(subcommand)]
@@ -252,11 +259,16 @@ enum Commands {
     },
 }
 
+static FORCE_JSON: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(code),
-        Err(error) => {
-            eprintln!("{}", json!({"error": format!("{error:#}")}));
+        Err(failure) => {
+            eprintln!(
+                "{}",
+                render::error(&format!("{failure:#}"), FORCE_JSON.load(Ordering::Relaxed))
+            );
             ExitCode::from(2)
         }
     }
@@ -265,6 +277,7 @@ fn main() -> ExitCode {
 #[allow(clippy::too_many_lines)]
 fn run() -> Result<u8> {
     let cli = Cli::parse();
+    FORCE_JSON.store(cli.json, Ordering::Relaxed);
     let database = match cli.db {
         Some(path) => path,
         None => default_database_path()?,
@@ -388,10 +401,16 @@ fn run() -> Result<u8> {
                 None => std::env::current_dir()?,
             };
             let scan = scan_worktree(&directory, base.as_deref())?;
-            emit(&store.publish_footprint(&agent_id(agent.as_deref())?, &scan)?)?;
+            present(
+                Shape::Sync,
+                &store.publish_footprint(&agent_id(agent.as_deref())?, &scan)?,
+            )?;
         }
         Commands::Collisions { agent } => {
-            emit(&store.collisions(&agent_id(agent.as_deref())?)?)?;
+            present(
+                Shape::Collisions,
+                &store.collisions(&agent_id(agent.as_deref())?)?,
+            )?;
         }
         Commands::Mergeable {
             agent,
@@ -405,7 +424,7 @@ fn run() -> Result<u8> {
             let (_, head) = integration_head(&directory, base.as_deref())?;
             let readiness = store.merge_readiness(&agent_id(agent.as_deref())?, &head)?;
             let mergeable = readiness["mergeable"] == true;
-            emit(&readiness)?;
+            present(Shape::Mergeable, &readiness)?;
             if !mergeable {
                 return Ok(1);
             }
@@ -437,7 +456,7 @@ fn run() -> Result<u8> {
         Commands::Doctor { workspace } => {
             let report = diagnose(&database, workspace.as_deref())?;
             let healthy = report["healthy"] == true;
-            emit(&report)?;
+            present(Shape::Doctor, &report)?;
             if !healthy {
                 return Ok(1);
             }
@@ -840,7 +859,7 @@ fn watch(
     ctrlc::set_handler(move || signal_running.store(false, Ordering::Relaxed))
         .context("failed to install interrupt handler")?;
     loop {
-        emit(&watch_pass(store, workspace, base)?)?;
+        present(Shape::Watch, &watch_pass(store, workspace, base)?)?;
         if once {
             break;
         }
@@ -866,11 +885,44 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
             .or_default()
             .push(checkout);
     }
+    // Scanning is git and file I/O with no shared state, so checkouts are observed in parallel.
+    // Publishing stays serial: it is one short transaction each and the store holds one
+    // connection, so contending for it would only add lock traffic.
+    let checkouts: Vec<(&PathBuf, &Vec<AgentCheckout>)> = grouped.iter().collect();
+    let cursor = AtomicUsize::new(0);
+    let scans: Mutex<Vec<(usize, Result<WorktreeScan>)>> = Mutex::new(Vec::new());
+    let workers = thread::available_parallelism()
+        .map_or(4, NonZeroUsize::get)
+        .min(checkouts.len().max(1));
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, _)) = checkouts.get(index) else {
+                        return;
+                    };
+                    let scanned = scan_worktree(path, base);
+                    if let Ok(mut guard) = scans.lock() {
+                        guard.push((index, scanned));
+                    }
+                }
+            });
+        }
+    });
+
+    let mut scanned = scans.into_inner().unwrap_or_default();
+    scanned.sort_by_key(|(index, _)| *index);
+
     let mut published = 0usize;
     let mut skipped = Vec::new();
     let mut witness = None;
-    for (path, agents) in &grouped {
-        let scan = match scan_worktree(path, base) {
+    let mut batch: Vec<(String, WorktreeScan)> = Vec::new();
+    for (index, result) in scanned {
+        let Some((path, agents)) = checkouts.get(index) else {
+            continue;
+        };
+        let scan = match result {
             Ok(scan) => scan,
             Err(error) => {
                 // A checkout can be removed or rewritten underneath us; that is not fatal.
@@ -881,12 +933,15 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
                 continue;
             }
         };
-        for agent in agents {
-            store.publish_footprint(&agent.agent_id, &scan)?;
+        for agent in *agents {
             witness.get_or_insert_with(|| agent.agent_id.clone());
+            batch.push((agent.agent_id.clone(), scan.clone()));
             published += 1;
         }
     }
+    // One transaction for the whole sweep: publishing agent by agent recomputes the collision
+    // set twice per agent, which is most of a tick once a fleet gets large.
+    store.publish_footprints(&batch)?;
     let collisions = match witness {
         Some(agent_id) => store.collisions(&agent_id)?,
         None => json!({"collisions": [], "collision_count": 0}),
@@ -922,4 +977,21 @@ fn bail_duration<T>() -> Result<T> {
 fn emit(value: &Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+/// Print for whoever is reading: prose at a terminal, JSON everywhere else.
+///
+/// The JSON contract predates this and agents depend on it, so a pipe or a redirect always gets
+/// JSON and only a human at a prompt sees the rendered form.
+fn present(shape: Shape, value: &Value) -> Result<()> {
+    if FORCE_JSON.load(Ordering::Relaxed) || !render::is_interactive() {
+        return emit(value);
+    }
+    match render::render(shape, value) {
+        Some(text) => {
+            println!("{text}");
+            Ok(())
+        }
+        None => emit(value),
+    }
 }

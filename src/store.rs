@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS symbol_footprints (
 );
 
 CREATE INDEX IF NOT EXISTS symbol_footprints_lookup
-ON symbol_footprints(workspace_id, kind, symbol);
+ON symbol_footprints(workspace_id, kind, symbol, agent_id);
 ";
 
 #[derive(Clone, Debug)]
@@ -994,6 +994,134 @@ impl MeshStore {
         })
     }
 
+    /// Replace one agent's footprint and symbol rows inside an open transaction.
+    fn write_footprint_rows(
+        transaction: &Transaction<'_>,
+        workspace_id: &str,
+        agent_id: &str,
+        scan: &WorktreeScan,
+        now: i64,
+    ) -> Result<()> {
+        transaction.execute(
+            "DELETE FROM footprints WHERE workspace_id = ? AND agent_id = ?",
+            params![workspace_id, agent_id],
+        )?;
+        for entry in &scan.entries {
+            transaction.execute(
+                "INSERT INTO footprints(
+                    workspace_id, agent_id, path, change_kind, digest,
+                    base_commit, branch, ranges, observed_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    workspace_id,
+                    agent_id,
+                    entry.path,
+                    entry.change_kind.as_str(),
+                    entry.digest,
+                    scan.base_commit,
+                    scan.branch,
+                    entry.ranges,
+                    now
+                ],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM symbol_footprints WHERE workspace_id = ? AND agent_id = ?",
+            params![workspace_id, agent_id],
+        )?;
+        for (symbol, path) in &scan.symbols.removed_exports {
+            transaction.execute(
+                "INSERT OR REPLACE INTO symbol_footprints(
+                    workspace_id, agent_id, kind, symbol, path
+                 ) VALUES (?, ?, 'removed_export', ?, ?)",
+                params![workspace_id, agent_id, symbol, path],
+            )?;
+        }
+        for symbol in &scan.symbols.references {
+            transaction.execute(
+                "INSERT OR IGNORE INTO symbol_footprints(
+                    workspace_id, agent_id, kind, symbol, path
+                 ) VALUES (?, ?, 'reference', ?, NULL)",
+                params![workspace_id, agent_id, symbol],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Publish a whole sweep's footprints in one transaction.
+    ///
+    /// Publishing one agent at a time recomputes the workspace collision set twice per agent, so a
+    /// sweep costs `O(agents x footprints)` and a large fleet spends most of a tick in `SQLite`. A
+    /// sweep is a single logical observation, so it gets a single transaction: the collision set
+    /// is compared once before and once after, and peers still see exactly the transitions they
+    /// would have seen one publish at a time.
+    pub fn publish_footprints(&self, batch: &[(String, WorktreeScan)]) -> Result<Value> {
+        if batch.is_empty() {
+            return Ok(json!({"published": 0, "collisions": [], "collision_count": 0}));
+        }
+        let now = now_ms()?;
+        self.write(|transaction| {
+            let first = Self::agent_row(transaction, &batch[0].0)?;
+            let workspace_id = first.workspace_id;
+            let before = collision_signatures(transaction, &workspace_id)?;
+            for (agent_id, scan) in batch {
+                let agent = Self::agent_row(transaction, agent_id)?;
+                // A sweep is scoped to one workspace; anything else is a caller error rather
+                // than something to silently fold into this workspace's collision set.
+                ensure!(
+                    agent.workspace_id == workspace_id,
+                    "batch spans more than one workspace"
+                );
+                Self::write_footprint_rows(transaction, &workspace_id, agent_id, scan, now)?;
+            }
+            let contested = workspace_collisions(transaction, &workspace_id)?;
+            let after = signatures_of(&contested);
+            for (path, signature) in &after {
+                if before.get(path) != Some(signature) {
+                    Self::event(
+                        transaction,
+                        &workspace_id,
+                        None,
+                        "collision.detected",
+                        Some(path),
+                        &json!({"signature": signature}),
+                    )?;
+                }
+            }
+            for path in before.keys() {
+                if !after.contains_key(path) {
+                    Self::event(
+                        transaction,
+                        &workspace_id,
+                        None,
+                        "collision.cleared",
+                        Some(path),
+                        &json!({}),
+                    )?;
+                }
+            }
+            for (agent_id, scan) in batch {
+                Self::event(
+                    transaction,
+                    &workspace_id,
+                    Some(agent_id),
+                    "footprint.published",
+                    scan.branch.as_deref(),
+                    &json!({
+                        "paths": scan.entries.len(),
+                        "base_ref": scan.base_ref,
+                        "base_commit": scan.base_commit
+                    }),
+                )?;
+            }
+            Ok(json!({
+                "published": batch.len(),
+                "collisions": collision_report(&contested, ""),
+                "collision_count": contested.len()
+            }))
+        })
+    }
+
     /// Replace this agent's observed footprint and report the collisions that result.
     ///
     /// The footprint is authoritative per agent: a scan that no longer touches a path releases it,
@@ -1003,49 +1131,7 @@ impl MeshStore {
         self.write(|transaction| {
             let agent = Self::agent_row(transaction, agent_id)?;
             let before = collision_signatures(transaction, &agent.workspace_id)?;
-            transaction.execute(
-                "DELETE FROM footprints WHERE workspace_id = ? AND agent_id = ?",
-                params![agent.workspace_id, agent_id],
-            )?;
-            for entry in &scan.entries {
-                transaction.execute(
-                    "INSERT INTO footprints(
-                        workspace_id, agent_id, path, change_kind, digest,
-                        base_commit, branch, ranges, observed_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        agent.workspace_id,
-                        agent_id,
-                        entry.path,
-                        entry.change_kind.as_str(),
-                        entry.digest,
-                        scan.base_commit,
-                        scan.branch,
-                        entry.ranges,
-                        now
-                    ],
-                )?;
-            }
-            transaction.execute(
-                "DELETE FROM symbol_footprints WHERE workspace_id = ? AND agent_id = ?",
-                params![agent.workspace_id, agent_id],
-            )?;
-            for (symbol, path) in &scan.symbols.removed_exports {
-                transaction.execute(
-                    "INSERT OR REPLACE INTO symbol_footprints(
-                        workspace_id, agent_id, kind, symbol, path
-                     ) VALUES (?, ?, 'removed_export', ?, ?)",
-                    params![agent.workspace_id, agent_id, symbol, path],
-                )?;
-            }
-            for symbol in &scan.symbols.references {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO symbol_footprints(
-                        workspace_id, agent_id, kind, symbol, path
-                     ) VALUES (?, ?, 'reference', ?, NULL)",
-                    params![agent.workspace_id, agent_id, symbol],
-                )?;
-            }
+            Self::write_footprint_rows(transaction, &agent.workspace_id, agent_id, scan, now)?;
 
             let contested = workspace_collisions(transaction, &agent.workspace_id)?;
             let after = signatures_of(&contested);
@@ -1638,9 +1724,10 @@ fn git_context(directory: &Path) -> Option<GitContext> {
         ])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    // A repository with no commits yet cannot resolve HEAD, so git exits non-zero while still
+    // printing the toplevel and common directory it did resolve. Treating that as "not a
+    // repository" would drop linked-worktree discovery and silently split the mesh, so the
+    // output is parsed on its own terms: a genuine non-repository prints nothing at all.
     let text = String::from_utf8(output.stdout).ok()?;
     let mut lines = text.lines();
     let checkout = PathBuf::from(lines.next()?).canonicalize().ok()?;

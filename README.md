@@ -124,7 +124,24 @@ pidmesh wait --agent "$PIDMESH_AGENT_ID" --after 42 --timeout-seconds 30
 pidmesh gc
 ```
 
-Every command emits JSON for reliable agent consumption.
+Commands print readable output at a terminal and JSON everywhere else, so a person sees prose while
+a pipe, a redirect, or an agent still gets the JSON it parses. `--json` forces JSON anywhere, and
+`NO_COLOR` turns off colour.
+
+```console
+$ pidmesh watch --once
+8 checkouts scanned, 8 published
+2 contested paths
+  x src/routes.rs               divergent    agent1, agent2, agent3, agent4
+  · src/shared.rs               identical    agent5, agent6
+
+1 symbol break
+  x compute_total() removed from src/api.rs, still used by agent8
+
+$ pidmesh mergeable
+Cannot merge yet — 1 blocker
+  x removes compute_total() which agent8 still calls
+```
 
 ## Detect collisions nobody declared
 
