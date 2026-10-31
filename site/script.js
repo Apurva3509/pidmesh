@@ -103,6 +103,19 @@
   });
   if (tabs.length) activateTab(tabs[0]);
 
+  // A panel shows commands and the output they produce. Only the commands are
+  // worth copying: `samp` holds the sample output, and `.prompt` the `$` that
+  // is typed by the terminal rather than by you.
+  const commandsIn = (panel) => {
+    const copy = panel.cloneNode(true);
+    copy.querySelectorAll("samp, .prompt").forEach((node) => node.remove());
+    return copy.textContent
+      .split("\n")
+      .map((line) => line.replace(/^ /, ""))
+      .join("\n")
+      .trim();
+  };
+
   document.querySelectorAll("[data-copy]").forEach((button) => {
     button.addEventListener("click", async () => {
       const visiblePanel = document.querySelector(
@@ -111,7 +124,7 @@
       if (!visiblePanel) return;
       const originalLabel = button.textContent;
       try {
-        await navigator.clipboard.writeText(visiblePanel.textContent.trim());
+        await navigator.clipboard.writeText(commandsIn(visiblePanel));
         button.textContent = "Copied";
       } catch {
         button.textContent = "Select text";
