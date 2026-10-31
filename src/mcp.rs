@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::converge::{integration_head, scan_worktree};
-use crate::store::{INTEGRATION_TASK_KEY, MeshStore};
+use crate::store::{INTEGRATION_TASK_KEY, MeshStore, checkout_directory};
 
 #[derive(Clone)]
 pub struct PidMeshMcp {
@@ -355,9 +355,16 @@ impl PidMeshMcp {
         &self,
         Parameters(parameters): Parameters<SyncParams>,
     ) -> Result<CallToolResult, McpError> {
-        let result = checkout_directory()
-            .and_then(|directory| scan_worktree(&directory, parameters.base.as_deref()))
-            .and_then(|scan| self.store.publish_footprint(&self.agent_id, &scan));
+        // The checkout, not the mesh root: this server runs inside an agent that was started
+        // in its own worktree and pointed at the repository the mesh is keyed by.
+        let result = checkout_directory(None).and_then(|directory| {
+            let scan = scan_worktree(&directory, parameters.base.as_deref())?;
+            let mut published = self.store.publish_footprint(&self.agent_id, &scan)?;
+            // Named in the answer so an agent can see which directory it just published, and
+            // so a wrong one is visible rather than silently plausible.
+            published["checkout_path"] = json!(directory.to_string_lossy());
+            Ok(published)
+        });
         tool_result(result)
     }
 
@@ -378,7 +385,7 @@ impl PidMeshMcp {
         &self,
         Parameters(parameters): Parameters<MergeableParams>,
     ) -> Result<CallToolResult, McpError> {
-        let result = checkout_directory()
+        let result = checkout_directory(None)
             .and_then(|directory| integration_head(&directory, parameters.base.as_deref()))
             .and_then(|(_, head)| self.store.merge_readiness(&self.agent_id, &head));
         tool_result(result)
@@ -419,14 +426,6 @@ fn tool_result(result: Result<Value>) -> Result<CallToolResult, McpError> {
         Ok(value) => CallToolResult::structured(value),
         Err(error) => CallToolResult::structured_error(json!({"error": format!("{error:#}")})),
     })
-}
-
-/// The checkout this server observes: the configured workspace, else the process directory.
-fn checkout_directory() -> Result<PathBuf> {
-    match env::var_os("PIDMESH_WORKSPACE") {
-        Some(workspace) => Ok(PathBuf::from(workspace)),
-        None => Ok(env::current_dir()?),
-    }
 }
 
 fn default_kind() -> String {

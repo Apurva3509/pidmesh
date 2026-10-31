@@ -1930,28 +1930,80 @@ pub fn workspace_root(root: Option<&Path>) -> Result<String> {
     Ok(workspace_context(root)?.root)
 }
 
+/// Absolute, and canonical where the path exists.
+fn normalize(path: PathBuf) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()?.join(path)
+    };
+    Ok(absolute.canonicalize().unwrap_or(absolute))
+}
+
+/// The mesh root this process was pointed at, if anything pointed it anywhere.
+fn configured_workspace(root: Option<&Path>) -> Result<Option<PathBuf>> {
+    root.map(Path::to_path_buf)
+        .or_else(|| env::var_os("PIDMESH_WORKSPACE").map(PathBuf::from))
+        .map(normalize)
+        .transpose()
+}
+
+/// The checkout this process is editing, as distinct from the mesh it belongs to.
+///
+/// These are two different things and were read out of one variable. `PIDMESH_WORKSPACE` (and
+/// `--workspace`) name the *mesh root*: the identity every agent in one repository shares, and
+/// the key the database groups agents by. They never named the directory an agent edits. A
+/// managed agent is spawned with `cwd` set to its own worktree and `PIDMESH_WORKSPACE` set to
+/// the primary repository — `src/ide.rs`, `pidmesh swarm`, and `pidmesh run` all do this — so
+/// resolving the checkout from the workspace published a footprint for a directory the agent
+/// was not touching. Every command still succeeded, which made it a false "safe": real
+/// collisions went unreported and `mergeable` could clear a merge it should have blocked.
+///
+/// Resolution, in order:
+///
+/// 1. `PIDMESH_CHECKOUT`, which says this outright and is what a spawner sets.
+/// 2. the process directory, whenever it belongs to the same repository as the mesh root —
+///    which is exactly the managed-agent shape, and the only reading of it that can be right.
+/// 3. the mesh root, for a host that starts the server outside the project altogether. That is
+///    the one configuration the old behaviour was defensible in, and it is preserved so nobody
+///    relying on `PIDMESH_WORKSPACE` to supply a project identity loses it.
+pub fn checkout_directory(root: Option<&Path>) -> Result<PathBuf> {
+    if let Some(checkout) = env::var_os("PIDMESH_CHECKOUT") {
+        return normalize(PathBuf::from(checkout));
+    }
+    let here = env::current_dir()?;
+    let Some(workspace) = configured_workspace(root)? else {
+        return Ok(here);
+    };
+    // The ordinary case, answered without starting git twice to learn nothing.
+    if here == workspace {
+        return Ok(here);
+    }
+    // Same repository means the process directory is a checkout *of this mesh*, so it is the
+    // agent's own one. Anything else — a different repository, or no repository at all — leaves
+    // the configured root as the only checkout this process can claim to be observing.
+    match (git_context(&here), git_context(&workspace)) {
+        (Some(mine), Some(mesh)) if mine.primary == mesh.primary => Ok(here),
+        _ => Ok(workspace),
+    }
+}
+
 fn workspace_context(root: Option<&Path>) -> Result<WorkspaceContext> {
-    let configured = root
-        .map(Path::to_path_buf)
-        .or_else(|| env::var_os("PIDMESH_WORKSPACE").map(PathBuf::from));
-    let explicit = configured.is_some();
-    let selected = configured.unwrap_or(env::current_dir()?);
-    let absolute = if selected.is_absolute() {
-        selected
-    } else {
-        env::current_dir()?.join(selected)
-    };
-    let normalized = absolute.canonicalize().unwrap_or(absolute);
-    let git = git_context(&normalized);
-    let checkout = git
-        .as_ref()
-        .map_or_else(|| normalized.clone(), |context| context.checkout.clone());
-    let root = if explicit {
-        normalized
-    } else {
-        git.as_ref()
-            .map_or_else(|| normalized.clone(), |context| context.primary.clone())
-    };
+    let configured = configured_workspace(root)?;
+    let checkout_directory = checkout_directory(root)?;
+    let git = git_context(&checkout_directory);
+    let checkout = git.as_ref().map_or_else(
+        || checkout_directory.clone(),
+        |context| context.checkout.clone(),
+    );
+    // An explicit workspace is the mesh root verbatim: that is what bypasses linked-worktree
+    // discovery, and `doctor` reports on the damage when it is set inside a worktree.
+    let root = configured.unwrap_or_else(|| {
+        git.as_ref().map_or_else(
+            || checkout_directory.clone(),
+            |context| context.primary.clone(),
+        )
+    });
     Ok(WorkspaceContext {
         branch: git.and_then(|context| context.branch),
         checkout: checkout.to_string_lossy().into_owned(),
@@ -2096,15 +2148,77 @@ fn unwatched_worktrees(store: &MeshStore, primary: &Path) -> Result<Vec<String>>
         .collect())
 }
 
+/// Checkouts of this repository that no live agent has registered.
+fn unwatched_warning(unwatched: &[String]) -> Value {
+    let one = unwatched.len() == 1;
+    json!({
+        "code": "unwatched_worktrees",
+        "detail": format!(
+            "{} of this repository {} no agent registered with pidmesh, so nothing observes \
+             what {} change and no collision involving {} can be reported. Run `pidmesh join \
+             --name <agent>` inside each one, or start it with `pidmesh run`.",
+            if one {
+                "1 checkout".to_owned()
+            } else {
+                format!("{} checkouts", unwatched.len())
+            },
+            if one { "has" } else { "have" },
+            if one { "it" } else { "they" },
+            if one { "it" } else { "them" },
+        ),
+        "worktrees": unwatched
+    })
+}
+
+/// The checkout pidmesh resolved is not the one this process is standing in.
+///
+/// `PIDMESH_WORKSPACE` pointed at a mesh this process is outside of, or `PIDMESH_CHECKOUT` is
+/// stale. Either way every footprint published from here describes a directory nobody is
+/// editing. Same family as the split mesh: nothing fails, and every answer is about the wrong
+/// place.
+fn checkout_mismatch(
+    resolved: &str,
+    resolved_checkout: &Path,
+    own_checkout: &Path,
+) -> Option<Value> {
+    // Compared as checkouts, not as directories: running from a subdirectory of a worktree is
+    // ordinary and resolves to the same checkout, so it is not a disagreement about anything.
+    let observed = git_context(resolved_checkout).map_or_else(
+        || resolved_checkout.to_path_buf(),
+        |context| context.checkout,
+    );
+    if observed == own_checkout {
+        return None;
+    }
+    Some(json!({
+        "code": "checkout_mismatch",
+        "detail": format!(
+            "pidmesh observes {}, but this process is running in {}. A footprint published from \
+             here describes the first of those rather than what you are editing. PIDMESH_WORKSPACE \
+             names the mesh ({}), not the checkout: unset it, or point PIDMESH_CHECKOUT at the \
+             directory this agent is actually editing.",
+            observed.display(),
+            own_checkout.display(),
+            resolved
+        ),
+        "checkout": observed.to_string_lossy(),
+        "directory": own_checkout.to_string_lossy()
+    }))
+}
+
 /// Diagnose whether this workspace is actually one shared mesh.
 ///
 /// An explicit `--workspace` or `PIDMESH_WORKSPACE` bypasses linked-worktree discovery, so every
 /// checkout becomes its own mesh. Coordination then silently does nothing while every command
-/// still succeeds, which is the worst failure mode this system has.
+/// still succeeds, which is the worst failure mode this system has. The same variable pointed
+/// at a mesh this process is not standing inside is the other half of that failure, reported
+/// here as `checkout_mismatch`.
 pub fn diagnose(database: &Path, root: Option<&Path>) -> Result<Value> {
     let store = MeshStore::new(database)?;
-    let here = git_context(&env::current_dir()?);
+    let directory = env::current_dir()?;
+    let here = git_context(&directory);
     let resolved = workspace_root(root)?;
+    let resolved_checkout = checkout_directory(root)?;
     let primary = here.as_ref().map(|context| context.primary.clone());
 
     let registered = store.read(|connection| {
@@ -2149,6 +2263,12 @@ pub fn diagnose(database: &Path, root: Option<&Path>) -> Result<Value> {
             "roots": siblings
         }));
     }
+    let own_checkout = here
+        .as_ref()
+        .map_or_else(|| directory.clone(), |context| context.checkout.clone());
+    if let Some(warning) = checkout_mismatch(&resolved, &resolved_checkout, &own_checkout) {
+        warnings.push(warning);
+    }
     // Checkouts git knows about that no live agent has registered. A mesh watching none of the
     // repository's worktrees is not healthy, however consistent its own records are: every
     // other check here passes trivially when there is nothing to check.
@@ -2157,23 +2277,7 @@ pub fn diagnose(database: &Path, root: Option<&Path>) -> Result<Value> {
         None => Vec::new(),
     };
     if !unwatched.is_empty() {
-        warnings.push(json!({
-            "code": "unwatched_worktrees",
-            "detail": format!(
-                "{} of this repository {} no agent registered with pidmesh, so nothing \
-                 observes what {} change and no collision involving {} can be reported. Run \
-                 `pidmesh join --name <agent>` inside each one, or start it with `pidmesh run`.",
-                if unwatched.len() == 1 {
-                    "1 checkout".to_owned()
-                } else {
-                    format!("{} checkouts", unwatched.len())
-                },
-                if unwatched.len() == 1 { "has" } else { "have" },
-                if unwatched.len() == 1 { "it" } else { "they" },
-                if unwatched.len() == 1 { "it" } else { "them" },
-            ),
-            "worktrees": unwatched
-        }));
+        warnings.push(unwatched_warning(&unwatched));
     }
 
     if here.is_none() {
@@ -2185,7 +2289,9 @@ pub fn diagnose(database: &Path, root: Option<&Path>) -> Result<Value> {
                 "detail": format!(
                     "{} is not inside a git repository, so linked-worktree discovery cannot \
                      group checkouts. Run pidmesh from a checkout, or `git init` here first.",
-                    resolved
+                    // The process directory, which is what `here` was read from. Naming the
+                    // workspace instead blamed a path that can be a perfectly good checkout.
+                    directory.display()
                 )
             }));
         } else {
@@ -2204,6 +2310,7 @@ pub fn diagnose(database: &Path, root: Option<&Path>) -> Result<Value> {
     Ok(json!({
         "database": database,
         "resolved_workspace": resolved,
+        "resolved_checkout": resolved_checkout.to_string_lossy(),
         "checkout": here.as_ref().map(|context| context.checkout.to_string_lossy()),
         "primary_repository": primary.as_ref().map(|path| path.to_string_lossy()),
         "branch": here.as_ref().and_then(|context| context.branch.clone()),

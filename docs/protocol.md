@@ -3,7 +3,9 @@
 PidMesh scopes all state to a logical project path. With no explicit override, linked git worktrees
 resolve through their common git directory and share the primary repository root as that identity.
 Each agent also records its actual checkout path and branch. `PIDMESH_WORKSPACE` or an explicit CLI
-workspace bypasses discovery. Agent sessions get immutable IDs containing their human-readable name,
+workspace bypasses discovery. It names the mesh root only: the checkout an agent observes is its
+process directory whenever that directory belongs to the same repository, or `PIDMESH_CHECKOUT`
+when a spawner names it outright. Agent sessions get immutable IDs containing their human-readable name,
 operating-system PID, and a random suffix. Names are convenient routing aliases; IDs are the stable
 address.
 

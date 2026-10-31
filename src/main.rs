@@ -21,7 +21,8 @@ use pidmesh::converge::{
 use pidmesh::ide::IdeManager;
 use pidmesh::render::{self, Shape};
 use pidmesh::store::{
-    AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, default_database_path, diagnose, workspace_root,
+    AgentCheckout, INTEGRATION_TASK_KEY, MeshStore, checkout_directory, default_database_path,
+    diagnose, workspace_root,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -581,7 +582,7 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
         } => {
             let directory = match checkout {
                 Some(path) => path,
-                None => std::env::current_dir()?,
+                None => checkout_directory(None)?,
             };
             let scan = scan_worktree(&directory, base.as_deref())?;
             present(
@@ -602,7 +603,7 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
         } => {
             let directory = match checkout {
                 Some(path) => path,
-                None => std::env::current_dir()?,
+                None => checkout_directory(None)?,
             };
             let (_, head) = integration_head(&directory, base.as_deref())?;
             let readiness = store.merge_readiness(&agent_id(agent.as_deref())?, &head)?;
@@ -891,6 +892,9 @@ fn run_swarm(
     }
 
     let root = workspace_root(workspace)?;
+    // The mesh root can be the primary repository while this command runs in a linked worktree,
+    // so the workers are told both: which mesh they are in, and which checkout they are editing.
+    let checkout = checkout_directory(workspace)?;
     let swarm_id = format!("swarm-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let stopping = Arc::new(AtomicBool::new(false));
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -921,6 +925,7 @@ fn run_swarm(
             "PIDMESH_AGENT_ID": agent_id,
             "PIDMESH_AGENT_INDEX": index,
             "PIDMESH_AGENT_NAME": name,
+            "PIDMESH_CHECKOUT": checkout,
             "PIDMESH_DB": store.path(),
             "PIDMESH_PROVIDER": provider,
             "PIDMESH_SWARM_ID": swarm_id,
@@ -1086,6 +1091,7 @@ fn run_supervised(
     }
     let agent_id = format!("{name}-run-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let root = workspace_root(workspace)?;
+    let checkout = checkout_directory(workspace)?;
     let mut registration = store.register_agent(
         name,
         std::process::id(),
@@ -1096,6 +1102,7 @@ fn run_supervised(
     )?;
     let environment = json!({
         "PIDMESH_AGENT_ID": agent_id,
+        "PIDMESH_CHECKOUT": checkout,
         "PIDMESH_DB": store.path(),
         "PIDMESH_WORKSPACE": root
     });

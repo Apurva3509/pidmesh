@@ -382,7 +382,8 @@ pidmesh swarm --workers 5 --name-prefix researcher --provider codex -- \
 ```
 
 Each child receives `PIDMESH_AGENT_ID`, `PIDMESH_AGENT_INDEX`, `PIDMESH_AGENT_NAME`,
-`PIDMESH_SWARM_ID`, `PIDMESH_SWARM_SIZE`, `PIDMESH_DB`, and `PIDMESH_WORKSPACE`. Workers can use
+`PIDMESH_SWARM_ID`, `PIDMESH_SWARM_SIZE`, `PIDMESH_DB`, `PIDMESH_WORKSPACE`, and
+`PIDMESH_CHECKOUT`. Workers can use
 the CLI or MCP server against the same mesh while remaining separate operating-system processes.
 The supervisor heartbeats every live worker, observes exits independently, and marks sessions stopped
 when they finish. `--fail-fast` terminates the remaining workers after the first failure. Ctrl-C,
@@ -417,6 +418,13 @@ claims and resource reservations during a clean shutdown. Linked git worktrees a
 automatically. Set `PIDMESH_WORKSPACE` to override that project identity when the host does not start
 the server from the project directory. `PIDMESH_DB` overrides the default
 `~/.pidmesh/pidmesh.db`.
+
+`PIDMESH_WORKSPACE` names the *mesh*, not the directory an agent edits. Those are different
+whenever an agent works in its own linked worktree of a shared repository, which is how
+`pidmesh ide`, `pidmesh swarm`, and `pidmesh run` start one. The checkout is the process
+directory whenever that directory belongs to the mesh's repository, and `PIDMESH_CHECKOUT` names
+it outright for a host that starts the server somewhere else. `pidmesh doctor` reports a
+`PIDMESH_WORKSPACE` that disagrees with the checkout it found.
 
 ## Concurrency guarantees
 

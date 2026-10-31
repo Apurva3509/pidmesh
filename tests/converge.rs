@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use pidmesh::converge::{Participant, classify, integration_head, scan_worktree};
 use pidmesh::store::MeshStore;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn git(directory: &Path, arguments: &[&str]) -> Result<()> {
@@ -772,15 +772,28 @@ fn two_worktree_repository(root: &Path, explicit_workspace: bool) -> Result<(Pat
 }
 
 fn doctor(database: &Path, from: &Path) -> Result<(Value, bool)> {
-    let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+    doctor_with_workspace(database, from, None)
+}
+
+fn doctor_with_workspace(
+    database: &Path,
+    from: &Path,
+    workspace: Option<&Path>,
+) -> Result<(Value, bool)> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pidmesh"));
+    command
         .current_dir(from)
         .env_remove("PIDMESH_WORKSPACE")
+        .env_remove("PIDMESH_CHECKOUT")
         .args([
             "--db",
             database.to_str().context("database path")?,
             "doctor",
-        ])
-        .output()?;
+        ]);
+    if let Some(workspace) = workspace {
+        command.env("PIDMESH_WORKSPACE", workspace);
+    }
+    let output = command.output()?;
     Ok((
         serde_json::from_slice(&output.stdout)?,
         output.status.success(),
@@ -942,6 +955,83 @@ fn doctor_reports_a_healthy_mesh_when_discovery_groups_the_worktrees() -> Result
     assert_eq!(report["linked_worktree"], true);
     assert_eq!(report["warnings"].as_array().map(Vec::len), Some(0));
     Ok(())
+}
+
+/// `PIDMESH_WORKSPACE` naming a mesh this process is not standing in.
+///
+/// Same family as the split mesh above, and the shape #37 was reported for: the workspace and
+/// the checkout are two different things, so a process pointed at one while sitting outside it
+/// observes a directory nobody is editing. Nothing fails, which is exactly why doctor has to
+/// say it.
+#[test]
+fn doctor_names_a_workspace_that_disagrees_with_the_checkout() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (database, worktree) = two_worktree_repository(directory.path(), false)?;
+    let repository = worktree
+        .parent()
+        .context("worktree parent")?
+        .join("repository");
+    let elsewhere = directory.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere)?;
+
+    // Standing inside the mesh is healthy, whether or not the workspace is named explicitly:
+    // a managed agent is started exactly like this, cwd in its worktree and the mesh root set.
+    let (report, _) = doctor_with_workspace(&database, &worktree, Some(&repository))?;
+    let codes = warning_codes(&report);
+    assert!(
+        !codes.contains(&"checkout_mismatch"),
+        "a checkout of the named mesh is not a mismatch: {report}"
+    );
+    assert_eq!(
+        report["resolved_checkout"],
+        json!(worktree.canonicalize()?.to_string_lossy()),
+        "the checkout is where the process is, not the mesh root: {report}"
+    );
+
+    // A subdirectory of that worktree is still that worktree, and must not be reported as a
+    // disagreement: working from `src/` is what people actually do.
+    let inside = worktree.join("nested");
+    std::fs::create_dir(&inside)?;
+    let (report, _) = doctor_with_workspace(&database, &inside, Some(&repository))?;
+    assert!(
+        !warning_codes(&report).contains(&"checkout_mismatch"),
+        "a subdirectory of the checkout is the checkout: {report}"
+    );
+
+    // Standing outside it is not.
+    let (report, succeeded) = doctor_with_workspace(&database, &elsewhere, Some(&repository))?;
+    assert!(
+        !succeeded,
+        "a mismatched checkout must exit non-zero: {report}"
+    );
+    let warnings = report["warnings"].as_array().context("warnings")?;
+    let mismatch = warnings
+        .iter()
+        .find(|warning| warning["code"] == "checkout_mismatch")
+        .context("doctor missed a workspace that disagrees with the checkout")?;
+    let detail = mismatch["detail"].as_str().context("detail")?;
+    assert!(
+        detail.contains("PIDMESH_CHECKOUT"),
+        "the warning has to say what to set: {detail}"
+    );
+    assert_eq!(
+        mismatch["checkout"],
+        json!(repository.canonicalize()?.to_string_lossy()),
+        "the directory actually observed is named: {mismatch}"
+    );
+    Ok(())
+}
+
+fn warning_codes(report: &Value) -> Vec<&str> {
+    report["warnings"]
+        .as_array()
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(|warning| warning["code"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The worst failure mode this system has: every command succeeds while nothing coordinates.
