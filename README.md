@@ -411,6 +411,7 @@ the server from the project directory. `PIDMESH_DB` overrides the default
 - An incomplete scan reports conflict rather than clearance; a downgrade always needs proof.
 - An unobserved checkout is a blocker, not a clean verdict.
 - A sweep that changes nothing writes nothing, and the event ledger is bounded.
+- `pidmesh gc` returns reclaimed space to the filesystem, which trimming alone does not.
 - Edits to separable regions of one file are distinguished from edits that overwrite each other.
 - Withdrawing an export a live checkout still calls is caught even when no file is shared.
 - A stale base blocks a merge even when the diff would apply cleanly.
