@@ -479,6 +479,49 @@ fn git(directory: &Path, arguments: &[&str]) -> Result<()> {
 // 1. The route table cannot fall behind the router
 // ---------------------------------------------------------------------------------------------
 
+/// Pull every `.route("…", …)` registration out of the named function, paired with its own body.
+fn routes_declared_in(function: &str) -> Vec<(String, String)> {
+    let start = SOURCE
+        .find(function)
+        .unwrap_or_else(|| panic!("{function} is still a router"));
+    let body = &SOURCE[start..];
+    let end = body.find("\n}\n").expect("the router has an end");
+    let body = &body[..end];
+    let mut found = Vec::new();
+    for chunk in body.split(".route(").skip(1) {
+        let rest = chunk
+            .trim_start()
+            .strip_prefix('"')
+            .expect("a route registers a string literal first");
+        let (pattern, remainder) = rest.split_once('"').expect("the literal is terminated");
+        found.push((pattern.to_owned(), remainder.to_owned()));
+    }
+    found
+}
+
+/// Authorization is applied per route *inside* `api_router`, through `read`, `control` or
+/// `ticketed` -- it is not a blanket layer over the whole service. The outer `router` carries
+/// only the body limit, the host check and the security headers, so an `/api/` path registered
+/// out there is served to anyone who asks.
+///
+/// `registered_routes` only reads `api_router`, so such a route would be invisible to every
+/// other test in this file as well as unguarded. Planting
+/// `.route("/api/v1/backdoor", get(health))` beside `/healthz` is enough to reproduce it: the
+/// whole suite passes. This closes that gap.
+#[test]
+fn the_public_router_registers_no_api_route() {
+    let stray: Vec<String> = routes_declared_in("fn router(")
+        .into_iter()
+        .map(|(pattern, _)| pattern)
+        .filter(|pattern| pattern.starts_with("/api"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "these /api routes are registered in `router` rather than `api_router`, so no \
+         read()/control()/ticketed() guard applies and they are served unauthenticated: {stray:?}"
+    );
+}
+
 /// Pull every `.route("…", …)` registration out of `api_router`, paired with its own body.
 fn registered_routes() -> Vec<(String, String)> {
     let start = SOURCE
