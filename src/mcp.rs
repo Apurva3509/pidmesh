@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::converge::{integration_head, scan_worktree};
-use crate::store::{INTEGRATION_TASK_KEY, MeshStore, checkout_directory};
+use crate::store::{INTEGRATION_TASK_KEY, MeshStore, Refusal, checkout_directory};
 
 #[derive(Clone)]
 pub struct PidMeshMcp {
@@ -84,7 +84,7 @@ struct ReleaseParams {
 /// hold it.
 ///
 /// Reusing `ClaimParams` here advertised a required `task` the tool then threw away, which made
-/// the obvious call -- `acquire_integration_lease` with no arguments -- fail to deserialize.
+/// the obvious call — `acquire_integration_lease` with no arguments — fail to deserialize.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct IntegrationLeaseParams {
     #[serde(default = "default_lease")]
@@ -421,10 +421,24 @@ impl PidMeshMcp {
 )]
 impl ServerHandler for PidMeshMcp {}
 
+/// Answer a tool call, saying which *kind* of failure a failure was.
+///
+/// An agent reading only `error` has the same problem the dashboard had: it cannot tell "you
+/// addressed nobody", which it should fix and retry differently, from "the database broke",
+/// which retrying the same way is the only sensible response to. `kind` is that distinction,
+/// taken from the store's type rather than from the text of the message.
+///
+/// The message itself is unchanged, including for a fault. Unlike the dashboard this is a stdio
+/// transport inside the agent's own process, with no remote audience to disclose to, and the
+/// detail in a failure here — which base ref git would not read, which directory is not a
+/// repository — is what makes a tool error actionable.
 fn tool_result(result: Result<Value>) -> Result<CallToolResult, McpError> {
     Ok(match result {
         Ok(value) => CallToolResult::structured(value),
-        Err(error) => CallToolResult::structured_error(json!({"error": format!("{error:#}")})),
+        Err(error) => CallToolResult::structured_error(json!({
+            "error": format!("{error:#}"),
+            "kind": Refusal::of(&error).map_or("fault", |refusal| refusal.kind().as_str()),
+        })),
     })
 }
 

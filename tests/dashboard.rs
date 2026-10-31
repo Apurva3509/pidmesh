@@ -322,6 +322,11 @@ impl Dashboard {
         self.directory.path().join("workspace")
     }
 
+    /// The database this dashboard is running on, so a test can break it on purpose.
+    fn database(&self) -> std::path::PathBuf {
+        self.directory.path().join("mesh.db")
+    }
+
     fn authorization(&self) -> String {
         format!("Bearer {}", self.token)
     }
@@ -1436,23 +1441,19 @@ fn a_run_of_refusals_does_not_wedge_the_server() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 6. Known defect, documented rather than fixed
+// 6. What the store refuses, and what actually broke
 // ---------------------------------------------------------------------------------------------
 
 /// Naming a recipient that is not a running agent is an ordinary thing for a caller to do, and
-/// the dashboard answers it with `500 dashboard operation failed`.
+/// the dashboard used to answer it with `500 dashboard operation failed`.
 ///
-/// `MeshStore::send` refuses an unknown recipient through `anyhow`, and `blocking` flattens every
-/// `anyhow` error into `ApiError::Internal`. The caller is told nothing it can act on, and a real
-/// internal fault is indistinguishable from a typo.
-///
-/// The fix is not local to this route: it is a decision about whether the store-backed routes
-/// should carry the store's reason back the way the IDE routes already do with
-/// `ApiError::Conflict`, which would change what an authenticated caller is told when sqlite
-/// itself fails. That belongs to whoever owns the error policy, so the expected behaviour is
-/// recorded here rather than guessed at.
+/// `MeshStore::send` refused an unknown recipient through `anyhow`, and `blocking` flattened
+/// every `anyhow` error into `ApiError::Internal`, so a typo and a broken database were the same
+/// answer. The store now says which it is with a type — `store::Refusal` — and `blocking` reads
+/// the type rather than the text of the message. An unknown recipient is a 404 naming what was
+/// not found; see `a_database_fault_is_a_500_that_describes_nothing` for the other half, which
+/// is that this did not come at the cost of telling a caller about sqlite.
 #[test]
-#[ignore = "known defect: an unknown message recipient is reported as a 500, see the doc comment"]
 fn sending_to_an_agent_that_is_not_running_is_a_client_error() -> Result<()> {
     let dashboard = Dashboard::start()?;
     let authorization = dashboard.authorization();
@@ -1466,5 +1467,128 @@ fn sending_to_an_agent_that_is_not_running_is_a_client_error() -> Result<()> {
         (400..500).contains(&reply.status),
         "an unknown recipient should be a client error, not {reply:?}"
     );
-    Ok(())
+    assert_eq!(
+        reply.status, 404,
+        "an unknown recipient is a thing that is not there: {reply:?}"
+    );
+    // The point of the status is that the caller can act on it, which needs the reason too.
+    assert!(
+        reply.body.contains("no-such-agent"),
+        "the refusal should name the recipient that was not found: {reply:?}"
+    );
+    // ... and must stay distinguishable from the router saying the endpoint does not exist,
+    // which is the other thing this dashboard answers 404 with.
+    assert!(
+        !reply.body.contains("no such endpoint"),
+        "an unknown recipient was reported as an unknown route: {reply:?}"
+    );
+
+    // Broadcasting still works, so the 404 is about the recipient and not about the route.
+    let broadcast = dashboard.send(
+        "POST",
+        "/api/v1/messages",
+        &[("Authorization", authorization.as_str())],
+        r#"{"text":"hello"}"#,
+    )?;
+    assert_eq!(broadcast.status, 200, "{broadcast:?}");
+    dashboard.assert_alive()
+}
+
+/// The other half of the decision: a refusal carries its reason, a fault still carries nothing.
+///
+/// Carrying the store's reason back for everything was the cheap fix, and it would have started
+/// handing an authenticated caller sqlite's own words — table names, file paths, schema. The
+/// fault here is induced for real rather than simulated: a second connection renames the
+/// `messages` table out from under the running dashboard, so the next insert fails inside sqlite
+/// exactly the way a corrupted or half-upgraded database would.
+#[test]
+fn a_database_fault_is_a_500_that_describes_nothing() -> Result<()> {
+    let dashboard = Dashboard::start()?;
+    let authorization = dashboard.authorization();
+    let credentials = [("Authorization", authorization.as_str())];
+
+    // The route works before the table is taken away, so what follows is the fault and not a
+    // dashboard that never answered this request in the first place.
+    let healthy = dashboard.send("POST", "/api/v1/messages", &credentials, r#"{"text":"a"}"#)?;
+    assert_eq!(healthy.status, 200, "{healthy:?}");
+
+    let connection = rusqlite::Connection::open(dashboard.database())?;
+    connection.busy_timeout(Duration::from_secs(30))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    connection.execute_batch("ALTER TABLE messages RENAME TO messages_taken_away")?;
+    drop(connection);
+
+    let reply = dashboard.send("POST", "/api/v1/messages", &credentials, r#"{"text":"b"}"#)?;
+    assert_eq!(
+        reply.status, 500,
+        "a database that cannot answer is not the caller's mistake: {reply:?}"
+    );
+    assert_eq!(
+        reply.body, r#"{"error":"dashboard operation failed"}"#,
+        "a fault must say exactly what it always said: {reply:?}"
+    );
+    let served = format!("{}{}", reply.head, reply.body);
+    for leak in [
+        "messages_taken_away",
+        "no such table",
+        "sqlite",
+        "SQLite",
+        "SQL",
+        "mesh.db",
+        "Error code",
+        "rusqlite",
+    ] {
+        assert!(
+            !served.contains(leak),
+            "the database fault leaked {leak:?} to the caller: {reply:?}"
+        );
+    }
+
+    // A refusal on the same broken database is still a refusal: the classification is the store's
+    // type, so it does not depend on which failure happens to come first.
+    let refused = dashboard.send(
+        "POST",
+        "/api/v1/messages",
+        &credentials,
+        r#"{"text":"c","recipient":"no-such-agent"}"#,
+    )?;
+    assert_eq!(refused.status, 404, "{refused:?}");
+
+    dashboard.assert_alive()
+}
+
+/// Every store-backed route still answers a well-formed request, now that `blocking` classifies
+/// instead of flattening.
+///
+/// `ApiError::from_store` is one function behind eight routes, so a mistake in it would be a
+/// mistake in all of them. The route inventory above proves they are reachable; this proves the
+/// new error path did not turn any of them into a refusal of ordinary work.
+#[test]
+fn the_store_backed_routes_still_answer_ordinary_requests() -> Result<()> {
+    let dashboard = Dashboard::start()?;
+    let authorization = dashboard.authorization();
+    let origin = dashboard.origin();
+    let credentials = [
+        ("Authorization", authorization.as_str()),
+        ("Origin", origin.as_str()),
+    ];
+    for (method, path, body) in [
+        ("GET", "/api/v1/snapshot", ""),
+        ("POST", "/api/v1/memories", r#"{"text":"a memory"}"#),
+        ("GET", "/api/v1/memories?q=memory", ""),
+        ("POST", "/api/v1/messages", r#"{"text":"a broadcast"}"#),
+        ("POST", "/api/v1/claims", r#"{"task":"a-task"}"#),
+        ("DELETE", "/api/v1/claims/a-task", ""),
+        ("GET", "/api/v1/resources", ""),
+        ("POST", "/api/v1/resources", r#"{"resources":["path:src"]}"#),
+        (
+            "DELETE",
+            "/api/v1/resources",
+            r#"{"resources":["path:src"]}"#,
+        ),
+    ] {
+        let reply = dashboard.send(method, path, &credentials, body)?;
+        assert_eq!(reply.status, 200, "{method} {path} answered {reply:?}");
+    }
+    dashboard.assert_alive()
 }

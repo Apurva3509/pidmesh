@@ -170,6 +170,102 @@ CREATE INDEX IF NOT EXISTS symbol_footprints_lookup
 ON symbol_footprints(workspace_id, kind, symbol, agent_id);
 ";
 
+/// A store operation the caller's own input made impossible, as opposed to a fault.
+///
+/// Almost everything that can go wrong inside the store is a fault — sqlite failing, a poisoned
+/// lock, a clock that will not read — and a fault has no detail anyone outside the process
+/// should see: sqlite talks about table names, file paths and schema. A refusal is the other
+/// thing. The caller named an agent that has exited, or asked for a lease longer than a lease can
+/// be. It is theirs to fix, and the reason is safe to hand back because the store wrote the whole
+/// sentence; nothing in it came from the database.
+///
+/// A refusal still travels as an `anyhow::Error`, so every existing caller keeps compiling and
+/// the CLI keeps printing the same text. What changes is that a caller who has to answer a
+/// request — the dashboard's `blocking`, the MCP tool wrapper — can ask [`Refusal::of`] instead
+/// of matching on the text of a message, which is fragile and is exactly how database detail
+/// would creep back into a reply.
+///
+/// Note what is deliberately *not* a refusal: [`MeshStore::agent_row`] failing to find the agent.
+/// Both API surfaces pass their own session's id there, never the caller's, so a missing row
+/// means the dashboard's or the server's own registration has gone — which is a fault, and is
+/// reported as one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Refusal {
+    kind: RefusalKind,
+    reason: String,
+}
+
+/// What kind of mistake a [`Refusal`] is, which is all a transport needs to choose a status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefusalKind {
+    /// An argument is malformed, or outside the range the store accepts.
+    Invalid,
+    /// The argument is well formed and names something this workspace does not have.
+    Missing,
+}
+
+impl Refusal {
+    /// An argument the store will not accept.
+    #[must_use]
+    pub fn invalid(reason: impl Into<String>) -> Self {
+        Self {
+            kind: RefusalKind::Invalid,
+            reason: reason.into(),
+        }
+    }
+
+    /// Something the caller named that is not here.
+    #[must_use]
+    pub fn missing(reason: impl Into<String>) -> Self {
+        Self {
+            kind: RefusalKind::Missing,
+            reason: reason.into(),
+        }
+    }
+
+    /// The refusal behind an error, or `None` if the error is a fault.
+    ///
+    /// This looks through `anyhow`'s context chain, so a refusal stays recognisable even if a
+    /// caller added context on the way out.
+    #[must_use]
+    pub fn of(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RefusalKind {
+        self.kind
+    }
+
+    /// The reason, as the store wrote it.
+    ///
+    /// Report this rather than the `anyhow` chain it arrived in: the chain can carry context a
+    /// caller added, and only this string is known to have been written here.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+impl RefusalKind {
+    /// A stable word for this kind, for a caller reporting it to a machine.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Missing => "missing",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MeshStore {
     path: PathBuf,
@@ -387,7 +483,7 @@ impl MeshStore {
         importance: f64,
     ) -> Result<Value> {
         if !(0.0..=1.0).contains(&importance) {
-            bail!("importance must be between 0 and 1");
+            bail!(Refusal::invalid("importance must be between 0 and 1"));
         }
         self.write(|transaction| {
             let agent = Self::agent_row(transaction, agent_id)?;
@@ -486,7 +582,9 @@ impl MeshStore {
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?
-                    .ok_or_else(|| anyhow!("active recipient not found: {recipient}"))?
+                    .ok_or_else(|| {
+                        Refusal::missing(format!("active recipient not found: {recipient}"))
+                    })?
                     .into()
             };
             transaction.execute(
@@ -607,12 +705,10 @@ impl MeshStore {
         detail: Option<&str>,
     ) -> Result<Value> {
         if lease_seconds == 0 {
-            bail!("lease_seconds must be positive");
+            bail!(Refusal::invalid("lease_seconds must be positive"));
         }
         let now = now_ms()?;
-        let lease_expires_at = now
-            .checked_add(i64::try_from(lease_seconds)?.saturating_mul(1000))
-            .ok_or_else(|| anyhow!("lease duration is too large"))?;
+        let lease_expires_at = lease_expiry(now, lease_seconds)?;
         self.write(|transaction| {
             let agent = Self::agent_row(transaction, agent_id)?;
             transaction.execute(
@@ -704,12 +800,12 @@ impl MeshStore {
     ) -> Result<Value> {
         let resources = normalize_resources(resources)?;
         if lease_seconds == 0 || lease_seconds > 86_400 {
-            bail!("lease_seconds must be between 1 and 86400");
+            bail!(Refusal::invalid(
+                "lease_seconds must be between 1 and 86400"
+            ));
         }
         let now = now_ms()?;
-        let lease_expires_at = now
-            .checked_add(i64::try_from(lease_seconds)?.saturating_mul(1000))
-            .ok_or_else(|| anyhow!("lease duration is too large"))?;
+        let lease_expires_at = lease_expiry(now, lease_seconds)?;
         self.write(|transaction| {
             let agent = Self::agent_row(transaction, agent_id)?;
             transaction.execute(
@@ -1489,7 +1585,7 @@ impl MeshStore {
                         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                     )
                     .optional()?
-                    .ok_or_else(|| anyhow!("agent not found: {agent_id}"))?
+                    .ok_or_else(|| Refusal::missing(format!("agent not found: {agent_id}")))?
             } else {
                 let root = workspace_root(root)?;
                 let found = connection
@@ -1577,7 +1673,9 @@ impl MeshStore {
 
     pub fn dashboard_snapshot(&self, root: &Path, limit: u32) -> Result<Value> {
         if !(1..=500).contains(&limit) {
-            bail!("dashboard limit must be between 1 and 500");
+            bail!(Refusal::invalid(
+                "dashboard limit must be between 1 and 500"
+            ));
         }
         let status = self.status(None, Some(root))?;
         let Some(workspace_id) = status["workspace_id"].as_str().map(ToOwned::to_owned) else {
@@ -1689,10 +1787,12 @@ impl MeshStore {
         limit: u32,
     ) -> Result<Value> {
         if timeout > Duration::from_secs(60) {
-            bail!("timeout must be at most 60 seconds");
+            bail!(Refusal::invalid("timeout must be at most 60 seconds"));
         }
         if !(Duration::from_millis(10)..=Duration::from_secs(5)).contains(&poll_interval) {
-            bail!("poll interval must be between 10 milliseconds and 5 seconds");
+            bail!(Refusal::invalid(
+                "poll interval must be between 10 milliseconds and 5 seconds"
+            ));
         }
         let deadline = Instant::now() + timeout;
         loop {
@@ -1870,6 +1970,12 @@ impl MeshStore {
         Ok(workspace_id)
     }
 
+    /// The workspace row behind an agent id.
+    ///
+    /// A miss here is **not** a [`Refusal`]. Every API surface passes its own session's id, so
+    /// the row being gone means this process's registration has gone, which is a fault and is
+    /// reported as one. The one place an agent id really is the caller's — `status` with an
+    /// explicit id — refuses on its own.
     fn agent_row(connection: &Connection, agent_id: &str) -> Result<AgentRow> {
         connection
             .query_row(
@@ -2404,6 +2510,18 @@ fn now_ms() -> Result<i64> {
     i64::try_from(duration.as_millis()).context("timestamp exceeds i64")
 }
 
+/// When a lease of `lease_seconds` taken at `now` expires.
+///
+/// A duration that cannot be represented is the caller's number being absurd, not the machine
+/// failing, so both ways of overflowing come back as one refusal rather than as a
+/// `TryFromIntError` the caller would be shown a 500 for.
+fn lease_expiry(now: i64, lease_seconds: u64) -> Result<i64> {
+    i64::try_from(lease_seconds)
+        .ok()
+        .and_then(|seconds| now.checked_add(seconds.saturating_mul(1000)))
+        .ok_or_else(|| Refusal::invalid("lease duration is too large").into())
+}
+
 fn is_busy(error: &rusqlite::Error) -> bool {
     matches!(
         error.sqlite_error_code(),
@@ -2419,28 +2537,34 @@ impl ResourceKey {
 
 fn normalize_resources(resources: &[String]) -> Result<Vec<ResourceKey>> {
     if resources.is_empty() || resources.len() > 64 {
-        bail!("resources must contain between 1 and 64 entries");
+        bail!(Refusal::invalid(
+            "resources must contain between 1 and 64 entries"
+        ));
     }
     let mut normalized = Vec::new();
     let mut seen = HashSet::new();
     for resource in resources {
-        let (kind, key) = resource
-            .split_once(':')
-            .ok_or_else(|| anyhow!("resource must use kind:key syntax: {resource}"))?;
+        let (kind, key) = resource.split_once(':').ok_or_else(|| {
+            Refusal::invalid(format!("resource must use kind:key syntax: {resource}"))
+        })?;
         if kind.is_empty()
             || kind.len() > 32
             || !kind.bytes().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
             })
         {
-            bail!("resource kind must be lowercase alphanumeric, '-' or '_': {kind}");
+            bail!(Refusal::invalid(format!(
+                "resource kind must be lowercase alphanumeric, '-' or '_': {kind}"
+            )));
         }
         let key = if kind == "path" {
             normalize_resource_path(key)?
         } else {
             let key = key.trim();
             if key.is_empty() || key.len() > 512 || key.chars().any(char::is_control) {
-                bail!("resource key must contain between 1 and 512 printable bytes");
+                bail!(Refusal::invalid(
+                    "resource key must contain between 1 and 512 printable bytes"
+                ));
             }
             key.to_owned()
         };
@@ -2457,7 +2581,9 @@ fn normalize_resources(resources: &[String]) -> Result<Vec<ResourceKey>> {
 
 fn normalize_resource_path(value: &str) -> Result<String> {
     if value.is_empty() || value.len() > 512 {
-        bail!("path resource must contain between 1 and 512 bytes");
+        bail!(Refusal::invalid(
+            "path resource must contain between 1 and 512 bytes"
+        ));
     }
     let mut parts = Vec::new();
     for component in Path::new(value).components() {
@@ -2466,19 +2592,25 @@ fn normalize_resource_path(value: &str) -> Result<String> {
             Component::Normal(part) => {
                 let part = part
                     .to_str()
-                    .ok_or_else(|| anyhow!("path resource must be valid UTF-8"))?;
+                    .ok_or_else(|| Refusal::invalid("path resource must be valid UTF-8"))?;
                 if part.chars().any(char::is_control) {
-                    bail!("path resource must not contain control characters");
+                    bail!(Refusal::invalid(
+                        "path resource must not contain control characters"
+                    ));
                 }
                 parts.push(part);
             }
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!("path resource must be relative and must not contain '..'");
+                bail!(Refusal::invalid(
+                    "path resource must be relative and must not contain '..'"
+                ));
             }
         }
     }
     if parts.is_empty() {
-        bail!("path resource must identify a workspace-relative path");
+        bail!(Refusal::invalid(
+            "path resource must identify a workspace-relative path"
+        ));
     }
     Ok(parts.join("/"))
 }
