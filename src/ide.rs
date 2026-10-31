@@ -491,7 +491,9 @@ impl IdeManager {
         ensure!(directory.is_dir(), "requested path is not a directory");
         let mut entries = fs::read_dir(&directory)?
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name() != ".git")
+            // Hidden from the listing by the same predicate that refuses to read it, so a name
+            // the browser offers is always a name the file route will serve.
+            .filter(|entry| !is_git_dir(&entry.file_name()))
             .map(|entry| {
                 let path = entry.path();
                 let metadata = entry.metadata()?;
@@ -1224,6 +1226,49 @@ fn review_value(session: &ManagedSession) -> Result<Value> {
     }))
 }
 
+/// The directory git keeps a repository's metadata in.
+const GIT_DIR: &str = ".git";
+
+/// Is this path component git's metadata directory?
+///
+/// Matched whole and without regard to case. Whole, because `.gitignore`, `.gitattributes` and
+/// `.github` are tracked workspace content that people legitimately read in the file browser --
+/// a prefix match would hide them. Without regard to case, because the filesystem under a
+/// pidmesh checkout is frequently case-insensitive: on macOS's default APFS, `.GIT/config`
+/// opens `.git/config`, and a case-sensitive rule would hold on Linux and evaporate on a Mac.
+fn is_git_dir(component: &OsStr) -> bool {
+    component
+        .to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(GIT_DIR))
+}
+
+/// Resolve a caller-supplied relative path against a checkout, refusing anything that is not
+/// workspace content.
+///
+/// Two things are refused here rather than at each call site, so that every consumer of this
+/// function inherits both:
+///
+/// 1. A path that resolves outside the checkout. Canonicalisation is what makes a symlink's
+///    innocent name irrelevant -- only where it lands counts.
+/// 2. A path at or under the git directory. `.git` sits inside the checkout, so it is not a
+///    traversal and rule 1 says nothing about it, but it is not workspace content either: it is
+///    the database *behind* the workspace. `.git/config` carries remote URLs with embedded
+///    credentials, `.git/objects` carries every version of every file ever committed -- including
+///    content deleted from the working tree -- and `.git/hooks` carries code that runs on commit.
+///    The dashboard is a workspace file browser; handing out the repository's own store is a
+///    different and much larger thing than browsing the files an agent is editing.
+///
+/// The check runs on the *canonical* path, below the checkout root, so it is a statement about
+/// where a request lands rather than how it was spelled. That is what makes it hold for a
+/// symlink pointing at `.git`, for a nested repository's `sub/.git`, for the `.git` *file* that
+/// marks a linked worktree, and for every spelling -- trailing slash, interior `.`, percent
+/// encoding, alternate case -- that resolves to the same place.
+///
+/// A path is the only thing this can reason about, so a *hard* link to a file under `.git`
+/// stays readable: it is the same inode under a name that carries no trace of the original.
+/// Nothing git does creates one, and planting one needs write access to the checkout, which
+/// already carries the ability to read `.git` directly -- so it is a limit worth naming rather
+/// than a gap worth closing here.
 fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     if !relative.is_empty() && relative != "." {
         validate_relative(relative)?;
@@ -1237,6 +1282,17 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     ensure!(
         selected.starts_with(&canonical_root),
         "path escaped managed checkout"
+    );
+    // Only the components below the root are the caller's doing. A checkout that itself lives
+    // under a directory named `.git` is the deployment's business, not this request's.
+    let within = selected
+        .strip_prefix(&canonical_root)
+        .context("path escaped managed checkout")?;
+    ensure!(
+        !within
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if is_git_dir(name))),
+        "the git directory is not workspace content"
     );
     Ok(selected)
 }
@@ -1359,7 +1415,7 @@ mod tests {
     use super::{
         ApproveRequest, IdeManager, LaunchRequest, RunHandle, git_status, git_text,
         inventory_worktrees, outside_scope, reclaim_worktrees, resolved, rollback_worktree,
-        session_view, slugify, validate_relative,
+        safe_path, session_view, slugify, validate_relative,
     };
     use crate::store::MeshStore;
 
@@ -1437,6 +1493,116 @@ mod tests {
         assert!(validate_relative("src/api").is_ok());
         assert!(validate_relative("../secrets").is_err());
         assert!(validate_relative("/tmp/secrets").is_err());
+    }
+
+    /// The git directory is inside the checkout, so no traversal rule touches it -- this is the
+    /// rule that does, and it is asserted on `safe_path` itself because both file routes and
+    /// anything added beside them resolve their path through exactly this function.
+    ///
+    /// The cases below are spellings that all land on the same bytes: a plain path, a nested
+    /// repository's, a symlink whose name says nothing about its target, the `.git` *file* that
+    /// marks a linked worktree, and -- on a case-insensitive filesystem -- a different case.
+    #[test]
+    fn the_git_directory_is_not_reachable_by_any_spelling() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("checkout");
+        fs::create_dir_all(root.join(".git/objects"))?;
+        fs::create_dir_all(root.join("sub/.git"))?;
+        fs::create_dir_all(root.join(".github"))?;
+        fs::write(root.join(".git/config"), "url = https://user:token@host\n")?;
+        fs::write(root.join("sub/.git/config"), "nested\n")?;
+        fs::write(root.join(".gitignore"), "target/\n")?;
+        fs::write(root.join(".github/ci.yml"), "name: ci\n")?;
+        fs::write(root.join("probe.txt"), "workspace content\n")?;
+        // A worktree's `.git` is a file, not a directory; it names the real gitdir, so reading
+        // it hands out the layout of a repository that is not even inside this checkout.
+        let linked = directory.path().join("linked");
+        fs::create_dir_all(&linked)?;
+        fs::write(
+            linked.join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/one\n",
+        )?;
+        fs::write(linked.join("probe.txt"), "workspace content\n")?;
+        std::os::unix::fs::symlink(root.join(".git"), root.join("gitlink"))?;
+        std::os::unix::fs::symlink(root.join(".git/config"), root.join("configlink"))?;
+
+        for refused in [
+            ".git",
+            ".git/",
+            ".git/.",
+            ".git/config",
+            "./.git/config",
+            ".git/./config",
+            ".git/objects",
+            "sub/.git",
+            "sub/.git/config",
+            "gitlink",
+            "gitlink/config",
+            "configlink",
+        ] {
+            let outcome = safe_path(&root, refused);
+            assert!(
+                outcome.is_err(),
+                "safe_path served {refused}: {:?}",
+                outcome.map(|path| path.display().to_string())
+            );
+        }
+        assert!(safe_path(&linked, ".git").is_err());
+
+        // Case-insensitively only where the filesystem is: asserting `.GIT` on a case-sensitive
+        // filesystem would be asserting that a path which does not exist cannot be read, which
+        // proves nothing. The rule itself is case-insensitive everywhere.
+        if root.join(".GIT/config").exists() {
+            assert!(safe_path(&root, ".GIT/config").is_err());
+            assert!(safe_path(&root, ".Git").is_err());
+        }
+
+        // The names that merely start with `.git` are tracked workspace content, and the file
+        // browser would be poorer and no safer for hiding them.
+        for served in [
+            "",
+            ".",
+            "probe.txt",
+            ".gitignore",
+            ".github",
+            ".github/ci.yml",
+            "sub",
+        ] {
+            safe_path(&root, served)
+                .with_context(|| format!("safe_path refused workspace content {served}"))?;
+        }
+        Ok(())
+    }
+
+    /// A listing may not offer a name the file route will then refuse, and may not hide a name
+    /// it would serve. The two routes share one predicate; this is the assertion that they do.
+    #[test]
+    fn a_listing_offers_exactly_the_names_the_file_route_will_serve() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        // Canonical, because `files` reports each entry relative to the root it was handed and
+        // `safe_path` returns canonical paths -- on macOS a `/var/folders` tempdir is a symlink
+        // to `/private/var/folders`, and the two spellings would not strip against each other.
+        let repository = seed_repository(directory.path())?.canonicalize()?;
+        fs::write(repository.join(".gitignore"), "target/\n")?;
+        let store = MeshStore::new(directory.path().join("mesh.db"))?;
+        let manager = IdeManager::new(store, repository.clone());
+
+        let listing = manager.files(None, ".")?;
+        let names = listing["entries"]
+            .as_array()
+            .context("entries")?
+            .iter()
+            .filter_map(|entry| entry["path"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&".gitignore".to_owned()), "{names:?}");
+        assert!(!names.iter().any(|name| name == ".git"), "{names:?}");
+        for name in &names {
+            safe_path(&repository, name)
+                .with_context(|| format!("the listing offered {name}, which safe_path refuses"))?;
+        }
+        assert!(manager.files(None, ".git").is_err());
+        assert!(manager.file(None, ".git/config").is_err());
+        Ok(())
     }
 
     #[test]
