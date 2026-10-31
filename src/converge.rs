@@ -6,7 +6,7 @@
 //! beyond being pointed at a directory.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -108,7 +108,9 @@ pub struct FootprintEntry {
     ///
     /// Base coordinates, not working-tree coordinates, because a three-way merge conflicts when
     /// two sides rewrote overlapping regions of the common ancestor. `None` means the regions
-    /// are unknown and the paths must be assumed to overlap.
+    /// are unknown and the paths must be assumed to overlap — which also covers the paths whose
+    /// regions are known and mean nothing, because git will not merge them a line at a time:
+    /// binary content, and anything `.gitattributes` marks `-merge` or hands to a merge driver.
     pub ranges: Option<String>,
 }
 
@@ -284,7 +286,7 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         kinds.entry(path).or_insert(kind);
     }
 
-    let entries: Vec<FootprintEntry> = kinds
+    let mut entries: Vec<FootprintEntry> = kinds
         .into_iter()
         .map(|(path, reported)| {
             // A lossily-decoded name does not address a real file, so trust neither the
@@ -323,6 +325,9 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
             }
         })
         .collect();
+    // Line regions describe a three-way *text* merge. `.gitattributes` can take that merge away
+    // from a path that diffs perfectly well, and then no gap between two edits is wide enough.
+    withhold_unmergeable_regions(checkout, &mut entries);
     let live: Vec<String> = entries
         .iter()
         .filter(|entry| entry.change_kind != ChangeKind::Deleted)
@@ -341,6 +346,242 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
         entries,
         symbols,
     })
+}
+
+/// Withhold the line regions of every path the repository has told git not to line-merge.
+///
+/// `.gitattributes` `-merge` — `*.lock -merge` is the standard lockfile idiom — makes git refuse
+/// to combine two sides of a path a line at a time, however diffable that path is. The merge
+/// becomes all-or-nothing, exactly like a binary one: *any* two-sided change conflicts. The hunk
+/// coordinates still exist and still look separable, so without this a lockfile rewritten at line
+/// 2 by one agent and line 18 by another reads as `adjacent` — reported as safe to merge — for a
+/// merge that conflicts every time. That is a false safe, which is the failure this module exists
+/// to prevent.
+///
+/// Blanking the regions rather than inventing a severity is deliberate: it is the same move the
+/// binary sniff already makes, it keeps `classify` a pure function of what was observed, and it
+/// demotes only the `adjacent` downgrade. Two checkouts holding byte-identical content still
+/// resolve trivially — git never consults a merge driver when both sides carry the same blob —
+/// and a delete against an edit still outranks content comparison. Everything else falls through
+/// to `divergent`, which is what "any two-sided change conflicts" means.
+///
+/// Cost. Only paths that still carry regions can be downgraded, so only those are asked about,
+/// and they are asked about in one `check-attr` for the whole checkout: `check-attr` is flat in
+/// path count, so once the process is being paid for, covering every candidate is close to free.
+/// The ask itself is skipped outright when no attribute file could apply (see
+/// `attributes_reachable`), which takes the common case — a repository with no `.gitattributes`
+/// at all — to zero subprocesses.
+fn withhold_unmergeable_regions(checkout: &Path, entries: &mut [FootprintEntry]) {
+    let candidates: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.ranges.is_some())
+        .map(|entry| entry.path.clone())
+        .collect();
+    if candidates.is_empty() || !attributes_reachable(checkout, &candidates) {
+        return;
+    }
+    let refused = unmergeable_paths(checkout, &candidates);
+    for entry in entries {
+        if refused.contains(&entry.path) {
+            entry.ranges = None;
+        }
+    }
+}
+
+/// Which of these paths git will not merge a line at a time, according to git itself.
+///
+/// Asking git is the only correct source. The alternative — reading `.gitattributes` ourselves —
+/// means reimplementing attribute precedence, nested files, negation and macros, and every subtle
+/// mistake in that reimplementation is a false safe by a different route.
+///
+/// Anything that goes wrong here withholds the regions instead of propagating: a scan that cannot
+/// establish a path is line-mergeable must not go on to call it `adjacent`. A short or ragged
+/// reply is treated the same way, because a missing triple would otherwise leave its path looking
+/// mergeable by default.
+fn unmergeable_paths(checkout: &Path, paths: &[String]) -> BTreeSet<String> {
+    let mut refused: BTreeSet<String> = BTreeSet::new();
+    for batch in argument_batches(paths) {
+        let mut arguments: Vec<&str> = vec!["check-attr", "merge", "-z", "--"];
+        arguments.extend(batch.iter().map(String::as_str));
+        let Ok(raw) = git_bytes(checkout, &arguments) else {
+            refused.extend(batch.iter().cloned());
+            continue;
+        };
+        let fields = split_nul_records(&raw);
+        let (triples, remainder) = fields.as_chunks::<3>();
+        if !remainder.is_empty() || triples.len() != batch.len() {
+            refused.extend(batch.iter().cloned());
+            continue;
+        }
+        for [path, _attribute, state] in triples {
+            if !merges_by_line(state) {
+                refused.insert(path.clone());
+            }
+        }
+    }
+    refused
+}
+
+/// Whether a `merge` attribute state leaves git doing an ordinary three-way text merge.
+///
+/// The four states `check-attr` reports:
+///
+/// * `unspecified` — nothing said about this path, so the default text merge applies.
+/// * `set` — `merge` written plainly, which asks for that same default text merge.
+/// * `unset` — `-merge`, the case this whole mechanism exists for. No line merge at all.
+/// * anything else — the name of a merge *driver*.
+///
+/// A named driver is treated as not line-mergeable, and that is the conservative call rather than
+/// a lazy one. The driver might be `binary`, which refuses every two-sided change exactly as
+/// `-merge` does; it might be `union`, which never conflicts but silently keeps both sides' lines;
+/// or it might be an arbitrary program out of `merge.<driver>.driver` that we cannot see, let
+/// alone predict. Even the drivers that do succeed do not combine the two sides along the hunk
+/// coordinates we measured from a textual diff, so those coordinates no longer describe the merge
+/// and must not be used to prove the edits separable. `text` is not special-cased: it names git's
+/// built-in text driver, but the same string can be bound to a user-defined driver in config, and
+/// we would be guessing which one is in force. The cost of the conservative reading is an extra
+/// `divergent` — a false alarm — against a false safe, and this project trades the other way.
+fn merges_by_line(state: &str) -> bool {
+    state == "unspecified" || state == "set"
+}
+
+/// Whether any attribute file could possibly apply to these paths.
+///
+/// This is the gate that keeps the common case free. git consults, for a path, the
+/// `.gitattributes` in its directory and every ancestor up to the top of the worktree, the shared
+/// git directory's `info/attributes`, and the holder's own global and system files. If none of
+/// those exists, no path can carry a `merge` attribute and the subprocess is pure waste — which
+/// is the state almost every repository is in.
+///
+/// It only ever decides whether to *ask*; the answer always comes from git. Every uncertain case
+/// resolves toward asking, so a gate that is wrong costs a subprocess rather than a wrong verdict.
+///
+/// Known limit: the holder probe below looks for the documented default locations of the global
+/// and system files. A `core.attributesFile` pointed somewhere else, or a system file under a
+/// non-`/etc` prefix, is still *honoured* when we ask — `check-attr` reads every layer — but it
+/// does not by itself trigger the ask. Closing that would cost a `git config` read, and a
+/// `-merge` rule that lives only in one person's home directory and nowhere in the repository is
+/// not the shape of the idiom this fixes.
+fn attributes_reachable(checkout: &Path, paths: &[String]) -> bool {
+    repository_attributes(checkout, paths) || holder_attributes()
+}
+
+/// Whether the repository itself carries an attribute file that could reach these paths.
+fn repository_attributes(checkout: &Path, paths: &[String]) -> bool {
+    if checkout.join(".gitattributes").exists() {
+        return true;
+    }
+    // Nested `.gitattributes` are ordinary, so each path's whole ancestor chain has to be
+    // considered — but chains overlap heavily, and a directory already walked has had everything
+    // above it walked too.
+    let mut walked: BTreeSet<&Path> = BTreeSet::new();
+    for path in paths {
+        let mut directory = Path::new(path.as_str()).parent();
+        while let Some(current) = directory.filter(|current| !current.as_os_str().is_empty()) {
+            if !walked.insert(current) {
+                break;
+            }
+            if checkout.join(current).join(".gitattributes").exists() {
+                return true;
+            }
+            directory = current.parent();
+        }
+    }
+    // `info/` is shared between a repository and its linked worktrees, so this has to resolve
+    // back to the common git directory. A layout we cannot resolve is assumed to hold one.
+    common_git_dir(checkout).is_none_or(|git_dir| git_dir.join("info").join("attributes").exists())
+}
+
+/// The git directory shared by a repository and all of its linked worktrees.
+///
+/// Resolved from the filesystem rather than `git rev-parse --git-common-dir`, because the whole
+/// point of this gate is to decide whether a subprocess is worth starting.
+fn common_git_dir(checkout: &Path) -> Option<PathBuf> {
+    let marker = checkout.join(".git");
+    if fs::symlink_metadata(&marker).ok()?.is_dir() {
+        return Some(marker);
+    }
+    let pointer = fs::read_to_string(&marker).ok()?;
+    let target = pointer
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    let target = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        checkout.join(target)
+    };
+    // A linked worktree's `.git` names `<common>/worktrees/<name>`; anything else already is the
+    // common directory.
+    if target.parent().and_then(Path::file_name) == Some(OsStr::new("worktrees")) {
+        target
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    } else {
+        Some(target)
+    }
+}
+
+/// Whether the machine holding the checkout has an attributes file of its own.
+///
+/// Probed once per process: it is a property of the machine, and a watcher re-scans the same
+/// checkouts every tick for hours.
+fn holder_attributes() -> bool {
+    static PRESENT: OnceLock<bool> = OnceLock::new();
+    *PRESENT.get_or_init(|| {
+        let global = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .is_some_and(|base| base.join("git").join("attributes").exists());
+        global || Path::new("/etc/gitattributes").exists()
+    })
+}
+
+/// Largest total path payload handed to one `check-attr`.
+///
+/// A checkout can hold thousands of changed paths, and an argument list long enough to exceed the
+/// kernel's limit fails the whole call. `check-attr` is flat in path count, so splitting costs
+/// only the extra process, and only for change sets far larger than any sweep normally sees.
+/// `--stdin` would avoid the split entirely but reintroduces the write-while-unread-stdout
+/// deadlock that `fingerprint_of` exists to avoid.
+const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+
+/// Split paths into argument lists short enough for one invocation each.
+fn argument_batches(paths: &[String]) -> Vec<&[String]> {
+    let mut batches = Vec::new();
+    let mut start = 0_usize;
+    let mut bytes = 0_usize;
+    for (index, path) in paths.iter().enumerate() {
+        let cost = path.len() + 1;
+        if bytes + cost > MAX_ARGUMENT_BYTES && index > start {
+            batches.push(&paths[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += cost;
+    }
+    if start < paths.len() {
+        batches.push(&paths[start..]);
+    }
+    batches
+}
+
+/// Split NUL-*terminated* git output into its records, empty ones included.
+///
+/// `split_nul` drops every empty field, which is right for a list of names and wrong here:
+/// `check-attr -z` emits fixed triples, and silently dropping a field would shift every later
+/// record onto the wrong path.
+fn split_nul_records(raw: &[u8]) -> Vec<String> {
+    let mut fields: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+        .collect();
+    // The stream terminates with a NUL, so the split always leaves one empty field behind it.
+    if fields.last().is_some_and(String::is_empty) {
+        fields.pop();
+    }
+    fields
 }
 
 /// Resolve the integration branch's current head commit.
@@ -1155,6 +1396,96 @@ mod tests {
             ranged("modified", Some("bbb"), None, Some("10-12,80-90")),
         ];
         assert_eq!(classify(&participants), "adjacent");
+    }
+
+    #[test]
+    fn only_a_default_text_merge_keeps_its_line_regions() {
+        assert!(merges_by_line("unspecified"), "nothing said is the default");
+        assert!(
+            merges_by_line("set"),
+            "`merge` plainly is that same default"
+        );
+        assert!(!merges_by_line("unset"), "`-merge` is the whole defect");
+        assert!(!merges_by_line("union"), "a driver, built-in or not");
+        assert!(
+            !merges_by_line("binary"),
+            "a driver that refuses everything"
+        );
+        assert!(
+            !merges_by_line("text"),
+            "the built-in name can be rebound in config, so it is not assumed safe"
+        );
+    }
+
+    #[test]
+    fn check_attr_records_keep_their_empty_fields() {
+        // Triples, NUL-terminated. Dropping an empty field would shift every later record onto
+        // the wrong path, which is why this does not reuse `split_nul`.
+        let raw = b"a.lock\0merge\0unset\0b.rs\0merge\0unspecified\0";
+        assert_eq!(
+            split_nul_records(raw),
+            ["a.lock", "merge", "unset", "b.rs", "merge", "unspecified"]
+        );
+        assert_eq!(split_nul_records(b"").len(), 0, "empty output, no records");
+        assert_eq!(split_nul_records(b"x\0\0y\0"), ["x", "", "y"]);
+    }
+
+    #[test]
+    fn long_path_lists_are_split_into_runnable_argument_lists() {
+        let few: Vec<String> = ["a", "b", "c"].into_iter().map(ToOwned::to_owned).collect();
+        assert_eq!(
+            argument_batches(&few).len(),
+            1,
+            "the normal case is one call"
+        );
+
+        let long: Vec<String> = (0..4_000).map(|index| format!("{index:0>200}")).collect();
+        let batches = argument_batches(&long);
+        assert!(batches.len() > 1, "an oversized list has to be split");
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).sum::<usize>(),
+            long.len(),
+            "splitting must not lose a path"
+        );
+        for batch in &batches {
+            let bytes: usize = batch.iter().map(|path| path.len() + 1).sum();
+            assert!(bytes <= MAX_ARGUMENT_BYTES, "a batch exceeded the ceiling");
+        }
+    }
+
+    #[test]
+    fn the_attribute_gate_asks_only_when_a_file_could_apply() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let checkout = directory.path();
+        fs::create_dir_all(checkout.join(".git")).expect("git dir");
+        fs::create_dir_all(checkout.join("src/deep")).expect("tree");
+        let paths = vec!["src/deep/one.rs".to_owned(), "two.rs".to_owned()];
+        assert!(
+            !repository_attributes(checkout, &paths),
+            "a repository with no attribute file must cost no subprocess"
+        );
+
+        // Nested `.gitattributes` are ordinary, so an ancestor of a changed path counts.
+        fs::write(checkout.join("src/.gitattributes"), "*.rs -merge\n").expect("attributes");
+        assert!(repository_attributes(checkout, &paths));
+
+        fs::remove_file(checkout.join("src/.gitattributes")).expect("remove");
+        fs::create_dir_all(checkout.join(".git/info")).expect("info");
+        fs::write(checkout.join(".git/info/attributes"), "*.lock -merge\n").expect("info file");
+        assert!(
+            repository_attributes(checkout, &paths),
+            "`info/attributes` is an attribute source like any other"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_git_directory_is_assumed_to_hold_attributes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        // No `.git` at all: the gate cannot prove anything, so it must err toward asking.
+        assert!(repository_attributes(
+            directory.path(),
+            &["one.rs".to_owned()]
+        ));
     }
 
     #[test]
