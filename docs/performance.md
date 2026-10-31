@@ -1,5 +1,37 @@
 # Convergence performance
 
+## Validation on a real repository
+
+Every figure elsewhere in this note comes from generated repositories: uniform files, trivial
+history, one language. Those hide whatever real structure does. Repeated against a working
+polyglot application — 253 tracked files, 105 JavaScript, 54 TSX, 30 PNG, 20 JSON, 9 Python, a
+5.8 MB tracked asset, and a committed build directory — with four agents in linked worktrees:
+
+- A sweep costs 0.280 s, in line with the synthetic numbers at that fleet size.
+- Binary files are recorded with a content digest and are not harvested for identifiers, because
+  they are not source extensions. A PNG rewritten with random bytes behaves like any other change.
+- A renamed Python `def` is recorded as a withdrawn export. It raises no break, correctly, because
+  no other checkout references it.
+- Two agents appending to the same TSX file are reported `divergent`; nothing else collides.
+- No false positives of any kind appeared across the four checkouts.
+
+### Soak
+
+150 consecutive sweeps against that repository, with a real edit introduced every tenth sweep:
+
+| after | elapsed | database | events | footprints | symbol rows |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 30 sweeps | 2.0 s | 1.18 MB | 14 | 7 | 1955 |
+| 60 | 4.0 s | 1.18 MB | 17 | 7 | 1957 |
+| 90 | 6.0 s | 1.18 MB | 20 | 7 | 1957 |
+| 120 | 8.1 s | 1.18 MB | 23 | 7 | 1957 |
+| 150 | 10.1 s | 1.18 MB | 26 | 7 | 1957 |
+
+Nothing drifts. The database does not grow between real changes, row counts stay flat, and
+`integrity_check` passes with no foreign-key violations and no duplicate footprint rows
+afterwards. Announcement is exactly one to one: six changes introduced one per sweep produced six
+`footprint.published` events, which is the property a waiting agent depends on.
+
 ## Update: the first-sweep penalty no longer reproduces
 
 The measurement below recorded a first sweep costing 2.5–4x a steady one. Re-measured after the
