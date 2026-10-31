@@ -2050,3 +2050,42 @@ fn a_symlink_cannot_bypass_the_scan_ceiling() -> Result<()> {
     );
     Ok(())
 }
+
+/// A git that will not start must say so, not blame the repository.
+///
+/// The base-branch probe used to swallow the difference, so pointing `PIDMESH_GIT` at a missing
+/// binary reported "no default integration branch found" — sending someone to look at their
+/// branches over a path problem.
+#[test]
+fn a_git_that_cannot_run_is_reported_as_such() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let (_alpha, alpha_tree) = fleet.agent("alpha")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+        .current_dir(&alpha_tree)
+        .env("PIDMESH_GIT", "/nonexistent/git")
+        .env_remove("PIDMESH_WORKSPACE")
+        .args([
+            "--db",
+            fleet
+                .repository
+                .join("..")
+                .join("probe.db")
+                .to_str()
+                .context("database path")?,
+            "--json",
+            "sync",
+            "--agent",
+            "nobody",
+        ])
+        .output()?;
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("could not run git") || message.contains("agent id"),
+        "a missing git must name itself: {message}"
+    );
+    assert!(
+        !message.contains("no default integration branch"),
+        "a path problem must not read as a repository problem: {message}"
+    );
+    Ok(())
+}

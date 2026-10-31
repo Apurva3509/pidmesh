@@ -70,7 +70,9 @@ Measured on Apple Silicon, 40 changed files per checkout:
 | 96 agents | 2.48 s | 0.05 s |
 
 An unchanged sweep writes nothing at all, so leaving a watcher running costs no storage growth.
-What time remains is git itself rather than SQLite.
+What time remains is git itself rather than SQLite, which is why the git executable is resolved
+once per process and, on macOS, resolved past the `/usr/bin/git` shim to the binary it forwards to.
+Set `PIDMESH_GIT` to choose a particular git.
 
 
 
