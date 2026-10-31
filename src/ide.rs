@@ -435,6 +435,22 @@ impl IdeManager {
             "primary checkout is no longer on {}",
             session.base_branch
         );
+        // The base *commit*, not only the base branch name. `base_commit` was recorded at launch
+        // and surfaced in every session view, but nothing compared it here -- so "the expected
+        // base branch" was enforced as a name and not as a position, and a run could be merged
+        // into a branch that had moved underneath it since the worktree was cut.
+        //
+        // That omission is what made a conflicting merge reachable at all. The worktree is cut
+        // at `base_commit`, so while the primary checkout still points there the agent's branch
+        // is a strict descendant of it and `--no-ff` can only ever produce a clean merge commit.
+        // Let the base move and the merge becomes a real three-way merge that can conflict --
+        // and a conflicted `git merge` does not fail cleanly, it stops half-applied with
+        // `MERGE_HEAD` set and conflict markers written into the user's own files.
+        ensure!(
+            git_text(&self.inner.workspace, ["rev-parse", "HEAD"])? == session.base_commit,
+            "{} has moved since this run started; rebase or relaunch before merging",
+            session.base_branch
+        );
 
         git_status(&session.worktree, [OsStr::new("add"), OsStr::new("-A")])?;
         git_status(
@@ -445,7 +461,13 @@ impl IdeManager {
                 OsStr::new(request.commit_message.trim()),
             ],
         )?;
-        git_status(
+        // Everything above this line is a gate, so a refusal cannot have touched the primary
+        // checkout. The merge is the one step that can fail *after* it has started changing it:
+        // a declined `pre-merge-commit` hook, or any conflict the gate above did not foresee,
+        // leaves the merge staged and uncommitted rather than undone. Abandoning that would hand
+        // the error back while the user's real repository sits mid-merge, which is a far worse
+        // outcome than the refusal itself. Unwind it before reporting.
+        if let Err(error) = git_status(
             &self.inner.workspace,
             [
                 OsStr::new("merge"),
@@ -454,7 +476,12 @@ impl IdeManager {
                 OsStr::new("-m"),
                 OsStr::new(request.commit_message.trim()),
             ],
-        )?;
+        ) {
+            abort_merge(&self.inner.workspace);
+            return Err(error).context(
+                "merging the agent branch failed; the primary checkout was left as it was",
+            );
+        }
         let mut runtime = lock(&session.runtime)?;
         let now = now_ms()?;
         runtime.approved_at = Some(now);
@@ -1142,7 +1169,16 @@ fn git_complaint(directory: &Path, stderr: &str) -> anyhow::Error {
     anyhow!("git failed: {stderr}")
 }
 
-fn git_text<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<String> {
+/// Run git and return its standard output exactly as git wrote it.
+///
+/// [`git_text`] trims what this returns, which is right for a command whose answer is a single
+/// value -- a sha, a branch name -- and wrong for one whose answer is a table whose leading
+/// characters carry meaning. `git status --porcelain` is the second kind: its first two columns
+/// are the staged and the unstaged state, and an unstaged modification to a tracked file spells
+/// the staged one as a space. Trimming eats that column from the *first* line only, which shifts
+/// that one path left by a byte and leaves every other line correct -- a corruption subtle enough
+/// to survive a casual read of the output.
+fn git_capture<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<String> {
     // The same resolved executable the rest of pidmesh uses, so PIDMESH_GIT and the macOS
     // developer-tools fallback apply here too instead of only to a sync.
     let output = Command::new(crate::converge::git_program())
@@ -1156,7 +1192,11 @@ fn git_text<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<St
         "{:#}",
         git_complaint(directory, &String::from_utf8_lossy(&output.stderr))
     );
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn git_text<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<String> {
+    Ok(git_capture(directory, arguments)?.trim().to_owned())
 }
 
 fn git_status<I, S>(directory: &Path, arguments: I) -> Result<()>
@@ -1178,8 +1218,39 @@ where
     Ok(())
 }
 
+/// Undo a merge that stopped part-way, so no refusal ever leaves the primary checkout mid-merge.
+///
+/// `MERGE_HEAD` is the question being asked: it exists only while a merge is in progress, which
+/// is exactly the state that has to be unwound and exactly the state `git merge --abort` knows
+/// how to unwind -- back to the commit and the working tree that were there before. Asking first
+/// matters because a merge can also fail *before* touching anything (an unknown branch, git
+/// itself missing), and `--abort` with no merge in progress is an error whose noise would be
+/// indistinguishable from a real failure to recover.
+///
+/// Best effort by design: the caller is already returning the merge's own error, which is the
+/// one worth reporting. A failure to abort can only mean the checkout was already in a state
+/// git would not undo, and nothing better is available from here.
+fn abort_merge(workspace: &Path) {
+    if git_text(
+        workspace,
+        ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"],
+    )
+    .is_ok()
+    {
+        let _ = git_status(workspace, [OsStr::new("merge"), OsStr::new("--abort")]);
+    }
+}
+
+/// Every path the run touched, as `git status --porcelain=v1` names it.
+///
+/// Read through [`git_capture`] rather than [`git_text`] because `line.get(3..)` below is
+/// counting the two status columns and the space after them, which only lines up while the line
+/// still begins where git put it. Trimming the output first silently dropped the leading space of
+/// an unstaged modification -- ` M src/a/keep.txt` -- so the first such path came back as
+/// `rc/a/keep.txt`: a name that matches no reserved scope, and so a merge gate that refused the
+/// single most ordinary thing an agent does, editing a file that already exists.
 fn changed_files(worktree: &Path) -> Result<Vec<String>> {
-    let output = git_text(
+    let output = git_capture(
         worktree,
         ["status", "--porcelain=v1", "--untracked-files=all"],
     )?;
