@@ -2079,8 +2079,12 @@ fn a_git_that_cannot_run_is_reported_as_such() -> Result<()> {
         ])
         .output()?;
     let message = String::from_utf8_lossy(&output.stderr);
+    // The wording may be "could not run git at X" or the fuller "git is not installed, or not
+    // on PATH"; what matters is that git is named as the subject and the executable that was
+    // tried is quoted, so the reader can see it is their override that is wrong.
     assert!(
-        message.contains("could not run git") || message.contains("agent id"),
+        (message.contains("git") && message.contains("/nonexistent/git"))
+            || message.contains("agent id"),
         "a missing git must name itself: {message}"
     );
     assert!(

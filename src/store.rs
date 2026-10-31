@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -214,14 +214,20 @@ impl MeshStore {
         }
         let connection = Self::open_connection(&path)?;
         let store = Self {
-            path,
+            path: path.clone(),
             connection: Arc::new(Mutex::new(connection)),
         };
         // Before initialize(), because the first write creates the -wal and -shm sidecars and
         // they inherit the mode of the moment, not a later chmod of the main file.
-        store.restrict_permissions()?;
-        store.initialize()?;
-        store.restrict_permissions()?;
+        //
+        // Both steps are mapped through the same description as the open: a read-only database
+        // file gets this far and then fails here, and "attempt to write a readonly database"
+        // on its own names neither the file nor anything to do about it.
+        store
+            .restrict_permissions()
+            .and_then(|()| store.initialize())
+            .and_then(|()| store.restrict_permissions())
+            .map_err(|error| describe_open_failure(&path, &error))?;
         Ok(store)
     }
 
@@ -1786,8 +1792,13 @@ impl MeshStore {
     }
 
     fn open_connection(path: &Path) -> Result<Connection> {
-        let connection =
-            Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        Self::try_open_connection(path).map_err(|error| describe_open_failure(path, &error))
+    }
+
+    /// `Connection::open` is lazy, so the real complaint arrives from the first pragma below
+    /// rather than from the open itself. Both are mapped together by the caller.
+    fn try_open_connection(path: &Path) -> Result<Connection> {
+        let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(30))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1948,14 +1959,63 @@ fn workspace_context(root: Option<&Path>) -> Result<WorkspaceContext> {
     })
 }
 
+/// Say what is wrong with a mesh database in terms of the file and the fix.
+///
+/// SQLite's own wording reaches a person as `file is not a database: Error code 26: file is not
+/// a database` — doubled, numbered, and naming neither the path it tried nor anything to do
+/// next. Every one of these is recoverable, and each has a different recovery.
+pub(crate) fn describe_open_failure(path: &Path, error: &anyhow::Error) -> anyhow::Error {
+    let text = format!("{error:#}");
+    let shown = path.display();
+    if text.contains("not a database") || text.contains("file is encrypted") {
+        return anyhow!(
+            "{shown} is not a pidmesh database. Something else wrote that file. Move it aside, \
+             or point --db (or PIDMESH_DB) at a different path; pidmesh creates the database on \
+             first use."
+        );
+    }
+    if text.contains("readonly") || text.contains("read-only") {
+        return anyhow!(
+            "{shown} is not writable, and pidmesh records every agent and footprint in it. \
+             Fix the file's permissions, or point --db (or PIDMESH_DB) at a path you own."
+        );
+    }
+    if text.contains("unable to open database file") {
+        return anyhow!(
+            "cannot open {shown}. The directory may not exist, may not be writable, or the path \
+             may name a directory rather than a file. Point --db (or PIDMESH_DB) at a writable \
+             file path."
+        );
+    }
+    if text.contains("disk I/O error") || text.contains("database disk image is malformed") {
+        return anyhow!(
+            "{shown} is damaged and cannot be read ({text}). Move it aside and let pidmesh \
+             create a fresh one; nothing in it is needed to re-observe a checkout."
+        );
+    }
+    anyhow!("cannot use the mesh database at {shown}: {text}")
+}
+
 struct GitContext {
     branch: Option<String>,
     checkout: PathBuf,
     primary: PathBuf,
 }
 
+/// Whether git can be started at all.
+///
+/// Discovery treats every git failure as "not a repository", which is right for a plain
+/// directory and badly wrong for a missing git: it silently gives the checkout its own workspace
+/// root, and that is exactly the split mesh `diagnose` exists to catch.
+fn git_runs() -> bool {
+    Command::new(crate::converge::git_program())
+        .arg("--version")
+        .output()
+        .is_ok_and(|probe| probe.status.success())
+}
+
 fn git_context(directory: &Path) -> Option<GitContext> {
-    let output = Command::new("git")
+    let output = Command::new(crate::converge::git_program())
         .arg("-C")
         .arg(directory)
         .args([
@@ -1990,6 +2050,50 @@ fn git_context(directory: &Path) -> Option<GitContext> {
         checkout,
         primary,
     })
+}
+
+/// Checkouts of `primary` that no live agent has registered.
+///
+/// Registration is the only thing a sweep counts, so a repository whose agents never joined
+/// looks identical to a quiet one. git already knows every checkout, and the difference between
+/// the two lists is the difference between "nothing is wrong" and "nothing is being watched".
+fn unwatched_worktrees(store: &MeshStore, primary: &Path) -> Result<Vec<String>> {
+    let registered = store.read(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT checkout_path, pid FROM agents
+             WHERE status = 'running' AND checkout_path IS NOT NULL",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })?;
+    // The same liveness test a sweep applies. A registration whose process is gone is not
+    // watching anything, and counting it here reported full coverage of a checkout that the
+    // very next `watch` would decline to scan.
+    let watched: BTreeSet<PathBuf> = registered
+        .into_iter()
+        .filter(|(_, pid)| process_is_alive(*pid))
+        .map(|(path, _)| {
+            let path = PathBuf::from(path);
+            path.canonicalize().unwrap_or(path)
+        })
+        .collect();
+    let known = crate::converge::worktree_paths(primary).unwrap_or_default();
+    // `git worktree list` names the main worktree first, and that is where a watcher runs
+    // rather than where an agent works. Flagging it whenever some other checkout *is* watched
+    // would fire this warning in the ordinary arrangement, and a diagnostic that complains
+    // about the normal case is one people learn to skip. Total blindness — no checkout watched
+    // at all — is the case that must never read as healthy, so there the whole list stands.
+    let anything_watched = known.iter().any(|path| watched.contains(path));
+    let main = known.first().filter(|_| anything_watched);
+    Ok(known
+        .iter()
+        .filter(|path| !watched.contains(*path) && Some(*path) != main)
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
 }
 
 /// Diagnose whether this workspace is actually one shared mesh.
@@ -2045,12 +2149,56 @@ pub fn diagnose(database: &Path, root: Option<&Path>) -> Result<Value> {
             "roots": siblings
         }));
     }
-    if here.is_none() {
+    // Checkouts git knows about that no live agent has registered. A mesh watching none of the
+    // repository's worktrees is not healthy, however consistent its own records are: every
+    // other check here passes trivially when there is nothing to check.
+    let unwatched = match primary.as_ref() {
+        Some(primary) => unwatched_worktrees(&store, primary)?,
+        None => Vec::new(),
+    };
+    if !unwatched.is_empty() {
         warnings.push(json!({
-            "code": "not_a_repository",
-            "detail": "This directory is not inside a git repository, so linked-worktree \
-                       discovery cannot group checkouts."
+            "code": "unwatched_worktrees",
+            "detail": format!(
+                "{} of this repository {} no agent registered with pidmesh, so nothing \
+                 observes what {} change and no collision involving {} can be reported. Run \
+                 `pidmesh join --name <agent>` inside each one, or start it with `pidmesh run`.",
+                if unwatched.len() == 1 {
+                    "1 checkout".to_owned()
+                } else {
+                    format!("{} checkouts", unwatched.len())
+                },
+                if unwatched.len() == 1 { "has" } else { "have" },
+                if unwatched.len() == 1 { "it" } else { "they" },
+                if unwatched.len() == 1 { "it" } else { "them" },
+            ),
+            "worktrees": unwatched
         }));
+    }
+
+    if here.is_none() {
+        // Reporting a missing git as a missing repository is the worst answer the diagnostic
+        // command can give: the directory *is* a checkout, and the advice it implies is wrong.
+        if git_runs() {
+            warnings.push(json!({
+                "code": "not_a_repository",
+                "detail": format!(
+                    "{} is not inside a git repository, so linked-worktree discovery cannot \
+                     group checkouts. Run pidmesh from a checkout, or `git init` here first.",
+                    resolved
+                )
+            }));
+        } else {
+            warnings.push(json!({
+                "code": "git_unavailable",
+                "detail": format!(
+                    "git could not be started (looked for `{}`), so pidmesh cannot observe any \
+                     checkout and every agent that joins gets its own private mesh. Install \
+                     git, or set PIDMESH_GIT to the full path of the executable.",
+                    Path::new(crate::converge::git_program()).display()
+                )
+            }));
+        }
     }
 
     Ok(json!({

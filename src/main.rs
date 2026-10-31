@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::os::unix::process::CommandExt;
@@ -15,7 +15,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use pidmesh::converge::{WorktreeScan, integration_head, resolve_base, scan_worktree};
+use pidmesh::converge::{
+    WorktreeScan, checkout_problem, integration_head, resolve_base, scan_worktree, worktree_paths,
+};
 use pidmesh::ide::IdeManager;
 use pidmesh::render::{self, Shape};
 use pidmesh::store::{
@@ -472,14 +474,17 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
             provider,
             capabilities,
             workspace,
-        } => emit(&store.register_agent(
-            &name,
-            pid.unwrap_or_else(calling_pid),
-            workspace.as_deref(),
-            &provider,
-            &capabilities,
-            None,
-        )?)?,
+        } => present(
+            Shape::Join,
+            &store.register_agent(
+                &name,
+                pid.unwrap_or_else(calling_pid),
+                workspace.as_deref(),
+                &provider,
+                &capabilities,
+                None,
+            )?,
+        )?,
         Commands::Heartbeat { agent } => emit(&json!({
             "updated": store.heartbeat(&agent_id(agent.as_deref())?)?
         }))?,
@@ -637,11 +642,13 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
             // Reporting is the default and has no side effects. Removal is opt-in and still
             // proves each worktree is spent before touching it, because preserving an agent's
             // uncommitted work matters more than reclaiming disk.
-            emit(&if reclaim {
-                ide.reclaim()?
+            // Reclaim reports a different shape (what it removed) and keeps emitting JSON;
+            // only the read-only listing is the one a person runs to look around.
+            if reclaim {
+                emit(&ide.reclaim()?)?;
             } else {
-                ide.worktrees()?
-            })?;
+                present(Shape::Worktrees, &ide.worktrees()?)?;
+            }
         }
         Commands::Doctor { workspace } => {
             let report = diagnose(&database, workspace.as_deref())?;
@@ -667,7 +674,10 @@ fn dispatch(db: Option<PathBuf>, command: Commands) -> Result<u8> {
             once,
         )?,
         Commands::Status { agent, workspace } => {
-            emit(&store.status(agent.as_deref(), workspace.as_deref())?)?;
+            present(
+                Shape::Status,
+                &store.status(agent.as_deref(), workspace.as_deref())?,
+            )?;
         }
         Commands::Events {
             agent,
@@ -781,16 +791,17 @@ fn quickstart_steps() -> Value {
                 "step": 1,
                 "run_in": "every checkout, once",
                 "command": "pidmesh join --name planner --provider codex",
-                "why": "Registers the process and prints the agent id. Export it as \
-                        PIDMESH_AGENT_ID in that shell and every later command knows who it \
-                        speaks for."
+                "why": "Registers the process and prints the agent id, along with the export \
+                        line to paste. Set PIDMESH_AGENT_ID in that shell and every later \
+                        command knows who it speaks for."
             },
             {
                 "step": 2,
                 "run_in": "the repository, once",
-                "command": "pidmesh watch",
+                "command": "pidmesh watch --once",
                 "why": "Sweeps every live checkout from git alone, so agents that never call \
-                        pidmesh themselves are still covered. It also reaps crashed sessions."
+                        pidmesh themselves are still covered. It also reaps crashed sessions. \
+                        Drop --once to keep sweeping on an interval until you stop it."
             },
             {
                 "step": 3,
@@ -815,15 +826,16 @@ PidMesh in three commands.
   1. Join — once per checkout
        pidmesh join --name planner --provider codex
 
-     Export the id it prints as PIDMESH_AGENT_ID in that shell. Every later
-     command then knows which agent it is speaking for.
+     It prints the export line to paste. Set PIDMESH_AGENT_ID in that shell
+     and every later command knows which agent it is speaking for.
 
   2. Watch — once per repository
-       pidmesh watch
+       pidmesh watch --once
 
      One sweep observes every live checkout from git alone, so agents that
      never call pidmesh themselves are still covered, and crashed sessions
-     stop holding what their peers are waiting on.
+     stop holding what their peers are waiting on. Drop --once and it keeps
+     sweeping every few seconds until you stop it with Ctrl-C.
 
   3. Gate — before every merge
        pidmesh mergeable && git merge my-branch
@@ -834,7 +846,10 @@ PidMesh in three commands.
 Then, whenever you want to know more:
   pidmesh status        who is alive and what they hold
   pidmesh collisions    which paths are contested right now
-  pidmesh doctor        whether this really is one shared mesh";
+  pidmesh doctor        whether this really is one shared mesh
+
+Nothing leaves this machine. There is no daemon, no account and no network
+call: the whole mesh is one SQLite file you can delete.";
 
 /// Print the quickstart: prose at a terminal, the same steps as JSON everywhere else.
 fn quickstart() -> Result<()> {
@@ -1267,6 +1282,21 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
         Some(agent_id) => store.collisions(&agent_id)?,
         None => json!({"collisions": [], "collision_count": 0}),
     };
+    let here = match workspace {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    // A sweep that found nothing has two very different causes, and only one of them is a
+    // quiet workspace. Probing costs one `git rev-parse` and only on the empty path, so a
+    // busy fleet never pays for it.
+    let workspace_problem = if grouped.is_empty() {
+        checkout_problem(&here)
+    } else {
+        None
+    };
+
+    let (known, unwatched) = coverage_gap(&here, &grouped);
+
     Ok(json!({
         "checkouts": grouped.len(),
         "observed": batch.len(),
@@ -1274,9 +1304,43 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
         "stale_agents": stale,
         "reaped": reaped,
         "skipped": skipped,
+        "workspace_problem": workspace_problem,
+        "git_worktrees": known,
+        "unwatched_worktrees": unwatched,
         "collision_count": collisions["collision_count"],
         "collisions": collisions["collisions"]
     }))
+}
+
+/// What git can see here, against what this sweep is actually watching.
+///
+/// Registration is the only thing a sweep counts, so a repository whose agents never joined
+/// sweeps to zero checkouts and reports a clean mesh — an all-green answer delivered while
+/// several worktrees edit the same files. git already knows every checkout for free, and the
+/// gap between the two numbers is the single most useful thing to tell a newcomer.
+///
+/// Returns how many checkouts git knows about, and which of them nothing is watching.
+fn coverage_gap(
+    here: &Path,
+    watching: &BTreeMap<PathBuf, Vec<AgentCheckout>>,
+) -> (usize, Vec<String>) {
+    let watched: BTreeSet<PathBuf> = watching
+        .keys()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect();
+    let known = worktree_paths(here).unwrap_or_default();
+    // `git worktree list` always names the main worktree first, and that is where a watcher is
+    // normally run from rather than where an agent works. Reporting it as a gap whenever some
+    // other checkout *is* watched would make this fire in the ordinary arrangement, and a
+    // warning that fires on the normal case teaches people to ignore it. When nothing at all
+    // is watched, the full list is exactly the point, so it stays.
+    let primary = known.first().filter(|_| !watched.is_empty());
+    let unwatched = known
+        .iter()
+        .filter(|path| !watched.contains(*path) && Some(*path) != primary)
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    (known.len(), unwatched)
 }
 
 /// How long a session may be quiet before a sweep checks whether its process is still alive.

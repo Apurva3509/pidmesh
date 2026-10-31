@@ -135,6 +135,11 @@ pidmesh quickstart
 It prints the three commands that take a fresh checkout to a guarded merge — join, watch, gate —
 and what each one buys you.
 
+Every command prints prose at a terminal and JSON everywhere else, so a person reads sentences
+while a pipe, a redirect or an agent still gets the object it parses. `--json` forces JSON. Colour
+is opt-out through `NO_COLOR`, and each report ends with the command that answers the question it
+raises, so no output is a dead end.
+
 ## Open the local agent IDE
 
 Launch a private browser dashboard for the current workspace:
@@ -248,6 +253,9 @@ Each contested path is classified by what would actually happen on merge:
 | `divergent` | The same path, with edits to overlapping regions. This is the case that silently overwrites work. |
 | `delete_edit` | One agent removed a path another is still editing. Git merges this without complaint in several common orderings. |
 
+At a terminal these four names are spelled out underneath the paths they apply to, so the
+vocabulary does not have to be learned from this table first.
+
 Every collision also reports `base_divergent`. Two agents can edit different files and still break
 each other when one cuts its worktree from a base the other has already moved past, which is how a
 clean merge still produces broken behaviour.
@@ -314,6 +322,17 @@ pidmesh doctor
 It names the resolved workspace, the primary repository behind the current checkout, and exits
 non-zero when two workspace roots belong to one repository, listing the orphaned roots.
 
+It also fails when the mesh is watching nothing. A sweep counts registrations, so a repository
+whose agents never joined produces an entirely clean report while several worktrees edit the same
+files — "nothing is wrong" and "I am not looking at anything" are otherwise identical output. git
+already knows every checkout, so `doctor` compares the two and warns with `unwatched_worktrees`,
+naming each checkout no live agent has registered. An unregistered *main* worktree is not counted
+while the others are watched, because running the watcher from there is the ordinary arrangement.
+
+When git itself cannot be started, `doctor` says so (`git_unavailable`) instead of reporting that
+the directory is not a repository: with no git, every agent that joins silently gets its own
+private mesh, which is the exact failure this command exists to catch.
+
 ### Observe a fleet that never calls sync
 
 `sync` still has to be invoked by somebody. A watcher removes even that requirement: registration
@@ -328,7 +347,14 @@ pidmesh watch --interval-seconds 15
 
 Each sweep scans every distinct live checkout once, publishes a footprint for every session in it,
 and reports the resulting collisions. A checkout that has been removed is skipped rather than
-failing the sweep, and a session whose PID is gone is not scanned at all.
+failing the sweep — the sweep names it and says why — and a session whose PID is gone is not
+scanned at all.
+
+A sweep also reports what it is *not* watching. `git_worktrees` counts the checkouts git knows
+about and `unwatched_worktrees` lists the ones no live agent has registered, so an empty result is
+never mistaken for a safe one. A sweep that can see nothing at all — no repository, no git, no
+registrations — says that rather than reporting a clean mesh, and `workspace_problem` carries the
+reason for anything parsing the JSON.
 
 `pidmesh unsync` withdraws a footprint explicitly, for an agent that is shutting down and can no
 longer produce a scan. Garbage collection keeps a dead agent's footprint while its checkout still

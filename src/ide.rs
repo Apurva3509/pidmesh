@@ -1096,16 +1096,36 @@ fn rollback_worktree(repository: &Path, worktree: &Path, branch: &str) {
     );
 }
 
+/// Explain a git that git refused, naming the fix for the complaints we recognise.
+///
+/// `pidmesh worktrees` outside a repository used to relay git's own `fatal:` line verbatim, and
+/// with git off PATH it printed a bare `No such file or directory (os error 2)` — an errno with
+/// no subject.
+fn git_complaint(directory: &Path, stderr: &str) -> anyhow::Error {
+    let stderr = stderr.trim();
+    if stderr.contains("not a git repository") {
+        return anyhow!(
+            "{} is not inside a git repository, so there are no worktrees to list. Run this \
+             from a checkout.",
+            directory.display()
+        );
+    }
+    anyhow!("git failed: {stderr}")
+}
+
 fn git_text<const N: usize>(directory: &Path, arguments: [&str; N]) -> Result<String> {
-    let output = Command::new("git")
+    // The same resolved executable the rest of pidmesh uses, so PIDMESH_GIT and the macOS
+    // developer-tools fallback apply here too instead of only to a sync.
+    let output = Command::new(crate::converge::git_program())
         .arg("-C")
         .arg(directory)
         .args(arguments)
-        .output()?;
+        .output()
+        .map_err(|error| crate::converge::git_unavailable(&error))?;
     ensure!(
         output.status.success(),
-        "git failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "{:#}",
+        git_complaint(directory, &String::from_utf8_lossy(&output.stderr))
     );
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
@@ -1115,15 +1135,16 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new("git")
+    let output = Command::new(crate::converge::git_program())
         .arg("-C")
         .arg(directory)
         .args(arguments)
-        .output()?;
+        .output()
+        .map_err(|error| crate::converge::git_unavailable(&error))?;
     ensure!(
         output.status.success(),
-        "git failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "{:#}",
+        git_complaint(directory, &String::from_utf8_lossy(&output.stderr))
     );
     Ok(())
 }
