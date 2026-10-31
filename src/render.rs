@@ -355,7 +355,18 @@ fn collision_block(value: &Value, palette: &Palette, advice: Option<&str>) -> St
         if !out.is_empty() {
             out.push(String::new());
         }
-        out.push(plural(symbols.len(), "symbol break", "symbol breaks"));
+        let mut heading = plural(symbols.len(), "symbol break", "symbol breaks");
+        // The list is capped. A capped list that does not say so is read as the whole truth,
+        // which is how a fleet with thousands of broken references looks like one with two
+        // hundred.
+        if value["symbol_breaks_truncated"] == true {
+            let _ = write!(
+                heading,
+                " {}(the report stops here; there are more){}",
+                palette.warn, palette.reset
+            );
+        }
+        out.push(heading);
         out.extend(symbols);
     }
     if let Some(advice) = advice {
@@ -1022,6 +1033,36 @@ mod tests {
             &plain(),
         );
         assert!(moved.contains("3 updated"), "{moved}");
+    }
+
+    /// The symbol-break list is capped, and a capped list that cannot say so reads as complete.
+    #[test]
+    fn a_capped_symbol_break_list_says_it_stopped_short() {
+        let sweep = |truncated: bool| {
+            json!({
+                "checkouts": 2,
+                "observed": 2,
+                "published": 2,
+                "skipped": [],
+                "collisions": [],
+                "symbol_breaks": [{
+                    "symbol": "compute_total",
+                    "removed_from": "src/api.rs",
+                    "used_by": {"agent_name": "bravo"}
+                }],
+                "symbol_breaks_truncated": truncated
+            })
+        };
+        let capped = watch(&sweep(true), &plain());
+        assert!(
+            capped.contains("there are more"),
+            "a truncated report must say so: {capped}"
+        );
+        // The same list, complete, is reported without the caveat — otherwise the warning is
+        // noise and stops being read.
+        let whole = watch(&sweep(false), &plain());
+        assert!(whole.contains("1 symbol break"), "{whole}");
+        assert!(!whole.contains("there are more"), "{whole}");
     }
 
     #[test]

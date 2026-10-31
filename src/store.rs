@@ -1568,8 +1568,9 @@ impl MeshStore {
                 "agent_id": agent_id,
                 "collisions": collision_report(&contested, agent_id),
                 "collision_count": contested.len(),
-                "symbol_breaks": symbol_break_report(&breaks, agent_id),
-                "symbol_break_count": breaks.len()
+                "symbol_breaks": symbol_break_report(&breaks.entries, agent_id),
+                "symbol_break_count": breaks.entries.len(),
+                "symbol_breaks_truncated": breaks.truncated
             }))
         })
     }
@@ -2818,15 +2819,28 @@ struct SymbolBreak {
 /// Largest number of symbol breaks reported at once.
 ///
 /// A large fleet can produce tens of thousands, which is megabytes of JSON nobody reads and a
-/// report that hides its own first line. The count is reported separately so truncation is
-/// visible rather than implied.
+/// report that hides its own first line. Reaching the cap is reported as a flag of its own,
+/// because the count stops at the cap too and so cannot betray it.
 const MAX_SYMBOL_BREAKS: i64 = 200;
 
+/// A page of symbol breaks, and whether the store stopped short of enumerating them all.
+///
+/// `entries.len()` reaching the cap is not the same as the cap being exceeded, so the query asks
+/// for one row more than it will carry and reports the overflow instead of inferring it. Without
+/// that, a workspace with exactly two hundred breaks and one with twenty thousand produced
+/// byte-identical output and both read as complete.
+struct SymbolBreaks {
+    entries: Vec<SymbolBreak>,
+    truncated: bool,
+}
+
 /// Every symbol break in the workspace, for the reports that describe the whole fleet.
-fn workspace_symbol_breaks(
-    connection: &Connection,
-    workspace_id: &str,
-) -> Result<Vec<SymbolBreak>> {
+///
+/// No per-viewer filter is applied, here or by the callers that use it: this is deliberately the
+/// unfiltered workspace list, because narrowing it *after* the cap is the #38 shape that turned a
+/// truncated answer into a clean one. A report that wants one agent's breaks asks for them with
+/// `symbol_breaks(.., Some(agent))`, which filters inside the query.
+fn workspace_symbol_breaks(connection: &Connection, workspace_id: &str) -> Result<SymbolBreaks> {
     symbol_breaks(connection, workspace_id, None)
 }
 
@@ -2842,7 +2856,7 @@ fn symbol_breaks(
     connection: &Connection,
     workspace_id: &str,
     removed_by: Option<&str>,
-) -> Result<Vec<SymbolBreak>> {
+) -> Result<SymbolBreaks> {
     let mut statement = connection.prepare(
         "SELECT DISTINCT r.symbol, r.path, r.agent_id, u.agent_id, a.name
          FROM symbol_footprints r
@@ -2860,9 +2874,10 @@ fn symbol_breaks(
          ORDER BY r.symbol, u.agent_id
          LIMIT ?3",
     )?;
-    let rows = statement
+    // One row past the cap, so the overflow is observed rather than guessed at.
+    let mut rows = statement
         .query_map(
-            params![workspace_id, removed_by, MAX_SYMBOL_BREAKS],
+            params![workspace_id, removed_by, MAX_SYMBOL_BREAKS + 1],
             |row| {
                 Ok(SymbolBreak {
                     symbol: row.get(0)?,
@@ -2874,7 +2889,13 @@ fn symbol_breaks(
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let cap = usize::try_from(MAX_SYMBOL_BREAKS).unwrap_or(usize::MAX);
+    let truncated = rows.len() > cap;
+    rows.truncate(cap);
+    Ok(SymbolBreaks {
+        entries: rows,
+        truncated,
+    })
 }
 
 /// A stable fingerprint of one collision, used to emit events only on real transitions.
@@ -2915,7 +2936,7 @@ fn symbol_blockers(
     agent_id: &str,
 ) -> Result<Vec<Value>> {
     let mut blockers = Vec::new();
-    for entry in symbol_breaks(connection, workspace_id, Some(agent_id))? {
+    for entry in symbol_breaks(connection, workspace_id, Some(agent_id))?.entries {
         let live: bool = connection
             .query_row(
                 "SELECT status = 'running' FROM agents WHERE id = ?",
@@ -3167,7 +3188,7 @@ fn workspace_convergence(connection: &Connection, workspace_id: &str, limit: u32
     }
     contested
         .sort_by_key(|(path, participants)| (severity_rank(classify(participants)), path.clone()));
-    let blocked = convergence_blocked(&contested, &breaks, &directory);
+    let blocked = convergence_blocked(&contested, &breaks.entries, &directory);
     let lease = integration_lease_holder(connection, workspace_id, now, &directory)?;
     let window = usize::try_from(limit).unwrap_or(usize::MAX);
     Ok(json!({
@@ -3178,8 +3199,12 @@ fn workspace_convergence(connection: &Connection, workspace_id: &str, limit: u32
         "collision_count": contested.len(),
         "integration_lease": lease,
         "severity": severity,
-        "symbol_breaks": convergence_symbol_report(&breaks[..breaks.len().min(window)], &directory),
-        "symbol_break_count": breaks.len()
+        "symbol_breaks": convergence_symbol_report(
+            &breaks.entries[..breaks.entries.len().min(window)],
+            &directory
+        ),
+        "symbol_break_count": breaks.entries.len(),
+        "symbol_breaks_truncated": breaks.truncated || breaks.entries.len() > window
     }))
 }
 
@@ -3192,7 +3217,8 @@ fn no_convergence() -> Value {
         "integration_lease": Value::Null,
         "severity": {"adjacent": 0, "delete_edit": 0, "divergent": 0, "identical": 0},
         "symbol_breaks": [],
-        "symbol_break_count": 0
+        "symbol_break_count": 0,
+        "symbol_breaks_truncated": false
     })
 }
 

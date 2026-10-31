@@ -1217,6 +1217,30 @@ fn watch(
     Ok(())
 }
 
+/// Everything contending in the workspace this sweep just observed.
+///
+/// A watcher holds no footprint of its own, so it asks on behalf of one of the sessions it has
+/// just swept. Both lists that come back are workspace-wide — every contested path and every
+/// symbol break between any two checkouts — so the witness decides nothing about *what* is
+/// reported, only whose point of view the `involves_me` flags are written from.
+///
+/// This is one read for the whole sweep and it already carries the symbol breaks: `collisions`
+/// computes them beside the contested paths, so a supervisor reporting them pays nothing it was
+/// not paying already. A watcher sweeps every five seconds, where a second query — or worse, one
+/// per checkout — is the cost that matters.
+fn sweep_contention(store: &MeshStore, witness: Option<String>) -> Result<Value> {
+    match witness {
+        Some(agent_id) => store.collisions(&agent_id),
+        None => Ok(json!({
+            "collisions": [],
+            "collision_count": 0,
+            "symbol_breaks": [],
+            "symbol_break_count": 0,
+            "symbol_breaks_truncated": false
+        })),
+    }
+}
+
 /// One observation sweep over every distinct live checkout.
 fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -> Result<Value> {
     // Several sessions can share one checkout, so scan each checkout once and reuse the result.
@@ -1311,10 +1335,7 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     // and its share of every contested path until something does — which blocks its peers from
     // merging indefinitely. A watcher is the one process reliably running, so it reaps.
     let reaped = store.collect_stale(Duration::from_secs(STALE_AFTER_SECONDS))?;
-    let collisions = match witness {
-        Some(agent_id) => store.collisions(&agent_id)?,
-        None => json!({"collisions": [], "collision_count": 0}),
-    };
+    let collisions = sweep_contention(store, witness)?;
     let here = match workspace {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir()?,
@@ -1341,7 +1362,17 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
         "git_worktrees": known,
         "unwatched_worktrees": unwatched,
         "collision_count": collisions["collision_count"],
-        "collisions": collisions["collisions"]
+        "collisions": collisions["collisions"],
+        // Every break in the workspace, not the witness agent's own. `collisions` and
+        // `mergeable` are asked *by* an agent and answer for it; a watcher participates in
+        // nothing and supervises everyone, so narrowing this list to whichever session happened
+        // to be swept first would hide the fleet's subtlest conflict behind an accident of
+        // iteration order. `involves_me` on these entries is relative to that witness, exactly
+        // as it already is on the contested paths beside them, and means nothing to a supervisor.
+        "symbol_breaks": collisions["symbol_breaks"],
+        "symbol_break_count": collisions["symbol_break_count"],
+        // A capped list that cannot say it was capped reads as a complete one.
+        "symbol_breaks_truncated": collisions["symbol_breaks_truncated"]
     }))
 }
 
