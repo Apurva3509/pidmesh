@@ -27,6 +27,9 @@ const MAX_HASHED_BYTES: u64 = 64 * 1024 * 1024;
 /// Measured against git: a gap of zero conflicts, a gap of one does not.
 const REQUIRED_GAP: u32 = 1;
 
+/// Bytes sampled when deciding whether content is binary, matching git's own cutoff.
+const BINARY_SNIFF_BYTES: usize = 8_000;
+
 /// Cap on identifiers recorded per checkout, so a generated file cannot flood the mesh.
 const MAX_REFERENCES: usize = 5_000;
 
@@ -297,12 +300,21 @@ pub fn scan_worktree(checkout: &Path, base_ref: Option<&str>) -> Result<Worktree
             } else {
                 reported
             };
-            let digest = if change_kind == ChangeKind::Deleted || !addressable {
+            let fingerprint = if change_kind == ChangeKind::Deleted || !addressable {
                 None
             } else {
-                digest_of(&absolute)
+                fingerprint_of(&absolute)
             };
-            let ranges = regions.remove(&path);
+            let digest = fingerprint
+                .as_ref()
+                .map(|fingerprint| fingerprint.digest.clone());
+            // Line regions only describe a path git will merge a line at a time. Content git
+            // reads as binary, and anything we could not read at all — a symlink, a submodule, a
+            // file past the hashing ceiling — has no line structure worth comparing, so its
+            // regions are withheld and the path is treated as overlapping instead.
+            let ranges = regions
+                .remove(&path)
+                .filter(|_| fingerprint.is_some_and(|fingerprint| !fingerprint.binary));
             FootprintEntry {
                 path,
                 change_kind,
@@ -430,6 +442,14 @@ fn read_diff(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
             "--unified=0",
             "--no-renames",
             "--no-ext-diff",
+            // A `diff=<driver>` attribute carrying a `textconv` makes git diff a *converted*
+            // rendering of the file, and `--no-ext-diff` does not switch that off. The hunk
+            // headers then count lines in the converted document, which addresses nothing a
+            // three-way merge will ever look at: a one-line minified config pretty-printed by a
+            // textconv reports two rewrites of that single line as hunks five lines apart, and
+            // five lines apart reads as `adjacent` — safe to merge — for a merge that always
+            // conflicts. Regions have to be measured in the bytes git actually merges.
+            "--no-textconv",
             "--no-color",
             "--src-prefix=a/",
             "--dst-prefix=b/",
@@ -443,8 +463,40 @@ fn read_diff(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
     let mut pending_add: Option<String> = None;
     let mut removed: Vec<(String, String)> = Vec::new();
     let mut added: Vec<String> = Vec::new();
+    // Body lines still owed to the hunk being read, and whether the parser has lost its place.
+    //
+    // Inside a hunk body every line is one of the file's own with a single marker byte in front,
+    // so a deleted `-- note` arrives as `--- note` and an added `++ x` as `+++ x` — byte for byte
+    // the shape of a file header. Reading those as headers is not cosmetic: it detached the
+    // parser from the file and silently dropped every later hunk, and a file whose overlapping
+    // region went unrecorded classifies as `adjacent`, which is reported as safe to merge. A
+    // hunk header states exactly how many lines its body holds, so counting them keeps content
+    // and headers apart no matter what the content looks like.
+    let mut body = 0_u64;
+    let mut desynced = false;
+    // One `diff --git` header is emitted per changed path, including the paths that go on to
+    // describe themselves as binary and name themselves nowhere else. Counting them is what
+    // tells us the textual pass came up short.
+    let mut announced = 0_usize;
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("--- ") {
+        if body > 0 {
+            // `\ No newline at end of file` annotates the preceding line rather than being one
+            // of the hunk's own, so it must not be counted against the body.
+            if line.starts_with('\\') {
+                continue;
+            }
+            body -= 1;
+            // An added file has no base side, so its name comes from the `+++` header instead.
+            let path = current.as_deref().or(pending_add.as_deref());
+            harvest(line, path, &mut removed, &mut added);
+            continue;
+        }
+        if line.starts_with("diff --git ") {
+            announced += 1;
+            // A new file starts here; nothing carries over from the last one.
+            current = None;
+            pending_add = None;
+        } else if let Some(rest) = line.strip_prefix("--- ") {
             // `--- a/path`, or `--- /dev/null` for an addition, which has no base side. git
             // appends a tab to a header whose path contains a space.
             current = rest
@@ -471,29 +523,41 @@ fn read_diff(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
                 (None, None) => {}
             }
         } else if let Some(rest) = line.strip_prefix("@@ ") {
-            let _ = &pending_add;
-            if let Some(path) = current.as_ref()
-                && let Some(span) = base_span(rest)
-            {
+            let Some((span, owed)) = hunk_header(rest) else {
+                // git emits well-formed headers, so this means the parser no longer knows where
+                // it is in the stream — and a half-read region list is precisely what downgrades
+                // a conflict to `adjacent`. Give up on regions entirely rather than report a
+                // subset of them as if it were the whole.
+                desynced = true;
+                break;
+            };
+            body = owed;
+            if let Some(path) = current.as_ref() {
                 regions.entry(path.clone()).or_default().push(span);
             }
-        } else if let Some(rest) = line.strip_prefix('-')
-            && !rest.starts_with("--")
-            && let Some(path) = current.as_ref()
-            && is_source(path)
-            && let Some(symbol) = exported_name(rest)
-        {
-            removed.push((symbol, path.clone()));
-        } else if let Some(rest) = line.strip_prefix('+')
-            && !rest.starts_with("++")
-            && let Some(symbol) = exported_name(rest)
-        {
-            added.push(symbol);
         }
     }
     // A rewritten signature reads as a delete plus an add. Only a name that never comes back was
     // genuinely withdrawn.
     removed.retain(|(symbol, _)| !added.contains(symbol));
+    if desynced {
+        // No regions at all means every contested path is treated as overlapping, which is the
+        // conservative direction; a partial list is the dangerous one.
+        regions.clear();
+    }
+    // Every announced path should have named itself in a `+++` header. The ones that did not
+    // described themselves as binary instead, and have to be recovered by name. A parser that
+    // gave up partway through stopped counting, so it has to ask as well: the paths after the
+    // point it stopped reading are named nowhere else, and a path in no footprint contests
+    // nothing.
+    if desynced || announced > kinds.len() {
+        for (path, kind) in opaque_changes(checkout, base_commit)? {
+            // Only the paths the textual pass missed. Those keep no regions, so they are treated
+            // as overlapping — which is the whole point: nothing is known about where they were
+            // rewritten, and git will not merge them line by line anyway.
+            kinds.entry(path).or_insert(kind);
+        }
+    }
     let regions = regions
         .into_iter()
         .map(|(path, spans)| (path, spans.join(",")))
@@ -503,6 +567,38 @@ fn read_diff(checkout: &Path, base_commit: &str) -> Result<DiffSummary> {
         regions,
         removed_exports: removed,
     })
+}
+
+/// Changed paths named by status letter alone, for the ones a unified diff will not describe.
+///
+/// A change git renders as binary emits a `diff --git` header and `Binary files ... differ`, with
+/// no `---`/`+++` pair naming it and no hunks to measure; so does a mode-only change, and so does
+/// any path carrying `-diff` in `.gitattributes` — the usual way to quieten a lockfile or a
+/// generated bundle. Once that work is committed `git status` is silent about it too, so the path
+/// entered no footprint at all: two checkouts could both rewrite the same image or the same
+/// lockfile and the mesh reported nothing to merge around, while `git merge` conflicts on it
+/// every time. Asking for names alone sidesteps the ambiguity of the `diff --git a/x b/y` header,
+/// whose two halves cannot be told apart when a path contains a space, and `-z` keeps unusual
+/// filenames intact.
+fn opaque_changes(checkout: &Path, base_commit: &str) -> Result<Vec<(String, ChangeKind)>> {
+    let raw = git_bytes(
+        checkout,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            base_commit,
+        ],
+    )?;
+    let fields = split_nul(&raw);
+    Ok(fields
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[code, path]| (path.clone(), ChangeKind::from_status_code(code)))
+        .collect())
 }
 
 /// Paths a diff against the base cannot mention: untracked files, and index-only state.
@@ -661,18 +757,57 @@ fn take_word(word: &mut String, seen: &mut BTreeSet<String>) {
     }
 }
 
-/// Turn the `-start,count` half of a hunk header into an inclusive `start-end` span.
-fn base_span(header: &str) -> Option<String> {
-    let old = header.split_whitespace().next()?.strip_prefix('-')?;
-    let (start, count) = old
-        .split_once(',')
-        .map_or((old, "1"), |(start, count)| (start, count));
-    let start: u32 = start.parse().ok()?;
-    let count: u32 = count.parse().ok()?;
+/// Record the declaration one hunk-body line withdraws or introduces.
+///
+/// Only code is read. `class`, `type`, `def` and `func` are ordinary English words, and both
+/// halves of "was this name withdrawn?" have to agree about that — otherwise a name a checkout
+/// removed from source reads as restored by a sentence in its changelog, and the break it really
+/// caused is cancelled by prose.
+fn harvest(
+    line: &str,
+    path: Option<&str>,
+    removed: &mut Vec<(String, String)>,
+    added: &mut Vec<String>,
+) {
+    let Some(path) = path.filter(|path| is_source(path)) else {
+        return;
+    };
+    if let Some(rest) = line.strip_prefix('-') {
+        if let Some(symbol) = exported_name(rest) {
+            removed.push((symbol, path.to_owned()));
+        }
+    } else if let Some(rest) = line.strip_prefix('+')
+        && let Some(symbol) = exported_name(rest)
+    {
+        added.push(symbol);
+    }
+}
+
+/// Read a `-start,count +start,count @@` hunk header.
+///
+/// Yields the inclusive base span and the number of body lines the hunk owns. The second half is
+/// what lets the parser tell the file's own content from the next header: under `--unified=0` a
+/// hunk holds exactly its removed plus its added lines, so a `--- ...` arriving before that many
+/// lines have been consumed is a deleted line of the file, not the start of another one.
+fn hunk_header(header: &str) -> Option<(String, u64)> {
+    let mut fields = header.split_whitespace();
+    let (start, removed) = hunk_side(fields.next()?.strip_prefix('-')?)?;
+    let (_, added) = hunk_side(fields.next()?.strip_prefix('+')?)?;
     // A pure insertion has count 0 and sits between two base lines; treat it as the single
     // boundary line so two insertions at the same point still register as overlapping.
-    let end = start.saturating_add(count.saturating_sub(1)).max(start);
-    Some(format!("{start}-{end}"))
+    let end = start.saturating_add(removed.saturating_sub(1)).max(start);
+    Some((
+        format!("{start}-{end}"),
+        u64::from(removed) + u64::from(added),
+    ))
+}
+
+/// Split one `start,count` half of a hunk header, where an absent count means one line.
+fn hunk_side(field: &str) -> Option<(u32, u32)> {
+    let (start, count) = field
+        .split_once(',')
+        .map_or((field, "1"), |(start, count)| (start, count));
+    Some((start.parse().ok()?, count.parse().ok()?))
 }
 
 /// Fingerprint a path's current bytes.
@@ -687,17 +822,34 @@ fn base_span(header: &str) -> Option<String> {
 ///
 /// Anything without comparable content — a directory, a submodule, a nested repository, a
 /// symlink, an unreadable or oversized file — yields `None`, which classifies as divergent.
-fn digest_of(path: &Path) -> Option<String> {
+fn fingerprint_of(path: &Path) -> Option<Fingerprint> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_HASHED_BYTES {
         return None;
     }
     let content = fs::read(path).ok()?;
-    Some(
-        Uuid::new_v5(&Uuid::NAMESPACE_OID, &content)
+    Some(Fingerprint {
+        digest: Uuid::new_v5(&Uuid::NAMESPACE_OID, &content)
             .simple()
             .to_string(),
-    )
+        binary: content
+            .iter()
+            .take(BINARY_SNIFF_BYTES)
+            .any(|byte| *byte == 0),
+    })
+}
+
+/// What one read of a path's bytes tells us about it.
+struct Fingerprint {
+    digest: String,
+    /// Whether git will refuse to merge this content line by line.
+    ///
+    /// git calls a blob binary when a NUL appears early in it, and a binary merge is all-or-
+    /// nothing: any two-sided change conflicts, however far apart the edits look in a diff. A
+    /// `diff` attribute makes git *show* such a file as text while still merging it whole, so
+    /// hunk coordinates exist for it and mean nothing — two edits twenty lines apart read as
+    /// `adjacent` for a merge that conflicts every time.
+    binary: bool,
 }
 
 /// Split NUL-terminated git output, dropping the trailing empty field.
