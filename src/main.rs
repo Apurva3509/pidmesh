@@ -1228,9 +1228,13 @@ fn watch(
 /// computes them beside the contested paths, so a supervisor reporting them pays nothing it was
 /// not paying already. A watcher sweeps every five seconds, where a second query — or worse, one
 /// per checkout — is the cost that matters.
-fn sweep_contention(store: &MeshStore, witness: Option<String>) -> Result<Value> {
+///
+/// A witness is only unavailable when the workspace has no live checkout at all. A sweep whose
+/// every scan *failed* still has registered checkouts to ask on behalf of, and asks: see
+/// `witness_for`.
+fn sweep_contention(store: &MeshStore, witness: Option<&str>) -> Result<Value> {
     match witness {
-        Some(agent_id) => store.collisions(&agent_id),
+        Some(agent_id) => store.collisions(agent_id),
         None => Ok(json!({
             "collisions": [],
             "collision_count": 0,
@@ -1239,6 +1243,97 @@ fn sweep_contention(store: &MeshStore, witness: Option<String>) -> Result<Value>
             "symbol_breaks_truncated": false
         })),
     }
+}
+
+/// How much of this sweep's answer was actually observed, rather than recalled.
+///
+/// The discriminator a reader needs and the sweep could never say. `collisions` is computed
+/// from stored footprints and the scan only refreshes them, so the four states differ in how
+/// current those rows are, not in whether they exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Observation {
+    /// No live checkout to observe. Nothing is being watched; nothing is being claimed.
+    Idle,
+    /// Every checkout was scanned. The report is current.
+    Complete,
+    /// Some checkouts were scanned. The report is current for those and recalled for the rest.
+    Partial,
+    /// Checkouts exist and not one could be scanned. Nothing in the report was refreshed.
+    Blind,
+}
+
+impl Observation {
+    fn of(checkouts: usize, observed: usize) -> Self {
+        match (checkouts, observed) {
+            (0, _) => Self::Idle,
+            (_, 0) => Self::Blind,
+            (checkouts, observed) if observed >= checkouts => Self::Complete,
+            _ => Self::Partial,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Blind => "blind",
+        }
+    }
+}
+
+/// Someone to ask the store on behalf of when the sweep scanned nobody.
+///
+/// Registration, not observation, is what makes a checkout askable: the agent row is in the
+/// database whether or not its working copy could be read this tick. So a sweep whose every
+/// scan failed still has a witness, and the only workspace that genuinely has none is one with
+/// no live checkout at all — which `watch` already reports as "Nothing is being watched".
+fn witness_for(grouped: &BTreeMap<PathBuf, Vec<AgentCheckout>>) -> Option<String> {
+    grouped
+        .values()
+        .flatten()
+        .next()
+        .map(|agent| agent.agent_id.clone())
+}
+
+/// Observe every checkout at once, paired with the index it came from.
+///
+/// Scanning is git and file I/O with no shared state, so checkouts are observed in parallel.
+/// Publishing stays serial: it is one short transaction each and the store holds one
+/// connection, so contending for it would only add lock traffic.
+///
+/// The result carries indices rather than arriving in order, and the caller checks every index
+/// back off against the list it asked about: a worker that panics poisons the lock and silently
+/// loses whatever was still queued behind it, which must be visible as an unobserved checkout
+/// rather than as one that found nothing.
+fn scan_in_parallel(
+    checkouts: &[(&PathBuf, &Vec<AgentCheckout>)],
+    base: Option<&str>,
+) -> Vec<(usize, Result<WorktreeScan>)> {
+    let cursor = AtomicUsize::new(0);
+    let scans: Mutex<Vec<(usize, Result<WorktreeScan>)>> = Mutex::new(Vec::new());
+    let workers = thread::available_parallelism()
+        .map_or(4, NonZeroUsize::get)
+        .min(checkouts.len().max(1));
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some((path, _)) = checkouts.get(index) else {
+                        return;
+                    };
+                    let scanned = scan_worktree(path, base);
+                    if let Ok(mut guard) = scans.lock() {
+                        guard.push((index, scanned));
+                    }
+                }
+            });
+        }
+    });
+    let mut scanned = scans.into_inner().unwrap_or_default();
+    scanned.sort_by_key(|(index, _)| *index);
+    scanned
 }
 
 /// One observation sweep over every distinct live checkout.
@@ -1266,39 +1361,19 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
         .and_then(|(path, _)| resolve_base(path, base).ok());
     let base = resolved_base.as_deref().or(base);
 
-    let cursor = AtomicUsize::new(0);
-    let scans: Mutex<Vec<(usize, Result<WorktreeScan>)>> = Mutex::new(Vec::new());
-    let workers = thread::available_parallelism()
-        .map_or(4, NonZeroUsize::get)
-        .min(checkouts.len().max(1));
-    thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let index = cursor.fetch_add(1, Ordering::Relaxed);
-                    let Some((path, _)) = checkouts.get(index) else {
-                        return;
-                    };
-                    let scanned = scan_worktree(path, base);
-                    if let Ok(mut guard) = scans.lock() {
-                        guard.push((index, scanned));
-                    }
-                }
-            });
-        }
-    });
-
-    let mut scanned = scans.into_inner().unwrap_or_default();
-    scanned.sort_by_key(|(index, _)| *index);
+    let scanned = scan_in_parallel(&checkouts, base);
 
     let mut published = 0u64;
     let mut skipped: Vec<Value> = Vec::new();
     let mut witness = None;
+    let mut observed_checkouts = 0usize;
+    let mut accounted: BTreeSet<usize> = BTreeSet::new();
     let mut batch: Vec<(String, WorktreeScan)> = Vec::new();
     for (index, result) in scanned {
         let Some((path, agents)) = checkouts.get(index) else {
             continue;
         };
+        accounted.insert(index);
         let scan = match result {
             Ok(scan) => scan,
             Err(error) => {
@@ -1310,9 +1385,22 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
                 continue;
             }
         };
+        observed_checkouts += 1;
         for agent in *agents {
             witness.get_or_insert_with(|| agent.agent_id.clone());
             batch.push((agent.agent_id.clone(), scan.clone()));
+        }
+    }
+    // A worker that panics poisons the result mutex, and every scan still queued behind it is
+    // then dropped on the floor: those checkouts appeared in neither `observed` nor `skipped`,
+    // so a sweep that lost half its fleet counted the same as one that found it quiet. Same
+    // shape as the defect above, one level down — account for every checkout or say why not.
+    for (index, (path, _)) in checkouts.iter().enumerate() {
+        if !accounted.contains(&index) {
+            skipped.push(json!({
+                "checkout": path.to_string_lossy(),
+                "error": "the scan did not report back; its worker did not finish"
+            }));
         }
     }
     // One transaction for the whole sweep: publishing agent by agent recomputes the collision
@@ -1335,7 +1423,25 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     // and its share of every contested path until something does — which blocks its peers from
     // merging indefinitely. A watcher is the one process reliably running, so it reaps.
     let reaped = store.collect_stale(Duration::from_secs(STALE_AFTER_SECONDS))?;
-    let collisions = sweep_contention(store, witness)?;
+
+    // A sweep that observed nothing is not a sweep that found nothing.
+    //
+    // The witness decides nothing about *what* is reported — both lists that come back are
+    // workspace-wide — so a sweep whose every scan failed can still ask on behalf of a checkout
+    // it failed to scan. The footprints are in the database and answer perfectly well; the scan
+    // only refreshes them. Reporting from a stub instead turned "I could not look" into "there
+    // is nothing there", which is the one answer a watcher must never give by accident.
+    //
+    // The recalled answer is dated and labelled rather than handed over as current: see
+    // `observation` and `last_observed_at` below, and the banner the renderer prints above it.
+    let observation = Observation::of(grouped.len(), observed_checkouts);
+    let witness = witness.or_else(|| witness_for(&grouped));
+    let collisions = sweep_contention(store, witness.as_deref())?;
+    // Only on the blind path, which is the rare one: a tick that observed normally pays nothing.
+    let last_observed_at = match (observation, witness.as_deref()) {
+        (Observation::Blind, Some(agent_id)) => store.last_footprint_at(agent_id)?,
+        _ => None,
+    };
     let here = match workspace {
         Some(path) => path.to_path_buf(),
         None => std::env::current_dir()?,
@@ -1349,12 +1455,31 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
         None
     };
 
-    let (known, unwatched) = coverage_gap(&here, &grouped);
+    let (known, unwatched, coverage_problem) = coverage_gap(&here, &grouped);
+    if let Some(error) = coverage_problem {
+        skipped.push(
+            json!({"coverage": "git could not list this repository's checkouts", "error": error}),
+        );
+    }
 
     Ok(json!({
         "checkouts": grouped.len(),
+        // Sessions, not checkouts: several can share one working copy. Unchanged.
         "observed": batch.len(),
+        // Checkouts that produced a scan, which is what `checkouts` is comparable to and what
+        // `observation` is derived from. `observed` counts sessions and so reads as complete
+        // coverage whenever two agents share the one checkout that did scan.
+        "observed_checkouts": observed_checkouts,
         "published": published,
+        // How much of everything below was observed by *this* sweep rather than recalled from
+        // the last one that could look: "idle", "complete", "partial" or "blind". Anything but
+        // "complete" means the contested paths and symbol breaks beside it are not fully
+        // current, and "blind" means none of them is.
+        "observation": observation.as_str(),
+        // Unix seconds the recalled footprints were last refreshed, on the blind path only, so
+        // that "not refreshed" carries a number rather than just a warning. Null otherwise —
+        // including when the sweep is blind over a workspace that has never published one.
+        "last_observed_at": last_observed_at,
         "stale_agents": stale,
         "reaped": reaped,
         "skipped": skipped,
@@ -1387,12 +1512,18 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
 fn coverage_gap(
     here: &Path,
     watching: &BTreeMap<PathBuf, Vec<AgentCheckout>>,
-) -> (usize, Vec<String>) {
+) -> (usize, Vec<String>, Option<String>) {
     let watched: BTreeSet<PathBuf> = watching
         .keys()
         .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
         .collect();
-    let known = worktree_paths(here).unwrap_or_default();
+    // A probe that failed is not a repository with no other checkout. Swallowed, it reported
+    // `git_worktrees: 0` with no gap — so a sweep that could not ask git how many checkouts
+    // exist claimed to be watching all of them. Same shape as the sweep above, one probe over.
+    let (known, probe) = match worktree_paths(here) {
+        Ok(known) => (known, None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
     // `git worktree list` always names the main worktree first, and that is where a watcher is
     // normally run from rather than where an agent works. Reporting it as a gap whenever some
     // other checkout *is* watched would make this fire in the ordinary arrangement, and a
@@ -1404,7 +1535,7 @@ fn coverage_gap(
         .filter(|path| !watched.contains(*path) && Some(*path) != primary)
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
-    (known.len(), unwatched)
+    (known.len(), unwatched, probe)
 }
 
 /// How long a session may be quiet before a sweep checks whether its process is still alive.

@@ -1089,6 +1089,123 @@ fn a_sweep_without_a_withdrawn_export_reports_no_symbol_break() -> Result<()> {
     Ok(())
 }
 
+/// A sweep that observed nothing must not report a clean workspace.
+///
+/// `watch` runs unattended every five seconds, so nobody reads each sweep — a quiet watcher is
+/// read as a quiet workspace. When every checkout fails to scan, the sweep used to pick no
+/// witness and report from a stub: zero collisions, empty lists, all-clear. The stored
+/// footprints were still in the database and could have answered: collisions are computed from
+/// DB rows and the scan only refreshes them.
+#[test]
+fn a_sweep_that_observed_nothing_reports_what_it_knew_rather_than_a_clean_mesh() -> Result<()> {
+    let fleet = Supervised::new(&[
+        ("src/shared.rs", "fn shared() {}\n"),
+        ("src/api.rs", "pub fn compute_total() -> u32 {\n    7\n}\n"),
+    ])?;
+    let alpha = fleet.checkout("alpha")?;
+    let bravo = fleet.checkout("bravo")?;
+    std::fs::write(alpha.join("src/shared.rs"), "fn shared() { /* a */ }\n")?;
+    std::fs::write(bravo.join("src/shared.rs"), "fn shared() { /* b */ }\n")?;
+
+    // A sweep that works, so there is a recorded state to fall back on.
+    let (seen, _) = fleet.sweep()?;
+    assert_eq!(seen["observation"], "complete", "{seen}");
+    assert_eq!(seen["collision_count"], 1, "{seen}");
+    assert_eq!(seen["last_observed_at"], Value::Null, "{seen}");
+
+    // Now every checkout becomes unreadable under the watcher — a filesystem going away, a
+    // permission change, git leaving PATH. The agents stay registered and alive.
+    std::fs::remove_dir_all(&alpha)?;
+    std::fs::remove_dir_all(&bravo)?;
+
+    let (blind, rendered) = fleet.sweep()?;
+    assert_eq!(blind["checkouts"], 2, "{blind}");
+    assert_eq!(blind["observed"], 0, "{blind}");
+    assert_eq!(blind["observed_checkouts"], 0, "{blind}");
+    assert_eq!(
+        blind["skipped"].as_array().map(Vec::len),
+        Some(2),
+        "{blind}"
+    );
+    assert_eq!(blind["observation"], "blind", "{blind}");
+
+    // The last known state, not an empty list. This is what used to read `collision_count: 0`.
+    assert_eq!(blind["collision_count"], 1, "{blind}");
+    assert_eq!(blind["collisions"][0]["path"], "src/shared.rs", "{blind}");
+    assert!(
+        blind["last_observed_at"].as_i64().is_some_and(|at| at > 0),
+        "unrefreshed data has to be dated: {blind}"
+    );
+
+    // And a person reading the sweep is never told it is clear.
+    assert!(!rendered.contains("No contested paths"), "{rendered}");
+    assert!(rendered.contains("none could be scanned"), "{rendered}");
+    assert!(
+        rendered.contains("Nothing could be observed."),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Nothing below was refreshed"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("1 contested path, last known"),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+/// A sweep with no stored collisions is still not an all-clear when it observed nothing.
+///
+/// The dangerous half: falling back to the recorded state only helps when there *is* one. An
+/// empty recorded state renders identically to a clean sweep unless the blind case suppresses
+/// the all-clear itself.
+#[test]
+fn a_blind_sweep_with_nothing_recorded_still_refuses_to_say_the_mesh_is_clear() -> Result<()> {
+    let fleet = Supervised::new(&[("src/shared.rs", "fn shared() {}\n")])?;
+    let alpha = fleet.checkout("alpha")?;
+    let (seen, clean) = fleet.sweep()?;
+    assert_eq!(seen["collision_count"], 0, "{seen}");
+    assert!(clean.contains("No contested paths"), "{clean}");
+
+    std::fs::remove_dir_all(&alpha)?;
+    let (blind, rendered) = fleet.sweep()?;
+    assert_eq!(blind["observation"], "blind", "{blind}");
+    assert_eq!(blind["collision_count"], 0, "{blind}");
+    assert!(
+        !rendered.contains("No contested paths"),
+        "an unobserved sweep must not render as an all-clear: {rendered}"
+    );
+    assert!(
+        rendered.contains("Nothing could be observed."),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+/// A sweep that observed some of its checkouts says which part of its answer is refreshed.
+#[test]
+fn a_partly_observed_sweep_says_it_is_only_partly_refreshed() -> Result<()> {
+    let fleet = Supervised::new(&[("src/shared.rs", "fn shared() {}\n")])?;
+    let alpha = fleet.checkout("alpha")?;
+    let bravo = fleet.checkout("bravo")?;
+    std::fs::write(alpha.join("src/shared.rs"), "fn shared() { /* a */ }\n")?;
+    std::fs::write(bravo.join("src/shared.rs"), "fn shared() { /* b */ }\n")?;
+    let (seen, _) = fleet.sweep()?;
+    assert_eq!(seen["observation"], "complete", "{seen}");
+
+    std::fs::remove_dir_all(&bravo)?;
+    let (partial, rendered) = fleet.sweep()?;
+    assert_eq!(partial["observation"], "partial", "{partial}");
+    assert_eq!(partial["observed"], 1, "{partial}");
+    assert_eq!(partial["observed_checkouts"], 1, "{partial}");
+    assert!(
+        rendered.contains("1 of 2 checkouts was observed"),
+        "{rendered}"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_missing_checkout_is_skipped_rather_than_failing_the_sweep() -> Result<()> {
     let fleet = Fleet::new()?;
@@ -2795,6 +2912,81 @@ fn a_flood_of_peer_symbol_breaks_cannot_clear_an_agents_own() -> Result<()> {
 /// added line anywhere in the checkout that happened to parse as a declaration therefore
 /// cancelled a real withdrawal, and quoting the old signature in a migration note is the normal
 /// way to document a removal. The cancellation has to be as trustworthy as the thing it cancels.
+/// A live peer's break must not be crowded out of the cap by departed peers.
+///
+/// `symbol_blockers` asked for one agent's breaks — correctly, inside the query, which is #38's
+/// fix — and then dropped the ones whose user had gone away, in Rust, *after* the two-hundred
+/// row cap. The cap is spent on rows the filter is about to discard, so an agent withdrawing
+/// more than two hundred names that only departed peers referenced lost its one live break to
+/// the limit and was told `mergeable: true` with no blockers at all. Narrower than #38 — it
+/// takes 200+ breaks of a single agent's own — and the same mistake one level down.
+#[test]
+fn a_live_peers_break_survives_a_cap_full_of_departed_ones() -> Result<()> {
+    let fleet = Fleet::new()?;
+    // Two hundred exports a peer who later departs will reference, plus one that sorts after
+    // all of them and belongs to a peer who stays. `symbol_breaks` orders by symbol, so the
+    // live peer's row is exactly the one the cap cuts.
+    let mut api = String::new();
+    for index in 0..200 {
+        let _ = writeln!(api, "def s_{index:03}():\n    return {index}\n");
+    }
+    api.push_str("def zz_live():\n    return 1\n");
+    std::fs::write(fleet.repository.join("src/api.py"), &api)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "api"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    let (delta, delta_tree) = fleet.agent("delta")?;
+
+    // Alpha withdraws every one of them.
+    std::fs::write(
+        alpha_tree.join("src/api.py"),
+        "def unrelated():\n    return 0\n",
+    )?;
+    // Delta calls the two hundred that sort first.
+    let mut uses = String::from("def use_many():\n");
+    for index in 0..200 {
+        let _ = writeln!(uses, "    s_{index:03}()");
+    }
+    std::fs::write(delta_tree.join("src/delta.py"), &uses)?;
+    // Bravo calls only the one that sorts last, and stays.
+    std::fs::write(
+        bravo_tree.join("src/bravo.py"),
+        "def use_one():\n    return zz_live()\n",
+    )?;
+
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    fleet.sync(&delta, &delta_tree)?;
+
+    // With both peers live, alpha is blocked — the control that proves the fixture breaks it.
+    assert!(
+        blocker_codes(&readiness(&fleet, &alpha, &alpha_tree)?)
+            .contains(&"removed_export_in_use".to_owned()),
+        "the fixture has to block before anyone departs"
+    );
+
+    // Delta goes away. Its breaks stay in the table and still sort ahead of bravo's.
+    assert!(fleet.store.stop_agent(&delta)?);
+
+    let report = readiness(&fleet, &alpha, &alpha_tree)?;
+    let blockers: Vec<&Value> = report["blockers"]
+        .as_array()
+        .context("missing blockers")?
+        .iter()
+        .filter(|blocker| blocker["code"] == "removed_export_in_use")
+        .collect();
+    assert_eq!(
+        blockers.len(),
+        1,
+        "the one live break must survive a cap full of departed ones: {report}"
+    );
+    assert_eq!(blockers[0]["symbol"], "zz_live", "{report}");
+    assert_eq!(report["mergeable"], false, "{report}");
+    Ok(())
+}
+
 #[test]
 fn documenting_a_removal_does_not_cancel_it() -> Result<()> {
     let fleet = Fleet::new()?;
