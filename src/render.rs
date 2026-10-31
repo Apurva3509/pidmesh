@@ -6,6 +6,7 @@
 
 use std::fmt::Write as _;
 use std::io::IsTerminal;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -163,6 +164,28 @@ fn legend(value: &Value, palette: &Palette) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// How long ago something happened, in the coarsest unit that still says something.
+///
+/// `at` is unix seconds. A recalled answer needs an age, not just a disclaimer: thirty seconds
+/// stale and a day stale are the difference between waiting for the next tick and stopping work.
+fn stamp(at: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_secs()).ok())
+        .unwrap_or(at);
+    // A clock that moved backwards, or a footprint written in the same second: neither is worth
+    // a unit, and "in -3 seconds" is worse than saying nothing precise.
+    let seconds = now.saturating_sub(at).max(0);
+    let (count, unit) = match seconds {
+        ..60 => return "moments ago".to_owned(),
+        60..3_600 => (seconds / 60, "minute"),
+        3_600..86_400 => (seconds / 3_600, "hour"),
+        _ => (seconds / 86_400, "day"),
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
 }
 
 /// The one command that answers "so what do I do now?".
@@ -332,22 +355,50 @@ fn symbol_lines(value: &Value, palette: &Palette) -> Vec<String> {
 /// `advice` is the line that tells a reader what to type next; a report they cannot act on is
 /// where every one of these commands used to stop.
 fn collision_block(value: &Value, palette: &Palette, advice: Option<&str>) -> String {
+    recalled_collision_block(value, palette, advice, false)
+}
+
+/// The same block, told either as what is true now or as what was true when pidmesh last looked.
+///
+/// `recalled` is the whole difference between a report and a memory of one. An all-clear is the
+/// one line that must never be printed from memory: "No contested paths" read from unrefreshed
+/// footprints is the false clean this block exists downstream of, just relocated. So when
+/// nothing was observed the clear case becomes a warning about the observation, and the
+/// headings above any recalled rows say where they came from.
+fn recalled_collision_block(
+    value: &Value,
+    palette: &Palette,
+    advice: Option<&str>,
+    recalled: bool,
+) -> String {
     let contested = contested_lines(value, palette);
     let symbols = symbol_lines(value, palette);
     if contested.is_empty() && symbols.is_empty() {
-        let mut clear = format!(
-            "{}No contested paths. Every checkout is working somewhere else.{}",
-            palette.good, palette.reset
-        );
+        let mut clear = if recalled {
+            format!(
+                "{}Nothing was contested when pidmesh last looked — but this sweep confirmed \
+                 nothing.{}",
+                palette.warn, palette.reset
+            )
+        } else {
+            format!(
+                "{}No contested paths. Every checkout is working somewhere else.{}",
+                palette.good, palette.reset
+            )
+        };
         if let Some(advice) = advice {
             clear.push('\n');
             clear.push_str(&next_step(palette, advice));
         }
         return clear;
     }
+    let recall = if recalled { ", last known" } else { "" };
     let mut out = Vec::new();
     if !contested.is_empty() {
-        out.push(plural(contested.len(), "contested path", "contested paths"));
+        out.push(format!(
+            "{}{recall}",
+            plural(contested.len(), "contested path", "contested paths")
+        ));
         out.extend(contested);
         out.extend(legend(value, palette));
     }
@@ -355,7 +406,10 @@ fn collision_block(value: &Value, palette: &Palette, advice: Option<&str>) -> St
         if !out.is_empty() {
             out.push(String::new());
         }
-        let mut heading = plural(symbols.len(), "symbol break", "symbol breaks");
+        let mut heading = format!(
+            "{}{recall}",
+            plural(symbols.len(), "symbol break", "symbol breaks")
+        );
         // The list is capped. A capped list that does not say so is read as the whole truth,
         // which is how a fleet with thousands of broken references looks like one with two
         // hundred.
@@ -383,28 +437,26 @@ fn collisions(value: &Value, palette: &Palette) -> String {
     )
 }
 
-fn watch(value: &Value, palette: &Palette) -> String {
-    let checkouts = value["checkouts"].as_u64().unwrap_or(0);
-    let published = value["published"].as_u64().unwrap_or(0);
-    let skipped = value["skipped"].as_array().map_or(0, Vec::len);
-    // "nothing changed" is the common answer for a watcher, and it should read like one rather
-    // than like a count of work performed.
-    let moved = if published == 0 {
-        "nothing changed".to_owned()
+/// The summary line, and the reason behind every checkout the sweep could not read.
+fn sweep_summary(
+    value: &Value,
+    palette: &Palette,
+    counted: &str,
+    moved: &str,
+    blind: bool,
+) -> String {
+    // "2 checkouts scanned" is false when neither could be opened, and it is the first line a
+    // reader sees — the disclaimer below arrives too late if the summary has already said the
+    // work happened.
+    let mut head = if blind {
+        format!(
+            "{}{counted}, none could be scanned{}",
+            palette.warn, palette.reset
+        )
     } else {
-        format!("{published} updated")
+        format!("{}{counted} scanned, {moved}{}", palette.dim, palette.reset)
     };
-    let mut head = format!(
-        "{}{} scanned, {}{}",
-        palette.dim,
-        plural(
-            usize::try_from(checkouts).unwrap_or(0),
-            "checkout",
-            "checkouts"
-        ),
-        moved,
-        palette.reset
-    );
+    let skipped = value["skipped"].as_array().map_or(0, Vec::len);
     if skipped > 0 {
         let _ = write!(
             head,
@@ -418,6 +470,7 @@ fn watch(value: &Value, palette: &Palette) -> String {
         let subject = entry["checkout"]
             .as_str()
             .or_else(|| entry["publish"].as_str())
+            .or_else(|| entry["coverage"].as_str())
             .unwrap_or("a checkout");
         let reason = entry["error"].as_str().unwrap_or("no reason recorded");
         // The header already names the checkout, so drop the copy git or the scanner appended.
@@ -430,32 +483,63 @@ fn watch(value: &Value, palette: &Palette) -> String {
             palette.warn, palette.reset, palette.dim, palette.reset
         );
     }
+    head
+}
+
+/// A sweep with no live checkout at all.
+///
+/// An empty sweep has several very different causes and only one of them is a quiet workspace:
+/// nobody joined, everybody who joined is already gone, or git cannot read this directory at
+/// all. Reporting any of them as a clean mesh is the failure, because the empty state then
+/// looks exactly like the safe state. The blind sweep below is the fourth cause and reads as a
+/// deliberate echo of this one.
+fn empty_sweep(value: &Value, palette: &Palette, head: &str, stale: u64) -> String {
+    if stale > 0 {
+        return format!(
+            "{head}\n{}{} registered, but no live process.{}\n  {}They exited, or joined without a surviving --pid. Re-join from the shell that keeps working in each checkout.{}",
+            palette.warn,
+            plural(
+                usize::try_from(stale).unwrap_or(0),
+                "agent is",
+                "agents are"
+            ),
+            palette.reset,
+            palette.dim,
+            palette.reset
+        );
+    }
+    format!(
+        "{head}\n{}Nothing is being watched.{}\n{}",
+        palette.warn,
+        palette.reset,
+        unwatched_lines(value, palette).join("\n")
+    )
+}
+
+fn watch(value: &Value, palette: &Palette) -> String {
+    let checkouts = value["checkouts"].as_u64().unwrap_or(0);
+    let published = value["published"].as_u64().unwrap_or(0);
+    let observation = value["observation"].as_str().unwrap_or("complete");
+    let blind = observation == "blind";
+    // "nothing changed" is the common answer for a watcher, and it should read like one rather
+    // than like a count of work performed.
+    let moved = if published == 0 {
+        "nothing changed".to_owned()
+    } else {
+        format!("{published} updated")
+    };
+    let counted = plural(
+        usize::try_from(checkouts).unwrap_or(0),
+        "checkout",
+        "checkouts",
+    );
+    // "2 checkouts scanned" is false when neither could be opened, and it is the first line a
+    // reader sees — the disclaimer below arrives too late if the summary has already said the
+    // work happened.
+    let mut head = sweep_summary(value, palette, &counted, &moved, blind);
     let stale = value["stale_agents"].as_u64().unwrap_or(0);
     if checkouts == 0 {
-        // An empty sweep has several very different causes and only one of them is a quiet
-        // workspace: nobody joined, everybody who joined is already gone, or git cannot read
-        // this directory at all. Reporting any of them as a clean mesh is the failure, because
-        // the empty state then looks exactly like the safe state.
-        if stale > 0 {
-            return format!(
-                "{head}\n{}{} registered, but no live process.{}\n  {}They exited, or joined without a surviving --pid. Re-join from the shell that keeps working in each checkout.{}",
-                palette.warn,
-                plural(
-                    usize::try_from(stale).unwrap_or(0),
-                    "agent is",
-                    "agents are"
-                ),
-                palette.reset,
-                palette.dim,
-                palette.reset
-            );
-        }
-        return format!(
-            "{head}\n{}Nothing is being watched.{}\n{}",
-            palette.warn,
-            palette.reset,
-            unwatched_lines(value, palette).join("\n")
-        );
+        return empty_sweep(value, palette, &head, stale);
     }
     // Before the coverage gap below, which is several lines: appended after it, this suffix
     // landed at the end of the last path rather than on the summary line it qualifies.
@@ -471,12 +555,61 @@ fn watch(value: &Value, palette: &Palette) -> String {
     if let Some(gap) = partial_coverage(value, palette) {
         let _ = write!(head, "\n{gap}");
     }
-    let body = collision_block(
+    // The same point for the checkouts this sweep *is* watching but could not read. The
+    // skipped reasons above say which ones failed; this says what that does to the answer.
+    if observation == "partial" {
+        let observed = value["observed_checkouts"].as_u64().unwrap_or(0);
+        let _ = write!(
+            head,
+            "\n  {}{} of {counted} {} observed, so the report below is current for {} and \
+             recalled for the rest.{}",
+            palette.warn,
+            observed,
+            if observed == 1 { "was" } else { "were" },
+            if observed == 1 { "it" } else { "them" },
+            palette.reset
+        );
+    }
+    if blind {
+        let _ = write!(head, "\n{}", blind_banner(value, palette));
+    }
+    let body = recalled_collision_block(
         value,
         palette,
-        Some("`pidmesh mergeable` says whether your own branch can merge right now."),
+        Some(if blind {
+            "fix a reason above and the next sweep reports for real; until then nothing here \
+             is confirmed."
+        } else {
+            "`pidmesh mergeable` says whether your own branch can merge right now."
+        }),
+        blind,
     );
     format!("{head}\n{body}")
+}
+
+/// A sweep that ran, over checkouts that exist, and observed not one of them.
+///
+/// The counterpart to "Nothing is being watched" one branch up: there the sweep had nothing to
+/// look at, here it had everything to look at and could see none of it. Both are the same
+/// principle — a sweep that observes nothing says so instead of reporting a clean workspace —
+/// and they are worded as a pair so a reader recognises the second from the first.
+fn blind_banner(value: &Value, palette: &Palette) -> String {
+    let mut out = vec![format!(
+        "{}Nothing could be observed.{} {}Every checkout failed to scan, for the reasons \
+         above.{}",
+        palette.warn, palette.reset, palette.dim, palette.reset
+    )];
+    // Dating the recalled answer is what separates it from a current one. Without a number a
+    // reader has no way to tell a report thirty seconds stale from one stale since yesterday.
+    let age = match value["last_observed_at"].as_i64() {
+        Some(at) => format!("last refreshed {}", stamp(at)),
+        None => "never refreshed — nothing has been published here".to_owned(),
+    };
+    out.push(format!(
+        "  {}Nothing below was refreshed by this sweep; it is what pidmesh recorded, {age}.{}",
+        palette.dim, palette.reset
+    ));
+    out.join("\n")
 }
 
 fn sync(value: &Value, palette: &Palette) -> String {

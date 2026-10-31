@@ -1575,6 +1575,30 @@ impl MeshStore {
         })
     }
 
+    /// When the footprints behind this workspace's collision report were last refreshed.
+    ///
+    /// A sweep that observed nothing still has to answer, and the stored footprints answer it.
+    /// Dating them is what keeps that answer from reading as a fresh one: "not refreshed" is a
+    /// disclaimer, "not refreshed since 14:02" is something an operator can act on. Unix
+    /// seconds, or `None` when the workspace holds no footprint at all.
+    ///
+    /// Deliberately its own call rather than another column on `collisions`: `watch` asks it
+    /// only on the blind path, so the five-second tick that observes normally pays nothing.
+    pub fn last_footprint_at(&self, agent_id: &str) -> Result<Option<i64>> {
+        self.read(|connection| {
+            let agent = Self::agent_row(connection, agent_id)?;
+            Ok(connection
+                .query_row(
+                    "SELECT MAX(observed_at) FROM footprints WHERE workspace_id = ?",
+                    [&agent.workspace_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .map(|milliseconds| milliseconds / 1000))
+        })
+    }
+
     pub fn status(&self, agent_id: Option<&str>, root: Option<&Path>) -> Result<Value> {
         self.read(|connection| {
             let workspace = if let Some(agent_id) = agent_id {
@@ -2841,7 +2865,7 @@ struct SymbolBreaks {
 /// truncated answer into a clean one. A report that wants one agent's breaks asks for them with
 /// `symbol_breaks(.., Some(agent))`, which filters inside the query.
 fn workspace_symbol_breaks(connection: &Connection, workspace_id: &str) -> Result<SymbolBreaks> {
-    symbol_breaks(connection, workspace_id, None)
+    symbol_breaks(connection, workspace_id, None, false)
 }
 
 /// Symbol breaks, optionally narrowed to the ones a single checkout is causing.
@@ -2852,10 +2876,18 @@ fn workspace_symbol_breaks(connection: &Connection, workspace_id: &str) -> Resul
 /// pushed every other agent's break past the limit. Those agents were then told `mergeable:
 /// true` with an empty blocker list: not a truncated answer, a clean one, for a merge that
 /// breaks the build. Filtering before the limit keeps each agent's own breaks inside its window.
+///
+/// `live_user_only` is the same rule applied to the other end of the break. A merge gate only
+/// cares about names a *live* peer still references, and narrowing to those after the cap is the
+/// identical mistake one level down: an agent carrying more than two hundred breaks of its own
+/// against departed peers pushed its live ones past the limit and was told `mergeable: true`
+/// with an empty blocker list. The report surfaces, which describe the whole fleet rather than
+/// gate a merge, pass `false` and keep every break.
 fn symbol_breaks(
     connection: &Connection,
     workspace_id: &str,
     removed_by: Option<&str>,
+    live_user_only: bool,
 ) -> Result<SymbolBreaks> {
     let mut statement = connection.prepare(
         "SELECT DISTINCT r.symbol, r.path, r.agent_id, u.agent_id, a.name
@@ -2871,13 +2903,19 @@ fn symbol_breaks(
            AND r.agent_id != u.agent_id
            AND COALESCE(ra.checkout_path, r.agent_id) != COALESCE(a.checkout_path, u.agent_id)
            AND (?2 IS NULL OR r.agent_id = ?2)
+           AND (?4 = 0 OR a.status = 'running')
          ORDER BY r.symbol, u.agent_id
          LIMIT ?3",
     )?;
     // One row past the cap, so the overflow is observed rather than guessed at.
     let mut rows = statement
         .query_map(
-            params![workspace_id, removed_by, MAX_SYMBOL_BREAKS + 1],
+            params![
+                workspace_id,
+                removed_by,
+                MAX_SYMBOL_BREAKS + 1,
+                live_user_only
+            ],
             |row| {
                 Ok(SymbolBreak {
                     symbol: row.get(0)?,
@@ -2936,18 +2974,10 @@ fn symbol_blockers(
     agent_id: &str,
 ) -> Result<Vec<Value>> {
     let mut blockers = Vec::new();
-    for entry in symbol_breaks(connection, workspace_id, Some(agent_id))?.entries {
-        let live: bool = connection
-            .query_row(
-                "SELECT status = 'running' FROM agents WHERE id = ?",
-                [&entry.used_by],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !live {
-            continue;
-        }
+    // Liveness is part of the query, not a pass over its result: dropping dead peers afterwards
+    // discards rows the cap already spent, so an agent with more than two hundred breaks of its
+    // own could lose every live one to departed peers sorted ahead of them and read as clean.
+    for entry in symbol_breaks(connection, workspace_id, Some(agent_id), true)?.entries {
         blockers.push(json!({
             "code": "removed_export_in_use",
             "detail": "this checkout withdraws an exported name another live checkout still \
