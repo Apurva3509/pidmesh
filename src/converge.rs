@@ -6,9 +6,11 @@
 //! beyond being pointed at a directory.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use uuid::Uuid;
@@ -321,6 +323,23 @@ pub fn integration_head(checkout: &Path, base_ref: Option<&str>) -> Result<(Stri
     Ok((base_ref, head))
 }
 
+/// Whether a ref resolves, keeping a failure to run git distinct from a ref that is absent.
+fn ref_exists(checkout: &Path, reference: &str) -> Result<bool> {
+    let program = git_program();
+    let output = Command::new(program)
+        .arg("-C")
+        .arg(checkout)
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .output()
+        .map_err(|error| {
+            anyhow!(
+                "could not run git at {}: {error}",
+                Path::new(program).display()
+            )
+        })?;
+    Ok(output.status.success())
+}
+
 /// Explain why a base could not be used, paying for a probe only once it has already failed.
 fn base_failure(checkout: &Path, base_ref: &str) -> anyhow::Error {
     // An unborn HEAD makes every ref lookup fail, so check it first or the answer blames the
@@ -359,7 +378,9 @@ fn resolve_base_ref(checkout: &Path, requested: Option<&str>) -> Result<String> 
         return Ok(requested.to_owned());
     }
     for candidate in DEFAULT_BASE_REFS {
-        if git_text(checkout, &["rev-parse", "--verify", "--quiet", candidate]).is_ok() {
+        // `?` rather than `is_ok()`: a git that will not start must not be reported as a
+        // repository without a main branch.
+        if ref_exists(checkout, candidate)? {
             return Ok(candidate.to_owned());
         }
     }
@@ -676,13 +697,62 @@ fn split_nul(raw: &[u8]) -> Vec<String> {
 /// to have in a `~/.gitconfig`, and under either one this scan reads an empty diff and reports no
 /// conflicts at all — a silent wrong answer with a zero exit code. Scanning must depend on the
 /// repository, never on who is holding it.
+/// The git executable to run, resolved once per process.
+///
+/// A sweep is dominated by the cost of *starting* git, and on macOS `/usr/bin/git` is a shim that
+/// re-dispatches to the developer tools: measured idle, 16.4 ms per invocation against 4.8 ms for
+/// the binary it forwards to — the same build, reporting the same version, reading the same
+/// configuration. Four invocations per checkout per tick makes that worth resolving past.
+///
+/// `PIDMESH_GIT` overrides the choice outright for anyone who needs a particular git.
+fn git_program() -> &'static OsString {
+    static PROGRAM: OnceLock<OsString> = OnceLock::new();
+    PROGRAM.get_or_init(|| {
+        if let Some(configured) = std::env::var_os("PIDMESH_GIT") {
+            return configured;
+        }
+        if cfg!(target_os = "macos")
+            && let Some(direct) = developer_tools_git()
+        {
+            return direct;
+        }
+        OsString::from("git")
+    })
+}
+
+/// The git the macOS shim forwards to, if it is present and runnable.
+fn developer_tools_git() -> Option<OsString> {
+    let output = Command::new("xcode-select").arg("-p").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let developer = String::from_utf8(output.stdout).ok()?;
+    let candidate = Path::new(developer.trim()).join("usr/bin/git");
+    // Only adopt it if it actually runs; a stale developer directory is worse than the shim.
+    Command::new(&candidate)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|probe| probe.status.success())?;
+    Some(candidate.into_os_string())
+}
+
 fn git_bytes(directory: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
+    let program = git_program();
+    let output = Command::new(program)
         .arg("-C")
         .arg(directory)
         .args(["-c", "core.quotePath=false"])
         .args(arguments)
-        .output()?;
+        .output()
+        .map_err(|error| {
+            // Failing to start git is a different problem from git refusing a request, and
+            // reporting it as the latter sends people looking at their branches.
+            anyhow!(
+                "could not run git at {}: {error}",
+                Path::new(program).display()
+            )
+        })?;
     ensure!(
         output.status.success(),
         "git failed: {}",

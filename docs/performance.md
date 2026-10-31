@@ -1,5 +1,24 @@
 # Convergence performance
 
+## Update: the shim is now bypassed automatically
+
+The measurement below identified `/usr/bin/git` on macOS as the largest free lever. It is no
+longer something an operator has to know about: the git executable is resolved once per process,
+and on macOS a shim is resolved past to the developer-tools binary it forwards to — the same
+build, reporting the same version, reading the same configuration. `PIDMESH_GIT` overrides the
+choice for anyone who needs a particular git.
+
+Measured on an idle machine, 24 checkouts of a 600-file repository:
+
+| git | one sweep |
+| --- | ---: |
+| `/usr/bin/git` (shim) | 0.448 s |
+| resolved automatically | **0.188 s** |
+
+A trivial invocation costs 16.4 ms through the shim against 4.8 ms direct, and a sweep makes four
+per checkout per tick, which is where the difference comes from.
+
+
 This note measures the convergence layer — the `pidmesh watch` sweep and the `pidmesh collisions`
 report it produces — and says where it stops keeping up. It is deliberately unflattering: the
 interesting number is the one where the thing breaks, not the one where it looks good.
