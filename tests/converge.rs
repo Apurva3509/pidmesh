@@ -2122,3 +2122,58 @@ fn garbage_collection_returns_space_to_the_filesystem() -> Result<()> {
     assert!(events.is_array(), "the ledger still reads after a rewrite");
     Ok(())
 }
+
+/// The verdict has to agree with what `git merge` actually does.
+///
+/// Severity was derived from whether rewritten regions overlap, which is not the question a
+/// three-way merge asks. It needs unchanged material *between* two changed regions to keep them
+/// apart: measured against git, one line is enough and zero is not. Edits to consecutive lines
+/// were therefore reported `adjacent` — safe to merge — and then conflicted. A differential run
+/// against real merges caught three such cases in forty.
+#[test]
+fn consecutive_edits_are_a_conflict_because_git_says_so() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let body = (0..60).fold(String::new(), |mut rows, line| {
+        let _ = writeln!(rows, "pub fn line_{line}() {{}}");
+        rows
+    });
+    std::fs::write(fleet.repository.join("src/wide.rs"), &body)?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "wide"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+
+    // Consecutive lines: no unchanged line separates them.
+    std::fs::write(
+        alpha_tree.join("src/wide.rs"),
+        body.replace("pub fn line_20() {}", "pub fn line_20_alpha() {}"),
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/wide.rs"),
+        body.replace("pub fn line_21() {}", "pub fn line_21_bravo() {}"),
+    )?;
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+
+    let collisions = fleet.collisions(&alpha)?;
+    let wide = at(&collisions, "src/wide.rs").context("expected a collision")?;
+    assert_eq!(
+        wide["severity"], "divergent",
+        "consecutive edits conflict in a real merge: {wide}"
+    );
+
+    // One unchanged line apart is genuinely separable, and must not be over-reported.
+    std::fs::write(
+        bravo_tree.join("src/wide.rs"),
+        body.replace("pub fn line_22() {}", "pub fn line_22_bravo() {}"),
+    )?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    let collisions = fleet.collisions(&alpha)?;
+    let wide = at(&collisions, "src/wide.rs").context("expected a collision")?;
+    assert_eq!(
+        wide["severity"], "adjacent",
+        "a one-line gap merges cleanly, so it must not block: {wide}"
+    );
+    Ok(())
+}
