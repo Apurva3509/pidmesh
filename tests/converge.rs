@@ -2753,22 +2753,15 @@ fn a_binary_file_rendered_as_text_is_not_merged_as_text() -> Result<()> {
     Ok(())
 }
 
-/// Known defect, left unfixed deliberately: `-merge` is not consulted.
+/// `.gitattributes` `-merge` takes the line merge away, so no gap is wide enough.
 ///
-/// `.gitattributes` can mark a path unmergeable with `-merge` — the normal idiom for a lockfile
-/// or a generated bundle — while leaving it perfectly diffable. git then produces ordinary line
-/// hunks for it and still refuses to merge it a line at a time: any two-sided change conflicts,
-/// however far apart the edits are. Two agents editing opposite ends of such a file are
-/// therefore reported `adjacent` and told the merge is clean, and it is not.
-///
-/// Unfixed because the only correct source for this is the `merge` attribute itself, which means
-/// a `git check-attr` call per scan. This module treats the number of git invocations as its
-/// dominant cost and says so, and the binary half of the same question is already covered for
-/// free by sniffing for NUL, so what remains is a deliberate cost decision rather than an
-/// oversight. Dropping regions for any path whose `merge` attribute is unset or names a driver
-/// would close it.
+/// `-merge` — the normal idiom for a lockfile or a generated bundle — marks a path unmergeable
+/// while leaving it perfectly diffable. git produces ordinary line hunks for it and still refuses
+/// to merge it a line at a time: any two-sided change conflicts, however far apart the edits are.
+/// Two agents editing opposite ends of such a file used to be reported `adjacent` and told the
+/// merge was clean, and it was not. The oracle below is the point: the merge is run for real
+/// first, so the severity is checked against git rather than against our reading of git.
 #[test]
-#[ignore = "known defect: the merge attribute is not consulted; needs a git check-attr per scan"]
 fn a_path_marked_unmergeable_is_not_adjacent() -> Result<()> {
     let fleet = Fleet::new()?;
     let body = (1..=20).fold(String::new(), |mut rows, row| {
@@ -2804,6 +2797,192 @@ fn a_path_marked_unmergeable_is_not_adjacent() -> Result<()> {
     assert_eq!(
         deps["severity"], "divergent",
         "a path the repository declared unmergeable cannot be adjacent: {deps}"
+    );
+    Ok(())
+}
+
+/// A `merge=<driver>` attribute is no safer than `-merge`, and for the same reason.
+///
+/// A named driver hands the merge to a program out of `merge.<driver>.driver`. It may refuse
+/// every two-sided change the way `binary` does, it may concatenate both sides the way `union`
+/// does, or it may be anything at all — and whatever it does, it does not combine the two sides
+/// along the hunk coordinates a textual diff produced, so those coordinates stop describing the
+/// merge. The driver here is `false`, which conflicts on every invocation, so the real merge
+/// below proves the severity rather than our reading of what drivers do.
+#[test]
+fn a_path_with_a_custom_merge_driver_is_not_adjacent() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let body = (1..=20).fold(String::new(), |mut rows, row| {
+        let _ = writeln!(rows, "dep_{row} = \"1.0\"");
+        rows
+    });
+    std::fs::write(fleet.repository.join("deps.lock"), &body)?;
+    std::fs::write(
+        fleet.repository.join(".gitattributes"),
+        "*.lock merge=lockfile\n",
+    )?;
+    // Repository config is shared with every linked worktree, so one setting covers the fleet.
+    git(
+        &fleet.repository,
+        &["config", "merge.lockfile.driver", "false"],
+    )?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "deps"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("deps.lock"),
+        body.replace("dep_2 = \"1.0\"", "dep_2 = \"2.0\""),
+    )?;
+    std::fs::write(
+        bravo_tree.join("deps.lock"),
+        body.replace("dep_18 = \"1.0\"", "dep_18 = \"2.0\""),
+    )?;
+    git(&alpha_tree, &["commit", "-am", "alpha"])?;
+    git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+    assert!(
+        merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "the driver under test must actually refuse the merge"
+    );
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    let collisions = fleet.collisions(&alpha)?;
+    let deps = at(&collisions, "deps.lock").context("expected a collision")?;
+    assert_eq!(
+        deps["severity"], "divergent",
+        "a path handed to a merge driver cannot be adjacent: {deps}"
+    );
+    Ok(())
+}
+
+/// The attribute is read per path, not per repository.
+///
+/// The fix has to ask git about each contested path rather than giving up on a whole checkout the
+/// moment a `.gitattributes` exists. Almost every repository that uses `*.lock -merge` has
+/// ordinary source files alongside the lockfile, and blanket-blocking those would turn one narrow
+/// false safe into a constant false alarm — which teaches people to ignore the blocker, and costs
+/// more than the breaks it would catch. The same `-merge` rule is in force here; the path being
+/// measured simply does not match it, and the merge really is clean.
+#[test]
+fn an_unmergeable_rule_leaves_other_paths_alone() -> Result<()> {
+    let fleet = Fleet::new()?;
+    let body = (0..60).fold(String::new(), |mut rows, line| {
+        let _ = writeln!(rows, "pub fn line_{line}() {{}}");
+        rows
+    });
+    std::fs::write(fleet.repository.join("src/wide.rs"), &body)?;
+    std::fs::write(fleet.repository.join(".gitattributes"), "*.lock -merge\n")?;
+    git(&fleet.repository, &["add", "-A"])?;
+    git(&fleet.repository, &["commit", "-m", "wide"])?;
+
+    let (alpha, alpha_tree) = fleet.agent("alpha")?;
+    let (bravo, bravo_tree) = fleet.agent("bravo")?;
+    std::fs::write(
+        alpha_tree.join("src/wide.rs"),
+        body.replace("pub fn line_20() {}", "pub fn line_20_alpha() {}"),
+    )?;
+    std::fs::write(
+        bravo_tree.join("src/wide.rs"),
+        body.replace("pub fn line_40() {}", "pub fn line_40_bravo() {}"),
+    )?;
+    git(&alpha_tree, &["commit", "-am", "alpha"])?;
+    git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+    assert!(
+        !merge_conflicts(&alpha_tree, "feat/bravo")?,
+        "the oracle must agree this merge is clean, or the test proves nothing"
+    );
+    fleet.sync(&alpha, &alpha_tree)?;
+    fleet.sync(&bravo, &bravo_tree)?;
+    let collisions = fleet.collisions(&alpha)?;
+    let wide = at(&collisions, "src/wide.rs").context("expected a collision")?;
+    assert_eq!(
+        wide["severity"], "adjacent",
+        "an unrelated `-merge` rule must not block a path that merges cleanly: {wide}"
+    );
+    Ok(())
+}
+
+/// Every `merge` attribute state, checked against a real merge of the same shape.
+///
+/// The named tests above pin `-merge` and a driver. This walks the whole state space
+/// `git check-attr merge` can report — nothing said, `merge` set plainly, `-merge`, a driver that
+/// conflicts, and a driver that resolves — against the identical pair of far-apart edits each
+/// time, so the only variable is the attribute. Each case asserts the classification against what
+/// `git merge` actually did, and the sweep as a whole asserts that both outcomes occurred: a
+/// classifier that had started reporting `divergent` for everything would pass every individual
+/// case while proving nothing.
+#[test]
+fn every_merge_attribute_state_agrees_with_a_real_merge() -> Result<()> {
+    // `union` resolves instead of conflicting, so a merge under it is clean — and the classifier
+    // still refuses to call it adjacent, because a driver does not combine the sides along the
+    // hunk coordinates we measured. That case is a tolerated false alarm, not a false safe, and
+    // it is listed here so the trade is visible rather than implied.
+    let cases: [(&str, &str, &str); 5] = [
+        ("unspecified", "", "adjacent"),
+        ("set", "*.lock merge\n", "adjacent"),
+        ("unset", "*.lock -merge\n", "divergent"),
+        ("driver-conflicts", "*.lock merge=refuses\n", "divergent"),
+        ("driver-resolves", "*.lock merge=union\n", "divergent"),
+    ];
+    let mut clean = 0_usize;
+    let mut conflicted = 0_usize;
+    for (label, attributes, expected) in cases {
+        let fleet = Fleet::new()?;
+        let body = (1..=20).fold(String::new(), |mut rows, row| {
+            let _ = writeln!(rows, "dep_{row} = \"1.0\"");
+            rows
+        });
+        std::fs::write(fleet.repository.join("deps.lock"), &body)?;
+        if !attributes.is_empty() {
+            std::fs::write(fleet.repository.join(".gitattributes"), attributes)?;
+        }
+        git(
+            &fleet.repository,
+            &["config", "merge.refuses.driver", "false"],
+        )?;
+        git(&fleet.repository, &["add", "-A"])?;
+        git(&fleet.repository, &["commit", "-m", "deps"])?;
+
+        let (alpha, alpha_tree) = fleet.agent("alpha")?;
+        let (bravo, bravo_tree) = fleet.agent("bravo")?;
+        std::fs::write(
+            alpha_tree.join("deps.lock"),
+            body.replace("dep_2 = \"1.0\"", "dep_2 = \"2.0\""),
+        )?;
+        std::fs::write(
+            bravo_tree.join("deps.lock"),
+            body.replace("dep_18 = \"1.0\"", "dep_18 = \"2.0\""),
+        )?;
+        git(&alpha_tree, &["commit", "-am", "alpha"])?;
+        git(&bravo_tree, &["commit", "-am", "bravo"])?;
+
+        let conflicts = merge_conflicts(&alpha_tree, "feat/bravo")?;
+        if conflicts {
+            conflicted += 1;
+        } else {
+            clean += 1;
+        }
+        fleet.sync(&alpha, &alpha_tree)?;
+        fleet.sync(&bravo, &bravo_tree)?;
+        let collisions = fleet.collisions(&alpha)?;
+        let deps = at(&collisions, "deps.lock").context("expected a collision")?;
+        let severity = deps["severity"].as_str().context("severity")?;
+        assert!(
+            !(severity == "adjacent" && conflicts),
+            "{label}: reported adjacent for a merge that conflicts: {deps}"
+        );
+        assert_eq!(
+            severity, expected,
+            "{label}: unexpected severity for `{attributes}`: {deps}"
+        );
+    }
+    assert!(
+        clean > 0 && conflicted > 0,
+        "the oracle produced {clean} clean and {conflicted} conflicting merges; \
+         it has to produce both or it is not discriminating"
     );
     Ok(())
 }
