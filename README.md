@@ -22,14 +22,21 @@ call anything, which matters because an agent launched by some other harness nev
 
 ```console
 $ pidmesh watch
-8 checkouts scanned, 8 published
+8 checkouts scanned, 8 updated
 2 contested paths
   x src/routes.rs               divergent    agent1, agent2, agent3, agent4
   · src/shared.rs               identical    agent5, agent6
+    divergent  two checkouts rewrote overlapping regions of this path — merging either one overwrites the other's work
+    identical  every checkout reached the same content here — duplicated effort, safe to merge
 
 1 symbol break
   x compute_total() removed from src/api.rs, still used by agent8
+  Next  `pidmesh mergeable` says whether your own branch can merge right now.
 ```
+
+The symbol break is the point. `src/api.rs` and `src/caller.rs` are different files, no checkout
+contests either of them, and `git merge` reports both as clean — a watcher that only compared
+paths would print the two contested lines above and call the fleet healthy.
 
 Then gate the merge instead of discovering it afterwards:
 
@@ -37,6 +44,7 @@ Then gate the merge instead of discovering it afterwards:
 $ pidmesh mergeable
 Cannot merge yet — 1 blocker
   x removes compute_total() which agent8 still calls
+  Next  `pidmesh collisions` shows every contested path and who holds it. Merging anyway is always yours to decide — pidmesh never touches your branches.
 ```
 
 `mergeable` exits non-zero, so `pidmesh mergeable && git merge …` is a safe thing to write. Nothing
@@ -307,17 +315,21 @@ a pipe, a redirect, or an agent still gets the JSON it parses. `--json` forces J
 
 ```console
 $ pidmesh watch --once
-8 checkouts scanned, 8 published
+8 checkouts scanned, 8 updated
 2 contested paths
   x src/routes.rs               divergent    agent1, agent2, agent3, agent4
   · src/shared.rs               identical    agent5, agent6
+    divergent  two checkouts rewrote overlapping regions of this path — merging either one overwrites the other's work
+    identical  every checkout reached the same content here — duplicated effort, safe to merge
 
 1 symbol break
   x compute_total() removed from src/api.rs, still used by agent8
+  Next  `pidmesh mergeable` says whether your own branch can merge right now.
 
 $ pidmesh mergeable
 Cannot merge yet — 1 blocker
   x removes compute_total() which agent8 still calls
+  Next  `pidmesh collisions` shows every contested path and who holds it. Merging anyway is always yours to decide — pidmesh never touches your branches.
 ```
 
 ## Detect collisions nobody declared
@@ -366,6 +378,7 @@ it:
 
 ```bash
 pidmesh collisions   # includes symbol_breaks alongside contested paths
+pidmesh watch        # the same breaks, fleet-wide, with nobody cooperating
 pidmesh mergeable    # blocks on removed_export_in_use
 ```
 
@@ -442,6 +455,15 @@ Each sweep scans every distinct live checkout once, publishes a footprint for ev
 and reports the resulting collisions. A checkout that has been removed is skipped rather than
 failing the sweep — the sweep names it and says why — and a session whose PID is gone is not
 scanned at all.
+
+A sweep reports symbol breaks beside the contested paths, in `symbol_breaks` and
+`symbol_break_count`. These are the *workspace's* breaks, not one agent's: `collisions` and
+`mergeable` are asked by a particular checkout and answer for it, while a watcher participates in
+nothing and supervises everyone, so narrowing the list to whichever session the sweep reached
+first would hide the one conflict class that shares no file behind an accident of ordering. The
+list is capped, and `symbol_breaks_truncated` says when the cap was reached, because a capped
+list that cannot say so is read as a complete one. Reporting them costs the sweep no extra work:
+the same read that produces the contested paths already produces these.
 
 A sweep also reports what it is *not* watching. `git_worktrees` counts the checkouts git knows
 about and `unwatched_worktrees` lists the ones no live agent has registered, so an empty result is

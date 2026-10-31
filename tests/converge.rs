@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use pidmesh::converge::{Participant, classify, integration_head, scan_worktree};
+use pidmesh::render::{Shape, render};
 use pidmesh::store::MeshStore;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -888,6 +889,203 @@ fn a_watcher_observes_a_fleet_that_never_calls_sync() -> Result<()> {
             .map(Vec::len),
         Some(3)
     );
+    Ok(())
+}
+
+/// A repository whose checkouts register and then never cooperate, swept by the real CLI.
+///
+/// The watcher is only meaningful end to end. `watch_pass` assembles its answer from a live
+/// sweep and hands it to the renderer, so a store-level test proves nothing about what the
+/// supervisor actually reports.
+struct Supervised {
+    _directory: TempDir,
+    repository: PathBuf,
+    database: PathBuf,
+}
+
+impl Supervised {
+    fn new(files: &[(&str, &str)]) -> Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository)?;
+        git(&repository, &["init", "-b", "main"])?;
+        git(
+            &repository,
+            &["config", "user.email", "pidmesh@example.com"],
+        )?;
+        git(&repository, &["config", "user.name", "PidMesh Test"])?;
+        std::fs::create_dir(repository.join("src"))?;
+        for (path, body) in files {
+            std::fs::write(repository.join(path), body)?;
+        }
+        git(&repository, &["add", "-A"])?;
+        git(&repository, &["commit", "-m", "initial"])?;
+        let database = directory.path().join("watch.db");
+        Ok(Self {
+            _directory: directory,
+            repository,
+            database,
+        })
+    }
+
+    /// A linked worktree joined with a live PID, exactly as any harness registers one.
+    ///
+    /// A sweep groups checkouts by path, so the name chosen here decides which agent the sweep
+    /// happens to reach first — which is the whole question these tests are about.
+    fn checkout(&self, name: &str) -> Result<PathBuf> {
+        let worktree = self.repository.join("..").join(format!("wt-{name}"));
+        git(
+            &self.repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("feat/{name}"),
+                worktree.to_str().context("worktree path")?,
+            ],
+        )?;
+        let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+            .current_dir(&worktree)
+            .env_remove("PIDMESH_WORKSPACE")
+            .args([
+                "--db",
+                self.database.to_str().context("database path")?,
+                "join",
+                "--name",
+                name,
+                "--pid",
+                &std::process::id().to_string(),
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "join failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(worktree)
+    }
+
+    /// One `pidmesh watch --once`, as the JSON agents parse and the text a person reads.
+    fn sweep(&self) -> Result<(Value, String)> {
+        let output = Command::new(env!("CARGO_BIN_EXE_pidmesh"))
+            .current_dir(&self.repository)
+            .env_remove("PIDMESH_WORKSPACE")
+            .args([
+                "--db",
+                self.database.to_str().context("database path")?,
+                "watch",
+                "--once",
+                "--base",
+                "main",
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pass: Value = serde_json::from_slice(&output.stdout)?;
+        let rendered = render(Shape::Watch, &pass).context("a sweep has a rendering")?;
+        Ok((pass, rendered))
+    }
+}
+
+/// The supervisor has to see the conflict that contests no path.
+///
+/// `watch` is the one surface built for agents that never cooperate, and a symbol break is the
+/// one conflict `git merge` reports as clean. The sweep published the footprints that detect it,
+/// reaped on their behalf, and then printed contested paths and nothing else — so the fleet-wide
+/// view was blind to exactly the class it exists to catch.
+#[test]
+fn a_sweep_reports_the_symbol_break_that_contests_no_path() -> Result<()> {
+    let fleet = Supervised::new(&[
+        ("src/api.rs", "pub fn compute_total() -> u32 {\n    7\n}\n"),
+        ("src/caller.rs", "fn unused() {}\n"),
+        ("src/notes.rs", "fn notes() {}\n"),
+    ])?;
+    // Checkouts are swept in path order, so the first one reached is a bystander to the break
+    // below: it neither withdraws the name nor calls it. A watcher reporting only its witness's
+    // own breaks finds nothing at all here.
+    let bystander = fleet.checkout("aaa")?;
+    let remover = fleet.checkout("mmm")?;
+    let caller = fleet.checkout("zzz")?;
+    std::fs::write(
+        bystander.join("src/notes.rs"),
+        "fn notes() { /* idle */ }\n",
+    )?;
+    std::fs::write(
+        remover.join("src/api.rs"),
+        "pub fn compute_subtotal() -> u32 {\n    7\n}\n",
+    )?;
+    std::fs::write(
+        caller.join("src/caller.rs"),
+        "fn report() -> u32 {\n    compute_total()\n}\n",
+    )?;
+
+    let (pass, rendered) = fleet.sweep()?;
+    assert_eq!(pass["checkouts"], 3, "{pass}");
+    // Three checkouts, three different files: path comparison alone reports a healthy fleet.
+    assert_eq!(pass["collision_count"], 0, "{pass}");
+
+    assert_eq!(pass["symbol_break_count"], 1, "{pass}");
+    let breaks = pass["symbol_breaks"].as_array().context("symbol breaks")?;
+    assert_eq!(breaks.len(), 1, "{pass}");
+    assert_eq!(breaks[0]["symbol"], "compute_total");
+    assert_eq!(breaks[0]["removed_from"], "src/api.rs");
+    assert_eq!(breaks[0]["used_by"]["agent_name"], "zzz");
+    assert!(
+        breaks[0]["removed_by"]
+            .as_str()
+            .is_some_and(|agent| agent.starts_with("mmm-")),
+        "{pass}"
+    );
+    // The break belongs to neither side of the agent the sweep reached first, which is the
+    // point: a supervisor reports the workspace's breaks, not one session's.
+    assert_eq!(breaks[0]["involves_me"], false, "{pass}");
+    assert_eq!(pass["symbol_breaks_truncated"], false, "{pass}");
+
+    // And it reaches the person watching, in the same words `collisions` uses.
+    assert!(rendered.contains("1 symbol break"), "{rendered}");
+    assert!(
+        rendered.contains("compute_total() removed from src/api.rs, still used by zzz"),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+/// A fleet that withdraws nothing must not grow a symbol-break section.
+///
+/// The clean case is half the contract: a report that always finds something is as useless as
+/// one that never does.
+#[test]
+fn a_sweep_without_a_withdrawn_export_reports_no_symbol_break() -> Result<()> {
+    let fleet = Supervised::new(&[
+        ("src/api.rs", "pub fn compute_total() -> u32 {\n    7\n}\n"),
+        ("src/shared.rs", "fn shared() {}\n"),
+    ])?;
+    let alpha = fleet.checkout("alpha")?;
+    let bravo = fleet.checkout("bravo")?;
+    // A real contested path, so the sweep is demonstrably reporting *something*. Both keep
+    // calling the export; neither withdraws it.
+    std::fs::write(
+        alpha.join("src/shared.rs"),
+        "fn shared() { compute_total(); /* a */ }\n",
+    )?;
+    std::fs::write(
+        bravo.join("src/shared.rs"),
+        "fn shared() { compute_total(); /* b */ }\n",
+    )?;
+
+    let (pass, rendered) = fleet.sweep()?;
+    assert_eq!(pass["collision_count"], 1, "{pass}");
+    assert_eq!(pass["symbol_break_count"], 0, "{pass}");
+    assert_eq!(
+        pass["symbol_breaks"].as_array().map(Vec::len),
+        Some(0),
+        "{pass}"
+    );
+    assert_eq!(pass["symbol_breaks_truncated"], false, "{pass}");
+    assert!(!rendered.contains("symbol break"), "{rendered}");
     Ok(())
 }
 
@@ -2555,6 +2753,13 @@ fn a_flood_of_peer_symbol_breaks_cannot_clear_an_agents_own() -> Result<()> {
     assert!(
         convergence["symbol_break_count"].as_i64().unwrap_or(0) >= 200,
         "this test only means something if the cap is actually reached: {convergence}"
+    );
+    // And the report has to admit it stopped early. A capped list that reads as a complete one
+    // is the same lie in a quieter voice: two hundred breaks and twenty thousand printed
+    // identically.
+    assert_eq!(
+        convergence["symbol_breaks_truncated"], true,
+        "a capped report must say it was capped: {convergence}"
     );
 
     // Alpha is genuinely withdrawing a name a live peer still calls, and must be told so.
