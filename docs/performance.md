@@ -1,5 +1,34 @@
 # Convergence performance
 
+## Differential validation against the compiler
+
+A symbol break claims something stronger than a merge conflict: that the merge will be *clean* and
+the result will not build. That is checkable by merging and then building.
+
+Seven scenarios, each with two agents in linked worktrees of a small crate. One agent changes an
+export; the other uses it, or does not. Both branches are merged into an integration branch, and
+the result is compiled.
+
+| scenario | break reported | merged cleanly | compiles |
+| --- | --- | --- | --- |
+| a withdrawn export the peer calls | yes | yes | **no** |
+| a withdrawn struct the peer names as a type | yes | yes | **no** |
+| a renamed const the peer references | yes | yes | **no** |
+| a renamed trait the peer bounds on | yes | yes | **no** |
+| an export reached through a `use` import | yes | yes | **no** |
+| a withdrawn export nobody calls | no | yes | yes |
+| an export whose body changed, still called | no | yes | yes |
+
+The verdict agrees with the compiler in all seven. The first five are the case the feature exists
+for and the hardest to see any other way: git reports success, and the result does not build. The
+last two are the cases that must *not* raise an alarm — retiring dead code, and editing a function
+without changing its name.
+
+Note what this does not establish. The harvester is textual, so it recognises these shapes because
+the names appear in the peer's changed files, not because anything parsed Rust. A usage that never
+mentions the name — reached through a re-export, a macro, or a trait method resolved by inference —
+would not be seen. The table shows the shapes that are covered, not a proof that none are missing.
+
 ## Differential validation against git
 
 Severity is a claim about what a merge will do, so it can be checked against one. Eighty generated
