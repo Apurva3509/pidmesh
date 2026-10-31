@@ -1219,7 +1219,7 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     let mut scanned = scans.into_inner().unwrap_or_default();
     scanned.sort_by_key(|(index, _)| *index);
 
-    let mut published = 0usize;
+    let mut published = 0u64;
     let mut skipped: Vec<Value> = Vec::new();
     let mut witness = None;
     let mut batch: Vec<(String, WorktreeScan)> = Vec::new();
@@ -1241,7 +1241,6 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
         for agent in *agents {
             witness.get_or_insert_with(|| agent.agent_id.clone());
             batch.push((agent.agent_id.clone(), scan.clone()));
-            published += 1;
         }
     }
     // One transaction for the whole sweep: publishing agent by agent recomputes the collision
@@ -1249,9 +1248,15 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     // A watcher runs for hours. A publish that fails — a locked database, a vanished agent — is
     // one bad tick, not a reason to stop observing the fleet, so it is reported like a failed
     // scan rather than propagated out of the loop.
-    if let Err(error) = store.publish_footprints(&batch) {
-        skipped.push(json!({"publish": "failed", "error": format!("{error:#}")}));
-        published = 0;
+    // The store reports what it actually wrote. Counting the batch instead told an operator that
+    // forty-eight checkouts had published when the sweep had changed nothing at all.
+    match store.publish_footprints(&batch) {
+        Ok(result) => {
+            published = result["published"].as_u64().unwrap_or(0);
+        }
+        Err(error) => {
+            skipped.push(json!({"publish": "failed", "error": format!("{error:#}")}));
+        }
     }
 
     // Nothing else reaps dead sessions, and a crashed agent holds its claims, its reservations
@@ -1264,6 +1269,7 @@ fn watch_pass(store: &MeshStore, workspace: Option<&Path>, base: Option<&str>) -
     };
     Ok(json!({
         "checkouts": grouped.len(),
+        "observed": batch.len(),
         "published": published,
         "stale_agents": stale,
         "reaped": reaped,
